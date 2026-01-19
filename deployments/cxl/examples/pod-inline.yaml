@@ -1,0 +1,42 @@
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: claim1
+spec:
+  devices:
+    requests:
+    - name: cxl
+      exactly:
+        deviceClassName: cxl.intel.com
+##
+## if one is not enough
+#        count: 1024
+##
+## requesting particular series
+#        selectors:
+#        - cel:
+#            expression: device.attributes["cxl.intel.com"].model == 'ddr5'
+##
+## for monitoring
+#        adminAccess: true
+#        allocationMode: "All"
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-inline-claim
+spec:
+  restartPolicy: Never
+  containers:
+  - name: with-resource
+    image: registry.k8s.io/e2e-test-images/busybox:1.29-2
+    command: ["sh", "-c", "ls /dev && free && sleep 300"]
+    resources:
+      claims:
+      - name: resource
+  - name: without-resource
+    image: registry.k8s.io/e2e-test-images/busybox:1.29-2
+    command: ["sh", "-c", "ls /dev && free && sleep 300"]
+  resourceClaims:
+  - name: resource
+    resourceClaimName: claim1

@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dra-extended-resource-example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dra-extended-resource-example
+  template:
+    metadata:
+      labels:
+        app: dra-extended-resource-example
+    spec:
+      containers:
+      - name: workload
+        image: registry.k8s.io/e2e-test-images/busybox:1.29-2
+        command: ["sh", "-c", "ls /dev && free && sleep 300"]
+        resources:
+          limits:
+            intel.com/cxl: 1024

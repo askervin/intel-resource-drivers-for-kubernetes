@@ -1,0 +1,150 @@
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: intel-cxl-resource-driver-kubelet-plugin
+  namespace: intel-cxl-resource-driver
+  labels:
+    app: intel-cxl-resource-driver-kubelet-plugin
+spec:
+  selector:
+    matchLabels:
+      app: intel-cxl-resource-driver-kubelet-plugin
+  template:
+    metadata:
+      labels:
+        app: intel-cxl-resource-driver-kubelet-plugin
+    spec:
+      serviceAccount: intel-cxl-resource-driver-service-account
+      serviceAccountName: intel-cxl-resource-driver-service-account
+      containers:
+      - name: kubelet-plugin
+        image: ghcr.io/intel/intel-resource-drivers-for-kubernetes/intel-cxl-resource-driver:latest
+        command: ["/kubelet-cxl-plugin"]
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: SYSFS_ROOT
+          value: "/sys"
+        volumeMounts:
+        - name: plugins-registry
+          mountPath: /var/lib/kubelet/plugins_registry
+        - name: plugins
+          mountPath: /var/lib/kubelet/plugins
+        - name: cdi
+          mountPath: /etc/cdi
+        - name: varruncdi
+          mountPath: /var/run/cdi
+        - name: sysfs
+          mountPath: "/sys"
+        securityContext:
+          privileged: true
+          capabilities:
+            drop: [ "ALL" ]
+          readOnlyRootFilesystem: true
+          runAsUser: 0
+          # Note, OpenShift has 'runtime/default' as a default.
+          # See https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/html/security_and_compliance/seccomp-profiles#custom-seccomp-profile
+          seccompProfile:
+            type: RuntimeDefault
+      volumes:
+      - name: plugins-registry
+        hostPath:
+          path: /var/lib/kubelet/plugins_registry
+      - name: plugins
+        hostPath:
+          path: /var/lib/kubelet/plugins
+      - name: cdi
+        hostPath:
+          path: /etc/cdi
+      - name: varruncdi
+        hostPath:
+          path: /var/run/cdi
+      - name: sysfs
+        hostPath:
+          path: /sys
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: intel-cxl-resource-driver-service-account
+  namespace: intel-cxl-resource-driver
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: intel-cxl-resource-driver-role
+  namespace: intel-cxl-resource-driver
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get"]
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceslices"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["resource.k8s.io"]
+  resources: ["resourceclaims"]
+  verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: intel-cxl-resource-driver-role-binding
+  namespace: intel-cxl-resource-driver
+subjects:
+- kind: ServiceAccount
+  name: intel-cxl-resource-driver-service-account
+  namespace: intel-cxl-resource-driver
+roleRef:
+  kind: ClusterRole
+  name: intel-cxl-resource-driver-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: resourceslices-policy-dra-kubelet-plugin-cxl
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups:   ["resource.k8s.io"]
+      apiVersions: ["v1"]
+      operations:  ["CREATE", "UPDATE", "DELETE"]
+      resources:   ["resourceslices"]
+  matchConditions:
+  - name: isRestrictedUser
+    expression: >-
+      request.userInfo.username == "system:serviceaccount:intel-cxl-resource-driver:intel-cxl-resource-driver-service-account"
+  variables:
+  - name: userNodeName
+    expression: >-
+      request.userInfo.extra[?'authentication.kubernetes.io/node-name'][0].orValue('')
+  - name: objectNodeName
+    expression: >-
+      (request.operation == "DELETE" ? oldObject : object).spec.?nodeName.orValue("")
+  validations:
+  - expression: variables.userNodeName != ""
+    message: >-
+      no node association found for user, this user must run in a pod on a node and ServiceAccountTokenPodNodeInfo must be enabled
+  - expression: variables.userNodeName == variables.objectNodeName
+    messageExpression: >-
+      "this user running on node '"+variables.userNodeName+"' may not modify " +
+      (variables.objectNodeName == "" ?"cluster resourceslices" : "resourceslices on node '"+variables.objectNodeName+"'")
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: resourceslices-policy-dra-kubelet-plugin-cxl
+spec:
+  policyName: resourceslices-policy-dra-kubelet-plugin-cxl
+  validationActions: [Deny]

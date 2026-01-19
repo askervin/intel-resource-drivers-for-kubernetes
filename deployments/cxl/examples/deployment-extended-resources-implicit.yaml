@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dra-implicit-extended-resource-example
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dra-implicit-extended-resource-example
+  template:
+    metadata:
+      labels:
+        app: dra-implicit-extended-resource-example
+    spec:
+      containers:
+      - name: workload
+        image: registry.k8s.io/e2e-test-images/busybox:1.29-2
+        command: ["sh", "-c", "ls /dev && free && sleep 300"]
+        resources:
+          limits:
+            deviceclass.resource.kubernetes.io/cxl.intel.com: 1024

@@ -1,0 +1,10 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: intel-cxl-resource-driver-kubelet-plugin
+  namespace: intel-cxl-resource-driver
+spec:
+  template:
+    spec:
+      nodeSelector:
+        intel.feature.node.kubernetes.io/cxl: "true"

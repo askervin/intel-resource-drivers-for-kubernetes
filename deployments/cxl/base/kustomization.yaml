@@ -1,0 +1,9 @@
+resources:
+  - device-class.yaml
+  - namespace.yaml
+  - resource-driver.yaml
+
+#images:
+#  - name: ghcr.io/intel/intel-resource-drivers-for-kubernetes/intel-cxl-resource-driver
+#    newName: registry.local/intel-cxl-resource-driver
+#    newTag: v0.1.0

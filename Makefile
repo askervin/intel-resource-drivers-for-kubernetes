@@ -59,6 +59,7 @@ pkg/version/*.go
 include $(CURDIR)/gpu.mk
 include $(CURDIR)/gaudi.mk
 include $(CURDIR)/qat.mk
+include $(CURDIR)/cxl.mk
 
 .EXPORT_ALL_VARIABLES:
 

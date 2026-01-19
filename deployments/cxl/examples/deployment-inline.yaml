@@ -1,0 +1,47 @@
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: 1g-mem
+spec:
+  spec:
+    devices:
+      requests:
+      - name: cxl
+        exactly:
+          deviceClassName: cxl.intel.com
+          count: 2
+          selectors:
+          # TODO: purely optional
+          #- cel:
+          #    expression: device.attributes["cxl.intel.com"].model == 'ddr5'
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cxl-test
+  labels:
+    app: inline-cxl-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inline-cxl-deployment
+  template:
+    metadata:
+      labels:
+        app: inline-cxl-deployment
+    spec:
+      containers:
+      - name: with-resource
+        image: registry.k8s.io/e2e-test-images/busybox:1.29-2
+        command: ["sh", "-c", "ls /dev && free && sleep 300"]
+        resources:
+          claims:
+          - name: resource
+      - name: without-resource
+        image: registry.k8s.io/e2e-test-images/busybox:1.29-2
+        command: ["sh", "-c", "ls /dev && free && sleep 300"]
+      resourceClaims:
+      - name: resource
+        resourceClaimTemplateName: 1g-mem
