@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-cxl-memory-inline-1
+spec:
+  restartPolicy: Never
+  containers:
+  - name: with-cxl-memory
+    image: registry.k8s.io/e2e-test-images/busybox:1.29-2
+    command: ["sh", "-c", "echo 'Pod with 20MB CXL memory' && numactl --hardware && free -m && sleep 300"]
+    resources:
+      claims:
+      - name: cxl-memory
+  resourceClaims:
+  - name: cxl-memory
+    devices:
+      requests:
+      - name: memory
+        exactly:
+          deviceClassName: cxl.intel.com
+          count: 10  # Request 10 chunks of 2MB = 20MB
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-cxl-memory-inline-2
+spec:
+  restartPolicy: Never
+  containers:
+  - name: with-cxl-memory
+    image: registry.k8s.io/e2e-test-images/busybox:1.29-2
+    command: ["sh", "-c", "echo 'Pod with 10MB CXL memory' && numactl --hardware && free -m && sleep 300"]
+    resources:
+      claims:
+      - name: cxl-memory
+  resourceClaims:
+  - name: cxl-memory
+    devices:
+      requests:
+      - name: memory
+        exactly:
+          deviceClassName: cxl.intel.com
+          count: 5  # Request 5 chunks of 2MB = 10MB
