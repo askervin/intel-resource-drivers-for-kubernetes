@@ -27,7 +27,8 @@ import (
 
 // DiscoverDevices discovers CXL regions using the external CXL package.
 // It returns a map of CXL node resources, where each resource represents
-// memory from a CXL region backed by a NUMA node.
+// memory from CXL regions backed by a NUMA node. If multiple regions map
+// to the same NUMA node, their memory sizes are aggregated.
 func DiscoverDevices(sysfsDir, namingStyle string) map[string]*device.DeviceInfo {
 	devices := make(map[string]*device.DeviceInfo)
 
@@ -43,9 +44,12 @@ func DiscoverDevices(sysfsDir, namingStyle string) map[string]*device.DeviceInfo
 		return devices
 	}
 
-	// Process each region device
+	// Process each region device and aggregate by NUMA node
 	regionDevices := cxlDevices.GetRegionDevices()
 	klog.V(3).Infof("Found %d CXL region devices", len(regionDevices))
+
+	// Track regions per NUMA node for aggregation
+	nodeToRegions := make(map[int][]*externalcxl.RegionDevice)
 
 	for _, region := range regionDevices {
 		// Only process enabled regions with valid NUMA nodes
@@ -66,23 +70,41 @@ func DiscoverDevices(sysfsDir, namingStyle string) map[string]*device.DeviceInfo
 			continue
 		}
 
+		nodeToRegions[node] = append(nodeToRegions[node], region)
+	}
+
+	// Create aggregated devices per NUMA node
+	for node, regions := range nodeToRegions {
+		var totalSize uint64
+		var regionNames []string
+		var mode string
+
+		for _, region := range regions {
+			totalSize += region.GetSize()
+			regionNames = append(regionNames, region.GetName())
+			if mode == "" {
+				mode = region.GetMode()
+			}
+			klog.V(3).Infof("Discovered CXL region %s: node=%d, size=%d bytes, mode=%s",
+				region.GetName(), node, region.GetSize(), region.GetMode())
+		}
+
 		// Create a device representing this CXL memory node
 		// Using "cxl-node<N>" naming to represent memory on NUMA node N
 		deviceName := fmt.Sprintf("cxl-node%d", node)
-		klog.V(3).Infof("Discovered CXL region %s: node=%d, size=%d bytes, mode=%s", 
-			region.GetName(), node, size, region.GetMode())
-
 		deviceInfo := &device.DeviceInfo{
-			UID:          deviceName,
-			PCIAddress:   "", // Not applicable for memory nodes
-			Model:        region.GetMode(),
-			PCIRoot:      "", // Not applicable for memory nodes
-			MemorySize:   size,
-			MemoryNode:   node,
-			RegionName:   region.GetName(),
+			UID:        deviceName,
+			PCIAddress: "", // Not applicable for memory nodes
+			Model:      mode,
+			PCIRoot:    "", // Not applicable for memory nodes
+			MemorySize: totalSize,
+			MemoryNode: node,
+			RegionName: fmt.Sprintf("%v", regionNames), // Store all region names
 		}
 
 		devices[deviceName] = deviceInfo
+		klog.V(3).Infof("Created aggregated CXL node %s: regions=%v, total_size=%d bytes",
+			deviceName, regionNames, totalSize)
 	}
 
 	klog.V(3).Infof("Discovered %d CXL memory nodes", len(devices))

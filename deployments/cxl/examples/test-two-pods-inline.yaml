@@ -15,7 +15,7 @@ spec:
   - name: cxl-memory
     devices:
       requests:
-      - name: memory
+      - name: cxl-memory
         exactly:
           deviceClassName: cxl.intel.com
           count: 10  # Request 10 chunks of 2MB = 20MB
@@ -37,7 +37,7 @@ spec:
   - name: cxl-memory
     devices:
       requests:
-      - name: memory
+      - name: cxl-memory
         exactly:
           deviceClassName: cxl.intel.com
           count: 5  # Request 5 chunks of 2MB = 10MB

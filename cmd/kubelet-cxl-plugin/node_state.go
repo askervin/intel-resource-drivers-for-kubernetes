@@ -34,6 +34,14 @@ import (
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/helpers"
 )
 
+const (
+	// chunkSize defines the memory allocation granularity in bytes (2 MB).
+	// This is aligned with the smallest hugepage size.
+	// Memory sizes that are not evenly divisible by chunkSize will be
+	// truncated down to the nearest 2 MB boundary.
+	chunkSize = 2 * 1024 * 1024 // 2 MB
+)
+
 type nodeState struct {
 	*helpers.NodeState
 	myflag1 string
@@ -106,8 +114,7 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 
 	allocatableDevices, _ := s.Allocatable.(map[string]*device.DeviceInfo)
 	for cxlUID, allocatableCXL := range allocatableDevices {
-		// Calculate capacity in 2 MB chunks (aligned with smallest hugepage size)
-		const chunkSize = 2 * 1024 * 1024 // 2 MB
+		// Calculate capacity in chunks (truncates down to nearest chunk boundary)
 		capacityChunks := int64(allocatableCXL.MemorySize / chunkSize)
 
 		newDevice := resourcev1.Device{
@@ -127,7 +134,7 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 					StringValue: &allocatableCXL.Model,
 				},
 			},
-			// Expose memory capacity as allocatable in 2 MB chunks
+			// Expose memory capacity as allocatable in chunks
 			Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
 				"memory": {
 					Value: *resource.NewQuantity(capacityChunks, resource.DecimalSI),
