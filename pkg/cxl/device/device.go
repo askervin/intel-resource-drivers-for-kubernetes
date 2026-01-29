@@ -57,8 +57,12 @@ type DeviceInfo struct {
 	// Consists of PCIAddress and Model with colons and dots replaced with hyphens, e.g. 0000-01-02-0-0x1234.
 	UID        string `json:"uid"`
 	PCIAddress string `json:"pciaddress"` // PCI address in Linux DBDF notation for use with sysfs, e.g. 0000:00:00.0
-	Model      string `json:"model"`      // PCI device ID
+	Model      string `json:"model"`      // PCI device ID or CXL region mode (e.g., "ram")
 	PCIRoot    string `json:"pciroot"`    // PCI Root complex ID
+	// CXL memory-specific fields
+	MemorySize uint64 `json:"memorysize"` // Memory size in bytes for CXL regions
+	MemoryNode int    `json:"memorynode"` // NUMA node ID for CXL memory regions
+	RegionName string `json:"regionname"` // CXL region name (e.g., "region0")
 }
 
 func (g DeviceInfo) CDIName() string {

@@ -17,76 +17,74 @@
 package discovery
 
 import (
-	"os"
-	"path"
-	"strings"
+	"fmt"
 
+	externalcxl "github.com/containers/nri-plugins/pkg/cxl"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
-	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/helpers"
 
 	"k8s.io/klog/v2"
 )
 
-// Detect devices from sysfs.
+// DiscoverDevices discovers CXL regions using the external CXL package.
+// It returns a map of CXL node resources, where each resource represents
+// memory from a CXL region backed by a NUMA node.
 func DiscoverDevices(sysfsDir, namingStyle string) map[string]*device.DeviceInfo {
-
-	sysfsDriverDir := path.Join(sysfsDir, device.SysfsDriverPath)
-
 	devices := make(map[string]*device.DeviceInfo)
 
-	driverDirFiles, err := os.ReadDir(sysfsDriverDir)
+	// Use DevicesFromSysfs() from external cxl package
+	cxlDevices, err := externalcxl.DevicesFromSysfs(sysfsDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			klog.V(5).Infof("No Intel CXL devices found on this host. %v does not exist", sysfsDriverDir)
-			return devices
-		}
-		klog.Errorf("could not read sysfs directory %v: %v", driverDirFiles, err)
+		klog.Errorf("Failed to discover CXL devices from sysfs: %v", err)
 		return devices
 	}
 
-	return scanDevicesFromDriverDirFiles(driverDirFiles, sysfsDriverDir, namingStyle)
-
-}
-
-func scanDevicesFromDriverDirFiles(driverDirFiles []os.DirEntry, sysfsDriverDir string, namingStyle string) map[string]*device.DeviceInfo {
-	devices := map[string]*device.DeviceInfo{}
-	for _, pciAddress := range driverDirFiles {
-		devicePCIAddress := pciAddress.Name()
-		// check if file is PCI device
-		if !device.PciRegexp.MatchString(devicePCIAddress) {
-			continue
-		}
-		klog.V(5).Infof("Found CXL PCI device: %s", devicePCIAddress)
-
-		driverDeviceDir := path.Join(sysfsDriverDir, devicePCIAddress)
-		// Read PCI device ID.
-		deviceIdFile := path.Join(driverDeviceDir, "device")
-		deviceIdBytes, err := os.ReadFile(deviceIdFile)
-		if err != nil {
-			klog.Errorf("failed detecting device %v PCI ID: %+v", devicePCIAddress, err)
-			continue
-		}
-		deviceId := strings.TrimSpace(string(deviceIdBytes))
-
-		uid := helpers.DeviceUIDFromPCIinfo(devicePCIAddress, deviceId)
-		klog.V(5).Infof("New cxl UID: %v", uid)
-		newDeviceInfo := &device.DeviceInfo{
-			UID:        uid,
-			PCIAddress: devicePCIAddress,
-			Model:      deviceId,
-			PCIRoot:    helpers.DeterminePCIRoot(driverDeviceDir),
-		}
-
-		devices[determineDeviceName(newDeviceInfo, namingStyle)] = newDeviceInfo
+	if cxlDevices == nil {
+		klog.V(5).Info("No CXL devices found")
+		return devices
 	}
 
+	// Process each region device
+	regionDevices := cxlDevices.GetRegionDevices()
+	klog.V(3).Infof("Found %d CXL region devices", len(regionDevices))
+
+	for _, region := range regionDevices {
+		// Only process enabled regions with valid NUMA nodes
+		if !region.Enabled {
+			klog.V(5).Infof("Skipping disabled region %s", region.GetName())
+			continue
+		}
+
+		node := region.GetNode()
+		if node < 0 {
+			klog.V(5).Infof("Skipping region %s with invalid NUMA node %d", region.GetName(), node)
+			continue
+		}
+
+		size := region.GetSize()
+		if size == 0 {
+			klog.V(5).Infof("Skipping region %s with zero size", region.GetName())
+			continue
+		}
+
+		// Create a device representing this CXL memory node
+		// Using "cxl-node<N>" naming to represent memory on NUMA node N
+		deviceName := fmt.Sprintf("cxl-node%d", node)
+		klog.V(3).Infof("Discovered CXL region %s: node=%d, size=%d bytes, mode=%s", 
+			region.GetName(), node, size, region.GetMode())
+
+		deviceInfo := &device.DeviceInfo{
+			UID:          deviceName,
+			PCIAddress:   "", // Not applicable for memory nodes
+			Model:        region.GetMode(),
+			PCIRoot:      "", // Not applicable for memory nodes
+			MemorySize:   size,
+			MemoryNode:   node,
+			RegionName:   region.GetName(),
+		}
+
+		devices[deviceName] = deviceInfo
+	}
+
+	klog.V(3).Infof("Discovered %d CXL memory nodes", len(devices))
 	return devices
-}
-
-func determineDeviceName(info *device.DeviceInfo, namingStyle string) string {
-	if namingStyle == "classic" {
-		return "cxl" + info.PCIAddress
-	}
-
-	return info.UID
 }

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
@@ -105,12 +106,31 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 
 	allocatableDevices, _ := s.Allocatable.(map[string]*device.DeviceInfo)
 	for cxlUID, allocatableCXL := range allocatableDevices {
+		// Calculate capacity in 2 MB chunks (aligned with smallest hugepage size)
+		const chunkSize = 2 * 1024 * 1024 // 2 MB
+		capacityChunks := int64(allocatableCXL.MemorySize / chunkSize)
+
 		newDevice := resourcev1.Device{
 			Name: cxlUID,
 			// Populate ResourceSlice.Device.Attributes from device.DeviceInfo.
 			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-				"pciRoot": {
-					StringValue: &allocatableCXL.PCIRoot,
+				"memorySize": {
+					IntValue: ptr(int64(allocatableCXL.MemorySize)),
+				},
+				"memoryNode": {
+					IntValue: ptr(int64(allocatableCXL.MemoryNode)),
+				},
+				"regionName": {
+					StringValue: &allocatableCXL.RegionName,
+				},
+				"mode": {
+					StringValue: &allocatableCXL.Model,
+				},
+			},
+			// Expose memory capacity as allocatable in 2 MB chunks
+			Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+				"memory": {
+					Value: *resource.NewQuantity(capacityChunks, resource.DecimalSI),
 				},
 			},
 		}
@@ -126,6 +146,10 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 	}
 
 	return driverResource
+}
+
+func ptr[T any](v T) *T {
+	return &v
 }
 
 func (s *nodeState) Prepare(ctx context.Context, claim *resourcev1.ResourceClaim) error {
