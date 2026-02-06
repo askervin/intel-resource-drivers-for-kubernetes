@@ -18,6 +18,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path"
@@ -30,15 +31,37 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
-	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/discovery"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/helpers"
 	driverVersion "github.com/intel/intel-resource-drivers-for-kubernetes/pkg/version"
+
+	nricxl "github.com/containers/nri-plugins/pkg/cxl"
 )
 
 type driver struct {
 	client coreclientset.Interface
 	state  nodeState
 	helper *kubeletplugin.Helper
+	config *DriverConfig
+}
+
+type DriverConfig struct {
+	// IgnoreDevices is a list of CXL memory devices. Matches
+	// uevent DEVNAME, <major>:<minor>, or serial number in
+	// decimal format, or 0x<hex>. Example: ["mem0", "cxl/mem0",
+	// "251:0", "3238060771", "0xc100e2e0"]
+	IgnoreDevices []string
+	// IgnoreRegions is a list of CXL memory regions ["region0"]
+	// to be ignored by the driver.
+	IgnoreRegions []string
+	// IgnoreNodes is a list of NUMA nodes to be ignored by the
+	// driver.
+	IgnoreNodes []int
+
+	// If IgnoreNew* is true, hotplugged devices, created regions
+	// and enabled nodes will be ignored by the driver.
+	IgnoreNewMemoryDevices bool
+	IgnoreNewRegions       bool
+	IgnoreNewNodes         bool
 }
 
 func getCXLFlags(someFlags any) (*CXLFlags, error) {
@@ -50,9 +73,17 @@ func getCXLFlags(someFlags any) (*CXLFlags, error) {
 	}
 }
 
+func newDriverConfigFromString(configStr string) (*DriverConfig, error) {
+	driverConfig := &DriverConfig{}
+	if err := json.Unmarshal([]byte(configStr), driverConfig); err != nil {
+		return nil, fmt.Errorf("failed to parse driver config: %v", err)
+	}
+	return driverConfig, nil
+}
+
 func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, error) {
 	driverVersion.PrintDriverVersion(device.DriverName)
-	sysfsDir := helpers.GetSysfsRoot(device.SysfsDriverPath)
+
 	preparedClaimsFilePath := path.Join(config.CommonFlags.KubeletPluginDir, device.PreparedClaimsFileName)
 
 	cxlFlags, err := getCXLFlags(config.DriverFlags)
@@ -60,14 +91,27 @@ func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, err
 		return nil, fmt.Errorf("getCXLFlags: %w", err)
 	}
 
-	// TODO: replace with your discovery call
-	detectedDevices := discovery.DiscoverDevices(sysfsDir, device.DefaultNamingStyle)
-	if len(detectedDevices) == 0 {
-		klog.Info("No supported devices detected")
+	driverConfig, err := newDriverConfigFromString(cxlFlags.ConfigStr)
+	if err != nil {
+		return nil, fmt.Errorf("newDriverConfigFromString: %w", err)
+	}
+
+	// Trim "/sys" suffix if present in SysfsRoot
+	sysfsRoot := cxlFlags.SysfsRoot
+	if len(sysfsRoot) >= 4 && sysfsRoot[len(sysfsRoot)-4:] == "/sys" {
+		cxlFlags.SysfsRoot = sysfsRoot[:len(sysfsRoot)-4]
+	}
+	detectedDevices, err := nricxl.DevicesFromSysfs(sysfsRoot)
+	if err != nil {
+		return nil, fmt.Errorf("failed to detect devices: %v", err)
+	}
+
+	if len(detectedDevices.RegionDevices) == 0 {
+		klog.Info("No region devices detected")
 	}
 
 	klog.V(3).Info("Creating new NodeState")
-	state, err := newNodeState(detectedDevices, config.CommonFlags.CdiRoot, preparedClaimsFilePath, config.CommonFlags.NodeName, cxlFlags.MyFlag1, cxlFlags.MyFlag2)
+	state, err := newNodeState(detectedDevices, config.CommonFlags.CdiRoot, preparedClaimsFilePath, config.CommonFlags.NodeName, driverConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create new NodeState: %v", err)
 	}
@@ -75,6 +119,7 @@ func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, err
 	driver := &driver{
 		state:  *state,
 		client: config.Coreclient,
+		config: driverConfig,
 	}
 
 	klog.Infof(`Starting DRA resource-driver kubelet-plugin

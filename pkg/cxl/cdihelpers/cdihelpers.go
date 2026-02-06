@@ -18,7 +18,6 @@ package cdihelpers
 
 import (
 	"fmt"
-	"path"
 
 	"k8s.io/klog/v2"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
@@ -83,7 +82,10 @@ func addDevicesToSpecAndWrite(cdiCache *cdiapi.Cache, devices device.DevicesInfo
 		newDevice := cdiSpecs.Device{
 			Name: name,
 			ContainerEdits: cdiSpecs.ContainerEdits{
-				DeviceNodes: newContainerEditsDeviceNodes(device.PCIAddress),
+				// Using a CXL memory device does not need to attach
+				// any device nodes into the container.
+				// DeviceNodes: newContainerEditsDeviceNodes(device.PCIAddress),
+				Env: []string{fmt.Sprintf("CXL_DEVICE=%s", device.Name)},
 			},
 		}
 		spec.Devices = append(spec.Devices, newDevice)
@@ -94,19 +96,6 @@ func addDevicesToSpecAndWrite(cdiCache *cdiapi.Cache, devices device.DevicesInfo
 	}
 
 	return nil
-}
-
-// TODO: populate CDI spec device nodes here if needed.
-func newContainerEditsDeviceNodes(pciAddress string) []*cdiSpecs.DeviceNode {
-	deviceNodes := []*cdiSpecs.DeviceNode{
-		{
-			Path:     path.Join(containerDevfsRoot, "null"),
-			HostPath: path.Join(containerDevfsRoot, "null"),
-			Type:     "c",
-		},
-	}
-
-	return deviceNodes
 }
 
 // writeSpec sets latest cdiVersion for spec and writes it.

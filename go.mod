@@ -1,8 +1,9 @@
 module github.com/intel/intel-resource-drivers-for-kubernetes
 
-go 1.24.2
+go 1.25.0
 
 require (
+	github.com/containers/nri-plugins v0.0.0-00010101000000-000000000000
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/onsi/ginkgo/v2 v2.21.0
 	github.com/onsi/gomega v1.35.1
@@ -125,3 +126,5 @@ require (
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
 )
+
+replace github.com/containers/nri-plugins => github.com/askervin/nri-plugins v0.9.5-0.20260108124843-89ea76f6362c

@@ -27,31 +27,31 @@ import (
 )
 
 type CXLFlags struct {
-	MyFlag1 string
-	MyFlag2 string
+	SysfsRoot string
+	ConfigStr string
 }
 
 func main() {
 	cxlFlags := CXLFlags{
-		MyFlag1: cxl.DefaultMyFlag1,
-		MyFlag2: cxl.DefaultMyFlag2,
+		SysfsRoot: cxl.DefaultSysfsRoot,
+		ConfigStr: cxl.DefaultConfigStr,
 	}
 	cliFlags := []cli.Flag{
 		&cli.StringFlag{
-			Name:        "myflag1",
-			Aliases:     []string{"p"},
-			Usage:       "myflag1 short desc",
-			Value:       cxl.DefaultMyFlag1,
-			Destination: &cxlFlags.MyFlag1,
-			EnvVars:     []string{cxl.MyFlag1EnvVarName},
+			Name:        "sysfs",
+			Aliases:     []string{},
+			Usage:       "",
+			Value:       cxl.DefaultSysfsRoot,
+			Destination: &cxlFlags.SysfsRoot,
+			EnvVars:     []string{cxl.SysfsRootEnvVarName},
 		},
 		&cli.StringFlag{
-			Name:        "myflag2",
-			Aliases:     []string{"n"},
-			Usage:       "myflag2 short desc",
-			Value:       cxl.DefaultMyFlag2,
-			Destination: &cxlFlags.MyFlag2,
-			EnvVars:     []string{cxl.MyFlag2EnvVarName},
+			Name:        "config-str",
+			Aliases:     []string{"c"},
+			Usage:       "driver configuration as a string",
+			Value:       cxl.DefaultConfigStr,
+			Destination: &cxlFlags.ConfigStr,
+			EnvVars:     []string{cxl.ConfigStrEnvVarName},
 		},
 	}
 
