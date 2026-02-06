@@ -22,6 +22,7 @@ import (
 	"time"
 
 	resourcev1 "k8s.io/api/resource/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
@@ -169,6 +170,17 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 					},
 					"node": {
 						IntValue: &node,
+					},
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"size": {
+						Value: *resource.NewQuantity(int64(dev.Size), resource.BinarySI),
+						RequestPolicy: &resourcev1.CapacityRequestPolicy{
+							ValidRange: &resourcev1.CapacityRequestPolicyRange{
+								Min:  resource.NewQuantity(0, resource.BinarySI),
+								Step: resource.NewQuantity(2*1024*1024, resource.BinarySI), // allocations in 2Miincrements,
+							},
+						},
 					},
 				},
 			}
