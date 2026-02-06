@@ -18,75 +18,23 @@ package discovery
 
 import (
 	"os"
-	"path"
-	"strings"
 
-	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
-	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/helpers"
+	nricxl "github.com/containers/nri-plugins/pkg/cxl"
 
 	"k8s.io/klog/v2"
 )
 
 // Detect devices from sysfs.
-func DiscoverDevices(sysfsDir, namingStyle string) map[string]*device.DeviceInfo {
+func DiscoverDevices(sysfsDir, namingStyle string) *nricxl.Devices {
+	cxlDevs, err := nricxl.DevicesFromSysfs(sysfsDir)
 
-	sysfsDriverDir := path.Join(sysfsDir, device.SysfsDriverPath)
-
-	devices := make(map[string]*device.DeviceInfo)
-
-	driverDirFiles, err := os.ReadDir(sysfsDriverDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			klog.V(5).Infof("No Intel CXL devices found on this host. %v does not exist", sysfsDriverDir)
-			return devices
+			klog.V(5).Infof("No CXL devices found on this host.")
+			return nil
 		}
-		klog.Errorf("could not read sysfs directory %v: %v", driverDirFiles, err)
-		return devices
+		klog.Errorf("could not read sysfs directory %v: %v", sysfsDir, err)
+		return nil
 	}
-
-	return scanDevicesFromDriverDirFiles(driverDirFiles, sysfsDriverDir, namingStyle)
-
-}
-
-func scanDevicesFromDriverDirFiles(driverDirFiles []os.DirEntry, sysfsDriverDir string, namingStyle string) map[string]*device.DeviceInfo {
-	devices := map[string]*device.DeviceInfo{}
-	for _, pciAddress := range driverDirFiles {
-		devicePCIAddress := pciAddress.Name()
-		// check if file is PCI device
-		if !device.PciRegexp.MatchString(devicePCIAddress) {
-			continue
-		}
-		klog.V(5).Infof("Found CXL PCI device: %s", devicePCIAddress)
-
-		driverDeviceDir := path.Join(sysfsDriverDir, devicePCIAddress)
-		// Read PCI device ID.
-		deviceIdFile := path.Join(driverDeviceDir, "device")
-		deviceIdBytes, err := os.ReadFile(deviceIdFile)
-		if err != nil {
-			klog.Errorf("failed detecting device %v PCI ID: %+v", devicePCIAddress, err)
-			continue
-		}
-		deviceId := strings.TrimSpace(string(deviceIdBytes))
-
-		uid := helpers.DeviceUIDFromPCIinfo(devicePCIAddress, deviceId)
-		klog.V(5).Infof("New cxl UID: %v", uid)
-		newDeviceInfo := &device.DeviceInfo{
-			UID:        uid,
-			PCIAddress: devicePCIAddress,
-			Model:      deviceId,
-			PCIRoot:    helpers.DeterminePCIRoot(driverDeviceDir),
-		}
-
-		devices[determineDeviceName(newDeviceInfo, namingStyle)] = newDeviceInfo
-	}
-
-	return devices
-}
-
-func determineDeviceName(info *device.DeviceInfo, namingStyle string) string {
-	if namingStyle == "classic" {
-		return "cxl" + info.PCIAddress
-	}
-
-	return info.UID
+	return cxlDevs
 }

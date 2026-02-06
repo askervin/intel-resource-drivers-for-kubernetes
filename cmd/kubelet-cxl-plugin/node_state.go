@@ -28,22 +28,20 @@ import (
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
 
-	cdihelpers "github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/cdihelpers"
+	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/cdihelpers"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/helpers"
+
+	nricxl "github.com/containers/nri-plugins/pkg/cxl"
 )
 
 type nodeState struct {
 	*helpers.NodeState
-	myflag1 string
-	myflag2 string
+	config *DriverConfig
 }
 
-func newNodeState(detectedDevices map[string]*device.DeviceInfo, cdiRoot, preparedClaimsFilePath, nodeName, myflag1, myflag2 string) (*nodeState, error) {
-	for ddev := range detectedDevices {
-		klog.V(3).Infof("new device: %+v", ddev)
-	}
-
+func newNodeState(detectedDevices *nricxl.Devices, cdiRoot, preparedClaimsFilePath, nodeName string, driverConfig *DriverConfig) (*nodeState, error) {
+	// was: detectedDevices map[string]*device.DeviceInfo
 	klog.V(5).Info("Refreshing CDI registry")
 	if err := cdiapi.Configure(cdiapi.WithSpecDirs(cdiRoot)); err != nil {
 		return nil, fmt.Errorf("unable to refresh the CDI registry: %v", err)
@@ -51,15 +49,17 @@ func newNodeState(detectedDevices map[string]*device.DeviceInfo, cdiRoot, prepar
 
 	cdiCache := cdiapi.GetDefaultCache()
 
-	// syncDetectedDevicesWithRegistry overrides uid in detecteddevices from existing cdi spec
-	if err := cdihelpers.AddDetectedDevicesToCDIRegistry(cdiCache, detectedDevices, true); err != nil {
-		return nil, fmt.Errorf("unable to sync detected devices to CDI registry: %v", err)
+	devInfo, err := buildDevInfos(driverConfig, detectedDevices)
+	if err != nil {
+		return nil, fmt.Errorf("failed to filter discovered devices: %v", err)
 	}
-
+	if err := cdihelpers.AddDetectedDevicesToCDIRegistry(cdiCache, devInfo, true); err != nil {
+		return nil, fmt.Errorf("failed to add detected devices to CDI registry: %v", err)
+	}
 	time.Sleep(250 * time.Millisecond)
 
 	klog.V(5).Info("Allocatable devices after CDI registry refresh:")
-	for duid, ddev := range detectedDevices {
+	for duid, ddev := range devInfo {
 		klog.V(5).Infof("CDI device: %v : %+v", duid, ddev)
 	}
 
@@ -75,16 +75,16 @@ func newNodeState(detectedDevices map[string]*device.DeviceInfo, cdiRoot, prepar
 	state := nodeState{
 		NodeState: &helpers.NodeState{
 			CdiCache:               cdiCache,
-			Allocatable:            detectedDevices,
+			Allocatable:            devInfo,
 			Prepared:               preparedClaims,
 			PreparedClaimsFilePath: preparedClaimsFilePath,
 			NodeName:               nodeName,
 		},
-		myflag1: myflag1,
-		myflag2: myflag2,
+		config: driverConfig,
 	}
+	fmt.Printf("type ofstate.Allocatable: %T\n", state.Allocatable)
 
-	allocatableDevices, ok := state.Allocatable.(map[string]*device.DeviceInfo)
+	allocatableDevices, ok := state.Allocatable.(device.DevicesInfo)
 	if !ok {
 		return nil, fmt.Errorf("unexpected type for state.Allocatable")
 	}
@@ -97,6 +97,53 @@ func newNodeState(detectedDevices map[string]*device.DeviceInfo, cdiRoot, prepar
 	return &state, nil
 }
 
+func buildDevInfos(driverConfig *DriverConfig, detectedDevices *nricxl.Devices) (device.DevicesInfo, error) {
+	var anyDev interface{}
+	devInfos := make(map[string]*device.DeviceInfo)
+	for _, regDev := range detectedDevices.RegionDevices {
+		klog.V(3).Infof("discovered CXL region device: %+v", regDev)
+		ignoreReason := ""
+		if !regDev.Enabled {
+			ignoreReason = "region is disabled"
+			continue
+		}
+		for _, memDev := range regDev.Memories {
+			if ignoreReason != "" {
+				break
+			}
+			for _, ignoreRegSpec := range driverConfig.IgnoreRegions {
+				if regDev.Name == ignoreRegSpec {
+					ignoreReason = fmt.Sprintf("region name %q", ignoreRegSpec)
+					break
+				}
+			}
+			for _, ignoreDevSpec := range driverConfig.IgnoreDevices {
+				serialDec := fmt.Sprintf("%d", memDev.Serial)
+				serialHex := fmt.Sprintf("0x%X", memDev.Serial)
+				serialHexNoPrefix := fmt.Sprintf("%X", memDev.Serial)
+				if serialDec == ignoreDevSpec || serialHex == ignoreDevSpec || serialHexNoPrefix == ignoreDevSpec {
+					ignoreReason = fmt.Sprintf("region has memory device serial %q", ignoreDevSpec)
+					break
+				}
+			}
+		}
+		if ignoreReason != "" {
+			klog.V(4).Infof("- ignoring region device %q: %s", regDev.Name, ignoreReason)
+			continue
+		}
+		cxlDevName := fmt.Sprintf("cxl-%s-node%d", regDev.Name, regDev.Node)
+		anyDev = regDev
+		devInfo := device.DeviceInfo{
+			Name:      cxlDevName,
+			CxlDev:    &anyDev,
+			SysfsPath: regDev.SysfsPath,
+		}
+		devInfos[regDev.Name] = &devInfo
+	}
+
+	return devInfos, nil
+}
+
 func (s *nodeState) GetResources() resourceslice.DriverResources {
 	s.Lock()
 	defer s.Unlock()
@@ -105,16 +152,28 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 
 	allocatableDevices, _ := s.Allocatable.(map[string]*device.DeviceInfo)
 	for cxlUID, allocatableCXL := range allocatableDevices {
-		newDevice := resourcev1.Device{
-			Name: cxlUID,
-			// Populate ResourceSlice.Device.Attributes from device.DeviceInfo.
-			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-				"pciRoot": {
-					StringValue: &allocatableCXL.PCIRoot,
-				},
-			},
+		var cxlDev interface{}
+		if allocatableCXL.CxlDev == nil {
+			continue
 		}
-		devices = append(devices, newDevice)
+		cxlDev = *allocatableCXL.CxlDev
+		switch dev := cxlDev.(type) {
+		case nricxl.RegionDevice:
+			node := int64(dev.Node)
+			newDevice := resourcev1.Device{
+				Name: cxlUID,
+				// Populate ResourceSlice.Device.Attributes from device.DeviceInfo.
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					"name": {
+						StringValue: &dev.Name,
+					},
+					"node": {
+						IntValue: &node,
+					},
+				},
+			}
+			devices = append(devices, newDevice)
+		}
 	}
 
 	driverResource := resourceslice.DriverResources{

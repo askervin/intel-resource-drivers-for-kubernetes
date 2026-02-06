@@ -27,16 +27,13 @@ var (
 )
 
 const (
-	// TODO: FIXME: remove if not needed
-	SysfsDriverPath = "bus/pci/drivers/cxldriver?"
-
-	CDIVendor        = "intel.com"
+	CDIVendor        = "generic"
 	CDIClass         = "cxl"
 	CDIKind          = CDIVendor + "/" + CDIClass
 	DriverName       = CDIClass + "." + CDIVendor
 	PCIAddressLength = len("0000:00:00.0")
 
-	CXLDevicePattern = "cxl[0-9]*"
+	CXLDevicePattern = "cxl-[-a-z0-9]*"
 
 	PreparedClaimsFileName = "preparedClaims.json"
 
@@ -45,23 +42,23 @@ const (
 	DefaultNamingStyle = "machine"
 
 	// From device-plugin.
-	DefaultMyFlag1    = "flag1value"
-	DefaultMyFlag2    = "flag2Value"
-	MyFlag1EnvVarName = "value1"
-	MyFlag2EnvVarName = "value2"
+	DefaultSysfsRoot    = ""
+	DefaultConfigStr    = ""
+	SysfsRootEnvVarName = "SYSFS_ROOT"
+	ConfigStrEnvVarName = "CONFIG_STR"
 )
 
 // DeviceInfo is an internal structure type to store info about discovered device.
 type DeviceInfo struct {
 	// UID is a unique identifier on node, used in ResourceSlice K8s API object as RFC1123-compliant identifier.
 	// Consists of PCIAddress and Model with colons and dots replaced with hyphens, e.g. 0000-01-02-0-0x1234.
-	UID        string `json:"uid"`
-	PCIAddress string `json:"pciaddress"` // PCI address in Linux DBDF notation for use with sysfs, e.g. 0000:00:00.0
-	Model      string `json:"model"`      // PCI device ID
-	PCIRoot    string `json:"pciroot"`    // PCI Root complex ID
+	UID       string `json:"uid"`
+	Name      string `json:"name"`
+	CxlDev    *any
+	SysfsPath string `json:"sysfs"`
 }
 
-func (g DeviceInfo) CDIName() string {
+func (g *DeviceInfo) CDIName() string {
 	return fmt.Sprintf("%s=%s", CDIKind, g.UID)
 }
 
