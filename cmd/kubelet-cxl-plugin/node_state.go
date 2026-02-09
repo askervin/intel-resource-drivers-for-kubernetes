@@ -29,7 +29,6 @@ import (
 	"k8s.io/utils/cpuset"
 
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
-	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
 
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/cdihelpers"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
@@ -338,20 +337,22 @@ func (s *nodeState) prepareAllocatedDevices(ctx context.Context, claim *resource
 			return allocatedDevices, fmt.Errorf("could not find allocatable device %v (pool %v)", allocatedDevice.Device, allocatedDevice.Pool)
 		}
 
+		klog.V(5).Infof("TODO: device %v for claim %v: allocatable device info: %+v", allocatedDevice.Device, claim.UID, allocatableDevice)
+
 		newDevice := kubeletplugin.Device{
-			Requests:     []string{allocatedDevice.Request},
-			PoolName:     allocatedDevice.Pool,
-			DeviceName:   allocatedDevice.Device,
-			CDIDeviceIDs: []string{allocatableDevice.CDIName()},
+			Requests:   []string{allocatedDevice.Request},
+			PoolName:   allocatedDevice.Pool,
+			DeviceName: allocatedDevice.Device,
+			// no need to inject CDI devices // CDIDeviceIDs: []string{allocatableDevice.CDIName()},
 		}
 		allocatedDevices.Devices = append(allocatedDevices.Devices, newDevice)
-
 	}
 
-	if len(allocatedDevices.Devices) > 0 {
-		cdiName := cdiparser.QualifiedName(device.CDIVendor, device.CDIClass, string(claim.UID))
-		allocatedDevices.Devices[0].CDIDeviceIDs = append(allocatedDevices.Devices[0].CDIDeviceIDs, cdiName)
-	}
+	// no need to inject CDI devices
+	// if len(allocatedDevices.Devices) > 0 {
+	// 	cdiName := cdiparser.QualifiedName(device.CDIVendor, device.CDIClass, string(claim.UID))
+	// 	allocatedDevices.Devices[0].CDIDeviceIDs = append(allocatedDevices.Devices[0].CDIDeviceIDs, cdiName)
+	// }
 
 	return allocatedDevices, nil
 }
