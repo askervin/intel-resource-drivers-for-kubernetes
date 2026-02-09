@@ -58,6 +58,12 @@ type DeviceInfo struct {
 	SysfsPath string `json:"sysfs"`
 }
 
+type SystemDRAM struct {
+	Name  string
+	Nodes []int
+	Size  uint64
+}
+
 func (g *DeviceInfo) CDIName() string {
 	return fmt.Sprintf("%s=%s", CDIKind, g.UID)
 }

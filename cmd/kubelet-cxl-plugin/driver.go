@@ -62,6 +62,11 @@ type DriverConfig struct {
 	IgnoreNewMemoryDevices bool
 	IgnoreNewRegions       bool
 	IgnoreNewNodes         bool
+
+	// If IgnoreDRAMNodes is true, NUMA nodes with DRAM memory
+	// will be ignored by the driver. By default, DRAM nodes are
+	// exposed in DRAM ResourceSlices.
+	IgnoreDRAMNodes bool
 }
 
 func getCXLFlags(someFlags any) (*CXLFlags, error) {
