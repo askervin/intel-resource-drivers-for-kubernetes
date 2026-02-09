@@ -327,7 +327,10 @@ func (s *nodeState) prepareAllocatedDevices(ctx context.Context, claim *resource
 			continue
 		}
 
-		allocatableDevices, _ := s.Allocatable.(map[string]*device.DeviceInfo)
+		allocatableDevices, ok := s.Allocatable.(device.DevicesInfo)
+		if !ok {
+			return allocatedDevices, fmt.Errorf("internal error: unexpected type for state.Allocatable %T", s.Allocatable)
+		}
 
 		allocatableDevice, found := allocatableDevices[allocatedDevice.Device]
 		if !found {
