@@ -270,6 +270,7 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 						Value: *resource.NewQuantity(int64(dev.Size), resource.BinarySI),
 					},
 				},
+				AllowMultipleAllocations: ptr(true),
 			}
 			devices = append(devices, newDevice)
 		default:
