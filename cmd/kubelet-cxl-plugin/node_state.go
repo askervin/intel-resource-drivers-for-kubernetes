@@ -106,26 +106,48 @@ func buildDevInfos(driverConfig *DriverConfig, detectedDevices *nricxl.Devices) 
 		ignoreReason := ""
 		if !regDev.Enabled {
 			ignoreReason = "region is disabled"
-			continue
+		}
+		for _, ignoreRegSpec := range driverConfig.IgnoreRegions {
+			if ignoreReason != "" {
+				break
+			}
+			if regDev.Name == ignoreRegSpec {
+				ignoreReason = fmt.Sprintf("region name %q", ignoreRegSpec)
+			}
+		}
+		for _, ignoreNode := range driverConfig.IgnoreNodes {
+			if ignoreReason != "" {
+				break
+			}
+			if regDev.Node == ignoreNode {
+				ignoreReason = fmt.Sprintf("region is on node %d", ignoreNode)
+			}
 		}
 		for _, memDev := range regDev.Memories {
 			if ignoreReason != "" {
 				break
 			}
-			for _, ignoreRegSpec := range driverConfig.IgnoreRegions {
-				if regDev.Name == ignoreRegSpec {
-					ignoreReason = fmt.Sprintf("region name %q", ignoreRegSpec)
-					break
-				}
-			}
 			for _, ignoreDevSpec := range driverConfig.IgnoreDevices {
-				serialDec := fmt.Sprintf("%d", memDev.Serial)
-				serialHex := fmt.Sprintf("0x%X", memDev.Serial)
-				serialHexNoPrefix := fmt.Sprintf("%X", memDev.Serial)
-				if serialDec == ignoreDevSpec || serialHex == ignoreDevSpec || serialHexNoPrefix == ignoreDevSpec {
-					ignoreReason = fmt.Sprintf("region has memory device serial %q", ignoreDevSpec)
+				if memDev.Name == ignoreDevSpec {
+					ignoreReason = fmt.Sprintf("region has a memory device name %q", ignoreDevSpec)
 					break
 				}
+				if memDev.DevName == ignoreDevSpec {
+					ignoreReason = fmt.Sprintf("region has a memory uevent device name %q", ignoreDevSpec)
+					break
+				}
+				if fmt.Sprintf("%d:%d", memDev.Major, memDev.Minor) == ignoreDevSpec {
+					ignoreReason = fmt.Sprintf("region has a memory device with major:minor %q", ignoreDevSpec)
+					break
+				}
+				serialDec := fmt.Sprintf("%d", memDev.Serial)
+				serialHex := fmt.Sprintf("0x%x", memDev.Serial)
+				serialHexNoPrefix := fmt.Sprintf("%x", memDev.Serial)
+				if serialDec == ignoreDevSpec || serialHex == ignoreDevSpec || serialHexNoPrefix == ignoreDevSpec {
+					ignoreReason = fmt.Sprintf("region has a memory device serial %q", ignoreDevSpec)
+					break
+				}
+
 			}
 		}
 		if ignoreReason != "" {
@@ -141,7 +163,6 @@ func buildDevInfos(driverConfig *DriverConfig, detectedDevices *nricxl.Devices) 
 		}
 		devInfos[regDev.Name] = &devInfo
 	}
-
 	return devInfos, nil
 }
 
@@ -181,14 +202,9 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
 					"size": {
 						Value: *resource.NewQuantity(int64(dev.Size), resource.BinarySI),
-						RequestPolicy: &resourcev1.CapacityRequestPolicy{
-							ValidRange: &resourcev1.CapacityRequestPolicyRange{
-								Min:  resource.NewQuantity(0, resource.BinarySI),
-								Step: resource.NewQuantity(2*1024*1024, resource.BinarySI), // allocations in 2Miincrements,
-							},
-						},
 					},
 				},
+				AllowMultipleAllocations: ptr(true),
 			}
 			devices = append(devices, newDevice)
 		default:
@@ -205,6 +221,10 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 	}
 
 	return driverResource
+}
+
+func ptr[T any](v T) *T {
+	return &v
 }
 
 func (s *nodeState) Prepare(ctx context.Context, claim *resourcev1.ResourceClaim) error {
