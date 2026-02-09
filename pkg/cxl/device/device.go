@@ -54,7 +54,7 @@ type DeviceInfo struct {
 	// Consists of PCIAddress and Model with colons and dots replaced with hyphens, e.g. 0000-01-02-0-0x1234.
 	UID       string `json:"uid"`
 	Name      string `json:"name"`
-	CxlDev    *any
+	Dev       any
 	SysfsPath string `json:"sysfs"`
 }
 

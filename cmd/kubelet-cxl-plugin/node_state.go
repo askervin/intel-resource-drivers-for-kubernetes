@@ -101,7 +101,6 @@ func newNodeState(detectedDevices *nricxl.Devices, cdiRoot, preparedClaimsFilePa
 }
 
 func buildDevInfos(driverConfig *DriverConfig, detectedDevices *nricxl.Devices) (device.DevicesInfo, error) {
-	var anyDev interface{}
 	cxlNodes := make(map[int]bool)
 	devInfos := make(map[string]*device.DeviceInfo)
 	for _, regDev := range detectedDevices.RegionDevices {
@@ -159,10 +158,9 @@ func buildDevInfos(driverConfig *DriverConfig, detectedDevices *nricxl.Devices) 
 			continue
 		}
 		cxlDevName := fmt.Sprintf("cxl-%s-node%d", regDev.Name, regDev.Node)
-		anyDev = regDev
 		devInfo := device.DeviceInfo{
 			Name:      cxlDevName,
-			CxlDev:    ptr(anyDev),
+			Dev:       any(regDev),
 			SysfsPath: regDev.SysfsPath,
 		}
 		devInfos[regDev.Name] = &devInfo
@@ -196,10 +194,9 @@ func buildDevInfos(driverConfig *DriverConfig, detectedDevices *nricxl.Devices) 
 			klog.V(4).Infof("discovered DRAM memory on node %d: size %d bytes", node.ID, node.Size)
 		}
 		if dramDev.Size > 0 {
-			anyDev = dramDev
 			devInfos["dram"] = &device.DeviceInfo{
-				Name:   "dram",
-				CxlDev: ptr(anyDev),
+				Name: "dram",
+				Dev:  any(dramDev),
 			}
 			klog.V(3).Infof("discovered system DRAM device: %+v", dramDev)
 		}
@@ -221,12 +218,10 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 
 	for cxlUID, allocatableCXL := range allocatableDevices {
 		klog.V(5).Infof("Processing allocatable device %v: %+v", cxlUID, allocatableCXL)
-		var cxlDev interface{}
-		if allocatableCXL.CxlDev == nil {
+		if allocatableCXL.Dev == nil {
 			continue
 		}
-		cxlDev = *allocatableCXL.CxlDev
-		switch dev := cxlDev.(type) {
+		switch dev := allocatableCXL.Dev.(type) {
 		case *nricxl.RegionDevice:
 			node := int64(dev.Node)
 			newDevice := resourcev1.Device{
@@ -241,7 +236,7 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 					},
 				},
 				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
-					"size": {
+					"memory": {
 						Value: *resource.NewQuantity(int64(dev.Size), resource.BinarySI),
 					},
 				},
@@ -265,14 +260,14 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 					},
 				},
 				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
-					"size": {
+					"memory": {
 						Value: *resource.NewQuantity(int64(dev.Size), resource.BinarySI),
 					},
 				},
 			}
 			devices = append(devices, newDevice)
 		default:
-			klog.Warningf("unexpected device type in state.Allocatable: %T", cxlDev)
+			klog.Warningf("unexpected device type in state.Allocatable: %T", dev)
 		}
 	}
 
