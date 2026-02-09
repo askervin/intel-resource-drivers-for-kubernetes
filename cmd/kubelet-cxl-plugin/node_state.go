@@ -228,6 +228,9 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 				Name: cxlUID,
 				// Populate ResourceSlice.Device.Attributes from device.DeviceInfo.
 				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					"type": {
+						StringValue: ptr("cxl-node"),
+					},
 					"name": {
 						StringValue: &dev.Name,
 					},
@@ -252,6 +255,9 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 			newDevice := resourcev1.Device{
 				Name: cxlUID,
 				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					"type": {
+						StringValue: ptr("dram"),
+					},
 					"name": {
 						StringValue: &dev.Name,
 					},
