@@ -19,6 +19,7 @@ require (
 	k8s.io/klog/v2 v2.130.1
 	k8s.io/kubernetes v1.34.2
 	k8s.io/pod-security-admission v0.34.0
+	k8s.io/utils v0.0.0-20260108192941-914a6e750570
 	tags.cncf.io/container-device-interface v1.0.1
 	tags.cncf.io/container-device-interface/specs-go v1.0.0
 )
@@ -122,7 +123,6 @@ require (
 	golang.org/x/net v0.38.0 // indirect
 	google.golang.org/grpc v1.72.1 // indirect
 	k8s.io/kubelet v0.34.0 // indirect
-	k8s.io/utils v0.0.0-20250604170112-4c0f3b243397 // indirect
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.0 // indirect
 )

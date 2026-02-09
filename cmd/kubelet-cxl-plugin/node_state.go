@@ -26,6 +26,8 @@ import (
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/cpuset"
+
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
 
@@ -100,6 +102,7 @@ func newNodeState(detectedDevices *nricxl.Devices, cdiRoot, preparedClaimsFilePa
 
 func buildDevInfos(driverConfig *DriverConfig, detectedDevices *nricxl.Devices) (device.DevicesInfo, error) {
 	var anyDev interface{}
+	cxlNodes := make(map[int]bool)
 	devInfos := make(map[string]*device.DeviceInfo)
 	for _, regDev := range detectedDevices.RegionDevices {
 		klog.V(3).Infof("discovered CXL region device: %+v", regDev)
@@ -107,6 +110,7 @@ func buildDevInfos(driverConfig *DriverConfig, detectedDevices *nricxl.Devices) 
 		if !regDev.Enabled {
 			ignoreReason = "region is disabled"
 		}
+		cxlNodes[regDev.Node] = true
 		for _, ignoreRegSpec := range driverConfig.IgnoreRegions {
 			if ignoreReason != "" {
 				break
@@ -158,10 +162,47 @@ func buildDevInfos(driverConfig *DriverConfig, detectedDevices *nricxl.Devices) 
 		anyDev = regDev
 		devInfo := device.DeviceInfo{
 			Name:      cxlDevName,
-			CxlDev:    &anyDev,
+			CxlDev:    ptr(anyDev),
 			SysfsPath: regDev.SysfsPath,
 		}
 		devInfos[regDev.Name] = &devInfo
+	}
+	if !driverConfig.IgnoreDRAMNodes {
+		dramDev := &device.SystemDRAM{
+			Name: "system-dram",
+		}
+		for _, node := range detectedDevices.MemoryNodes {
+			if cxlNodes[node.ID] {
+				continue
+			}
+			ignoreReason := ""
+			if node.Size == 0 {
+				ignoreReason = "node has 0 size"
+			}
+			for _, ignoreNode := range driverConfig.IgnoreNodes {
+				if ignoreReason != "" {
+					break
+				}
+				if node.ID == ignoreNode {
+					ignoreReason = fmt.Sprintf("node ID %d is in ignoreNodes", ignoreNode)
+				}
+			}
+			if ignoreReason != "" {
+				klog.V(4).Infof("- ignoring DRAM on node %d: %s", node.ID, ignoreReason)
+				continue
+			}
+			dramDev.Nodes = append(dramDev.Nodes, node.ID)
+			dramDev.Size += node.Size
+			klog.V(4).Infof("discovered DRAM memory on node %d: size %d bytes", node.ID, node.Size)
+		}
+		if dramDev.Size > 0 {
+			anyDev = dramDev
+			devInfos["dram"] = &device.DeviceInfo{
+				Name:   "dram",
+				CxlDev: ptr(anyDev),
+			}
+			klog.V(3).Infof("discovered system DRAM device: %+v", dramDev)
+		}
 	}
 	return devInfos, nil
 }
@@ -205,6 +246,29 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 					},
 				},
 				AllowMultipleAllocations: ptr(true),
+			}
+			devices = append(devices, newDevice)
+		case *device.SystemDRAM:
+			// convert dev.Nodes into a string
+			// representation, e.g. "0,1,2", use
+			// kubernetes cpusets library to format it.
+			nodeSet := cpuset.New(dev.Nodes...)
+			nodeList := nodeSet.String()
+			newDevice := resourcev1.Device{
+				Name: cxlUID,
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					"name": {
+						StringValue: &dev.Name,
+					},
+					"nodes": {
+						StringValue: &nodeList,
+					},
+				},
+				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
+					"size": {
+						Value: *resource.NewQuantity(int64(dev.Size), resource.BinarySI),
+					},
+				},
 			}
 			devices = append(devices, newDevice)
 		default:
