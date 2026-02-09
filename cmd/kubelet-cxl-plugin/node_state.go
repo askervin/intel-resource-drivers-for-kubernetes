@@ -151,15 +151,21 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 
 	devices := []resourcev1.Device{}
 
-	allocatableDevices, _ := s.Allocatable.(map[string]*device.DeviceInfo)
+	allocatableDevices, ok := s.Allocatable.(device.DevicesInfo)
+	if !ok {
+		klog.Errorf("internal error: unexpected type for state.Allocatable %T", s.Allocatable)
+		return resourceslice.DriverResources{}
+	}
+
 	for cxlUID, allocatableCXL := range allocatableDevices {
+		klog.V(5).Infof("Processing allocatable device %v: %+v", cxlUID, allocatableCXL)
 		var cxlDev interface{}
 		if allocatableCXL.CxlDev == nil {
 			continue
 		}
 		cxlDev = *allocatableCXL.CxlDev
 		switch dev := cxlDev.(type) {
-		case nricxl.RegionDevice:
+		case *nricxl.RegionDevice:
 			node := int64(dev.Node)
 			newDevice := resourcev1.Device{
 				Name: cxlUID,
@@ -185,6 +191,8 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 				},
 			}
 			devices = append(devices, newDevice)
+		default:
+			klog.Warningf("unexpected device type in state.Allocatable: %T", cxlDev)
 		}
 	}
 
