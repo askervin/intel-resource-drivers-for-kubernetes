@@ -31,10 +31,14 @@ TEST_IMAGE ?= gaudi-dra-driver-test-image:latest
 
 EXT_LDFLAGS = -static
 LDFLAGS = \
- -s -w \
  -X ${PKG}/pkg/version.gitCommit=${GIT_COMMIT} \
  -X ${PKG}/pkg/version.buildDate=${BUILD_DATE}
 
+ifeq ($(DEBUG),1)
+    GCFLAGS ?= -gcflags "all=-N -l"
+else
+    LDFLAGS=" -s -w ${LDFLAGS}"
+endif
 
 GOLICENSES_VERSION?=v1.6.0
 ifneq ("$(wildcard licenses/)","")
