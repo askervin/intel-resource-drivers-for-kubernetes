@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
@@ -242,6 +243,11 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 						Value: *resource.NewQuantity(int64(dev.Size), resource.BinarySI),
 					},
 				},
+				NodeAllocatableResourceMappings: map[v1.ResourceName]resourcev1.NodeAllocatableResourceMapping{
+					v1.ResourceMemory: {
+						CapacityKey: ptr(resourcev1.QualifiedName("memory")),
+					},
+				},
 				AllowMultipleAllocations: ptr(true),
 			}
 			devices = append(devices, newDevice)
@@ -267,6 +273,11 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
 					"memory": {
 						Value: *resource.NewQuantity(int64(dev.Size), resource.BinarySI),
+					},
+				},
+				NodeAllocatableResourceMappings: map[v1.ResourceName]resourcev1.NodeAllocatableResourceMapping{
+					v1.ResourceMemory: {
+						CapacityKey: ptr(resourcev1.QualifiedName("memory")),
 					},
 				},
 				AllowMultipleAllocations: ptr(true),
