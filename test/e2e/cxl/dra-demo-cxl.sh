@@ -2,6 +2,9 @@
 
 NAMESPACE="dra-demo-cxl"
 
+# feature gates in kube-apiserver --feature-gates=.... command line syntax
+FEATURE_GATES="DRANodeAllocatableResources=true,DRAConsumableCapacity=true"
+
 SSH_OPTS="-o StrictHostKeyChecking=No -o ControlMaster=auto -o ControlPersist=120 -o ControlPath=~/.ssh/%r@%h-%p"
 
 TMPFILE_CMD="/tmp/$USER-dra-demo-cxl.sh/vmsh.output"
@@ -128,10 +131,40 @@ create-cluster() {
     govm-ssh-hosts
 }
 
+check-feature-gates() {
+    echo 'If k8s is too old, build a recent enough:
+    git clone --depth=1 -b v1.36.0-beta0 https://github.com/kubernetes/kubernetes &&
+    cd kubernetes &&
+    make quick-release-images &&
+    make WHAT="cmd/kubelet cmd/kubeadm cmd/kubectl" &&
+    scp _output/release-images/amd64/kube*.tar n4-cxl-fedora-43-containerd: &&
+    scp _output/bin/{kubelet,kubeadm,kubectl} n4-cxl-fedora-43-containerd:
+    ssh n4-cxl-fedora-43-containerd "
+        sudo mv -v kubelet kubectl kubeadm $(dirname $(command -v kubectl))/ &&
+        for component in apiserver controller-manager scheduler proxy; do sudo ctr -n k8s.io images import kube-$component.tar; done"
+    # and finally
+    kubeadm upgrade apply v1.36.0-beta.0 --force
+    '
+
+    vmsh "sudo sed -i '/^    - kube-apiserver/a\    - --feature-gates=$FEATURE_GATES' /etc/kubernetes/manifests/kube-apiserver.yaml" \
+         "sudo grep '$FEATURE_GATES' /etc/kubernetes/manifests/kube-apiserver.yaml'"
+
+    vmsh "sudo tee -a  /var/lib/kubelet/config.yaml <<< 'featureGates:'" \
+         "grep 'featureGates:' /var/lib/kubelet/config.yaml"
+
+    for fgateval in ${FEATURE_GATES/,/ }; do
+        fgate=${fgateval%=*}; val=${fgateval#*=}
+        vmsh "sudo tee -a /var/lib/kubelet/config.yaml <<< '  $fgate: $val'" \
+             "grep '$fgate: $val' /var/lib/kubelet/config.yaml"
+    done
+}
+
+
 if [[ -z "$vm" ]]; then
     error "specify vm=NAME-OF-HOST where to ssh and run cluster commands"
 fi
 
+echo "Dropping to interactive mode, try check-feature-gates, to start with
 interactive
 
 SSH_OPT="-o ConnectTimeout=2s" vmsh "exit 42"
