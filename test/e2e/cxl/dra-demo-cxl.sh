@@ -65,6 +65,11 @@ interactive() {
     done
 }
 
+## For copy-pasting vmsh commands directly to a prompt in vm,
+## start by copy-pasting:
+#
+# vmsh() { ( [ -n "$2" ] && bash -c "$2" ) || ( bash -c "$1"; [ -z "$2" ] || bash -c "$2" ) }
+
 vmsh() {
     local command="$1"
     local verify="$2"
@@ -164,7 +169,7 @@ if [[ -z "$vm" ]]; then
     error "specify vm=NAME-OF-HOST where to ssh and run cluster commands"
 fi
 
-echo "Dropping to interactive mode, try check-feature-gates, to start with
+echo "Dropping to interactive mode, try check-feature-gates, to start with"
 interactive
 
 SSH_OPT="-o ConnectTimeout=2s" vmsh "exit 42"
@@ -207,7 +212,7 @@ metadata:
 spec:
   selectors:
   - cel:
-      expression: \"device.driver == 'cxl.generic' && device.attributes['type'].string == 'cxl-node'\"
+      expression: \"device.driver == 'cxl.generic' && device.attributes['cxl.generic'].type == 'cxl-node'\"
 ---
 apiVersion: resource.k8s.io/v1
 kind: DeviceClass
@@ -216,7 +221,7 @@ metadata:
 spec:
   selectors:
   - cel:
-      expression: \"device.driver == 'cxl.generic' && device.attributes['type'].string == 'dram'\"
+      expression: \"device.driver == 'cxl.generic' && device.attributes['cxl.generic'].type == 'dram'\"
 EOF" \
          "kubectl get deviceclass cxl-memory-class -o yaml && kubectl get deviceclass dram-memory-class -o yaml"
 
