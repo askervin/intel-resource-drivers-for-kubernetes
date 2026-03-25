@@ -3,7 +3,7 @@
 NAMESPACE="dra-demo-cxl"
 
 # feature gates in kube-apiserver --feature-gates=.... command line syntax
-FEATURE_GATES="DRANodeAllocatableResources=true,DRAConsumableCapacity=true"
+FEATURE_GATES="DRANodeAllocatableResources=true,DRAConsumableCapacity=true,DRAPartitionableDevices=true"
 
 SSH_OPTS="-o StrictHostKeyChecking=No -o ControlMaster=auto -o ControlPersist=120 -o ControlPath=~/.ssh/%r@%h-%p"
 
@@ -152,7 +152,10 @@ check-feature-gates() {
     '
 
     vmsh "sudo sed -i '/^    - kube-apiserver/a\    - --feature-gates=$FEATURE_GATES' /etc/kubernetes/manifests/kube-apiserver.yaml" \
-         "sudo grep '$FEATURE_GATES' /etc/kubernetes/manifests/kube-apiserver.yaml'"
+         "sudo grep '$FEATURE_GATES' /etc/kubernetes/manifests/kube-apiserver.yaml"
+
+    vmsh "sudo sed -i '/^    - kube-scheduler/a\    - --feature-gates=$FEATURE_GATES' /etc/kubernetes/manifests/kube-scheduler.yaml" \
+         "sudo grep '$FEATURE_GATES' /etc/kubernetes/manifests/kube-scheduler.yaml"
 
     vmsh "sudo tee -a  /var/lib/kubelet/config.yaml <<< 'featureGates:'" \
          "grep 'featureGates:' /var/lib/kubelet/config.yaml"
@@ -341,6 +344,18 @@ EOF" \
     vmsh "kubectl get resourceclaims -n $NAMESPACE"
 
     vmsh "kubectl get resourceclaim cxl-memory-claim -n $NAMESPACE -o yaml"
+
+    # TODO: verify that resource mapping from cxl and dram to node native memory works
+    # look for pod .status.nodeAllocatableResourceClaimStatuses?
+    # WEIRD:
+    # in kube-scheduler log there is print from
+    # 	logger.V(5).Info("Patched pod status with NodeAllocatableResourceClaimStatuses", "pod", klog.KObj(pod), "status", targetStatus.NodeAllocatableResourceClaimStatuses)
+    # line 432 in nodeallocatabledynamicresources.go
+
+    vmsh "echo 'You might be running buggy kubelet: pod .status.nodeAllocatableResources does not exist, could be accidentaly dropped (not copied on status update) by kubelet'" \
+         "kubectl get pod -n dra-demo-cxl cxl-memory-pod  -o yaml | grep nodeAllocatableResource -A10"
+
+
 )
 
 # section "peek under the hood"
