@@ -29,12 +29,17 @@ import (
 type CXLFlags struct {
 	SysfsRoot string
 	ConfigStr string
+	NRIName   string
+	NRIIdx    string
+	NRISocket string
 }
 
 func main() {
 	cxlFlags := CXLFlags{
 		SysfsRoot: cxl.DefaultSysfsRoot,
 		ConfigStr: cxl.DefaultConfigStr,
+		NRIName:   "kubelet-cxl-plugin",
+		NRIIdx:    "30",
 	}
 	cliFlags := []cli.Flag{
 		&cli.StringFlag{
@@ -52,6 +57,27 @@ func main() {
 			Value:       cxl.DefaultConfigStr,
 			Destination: &cxlFlags.ConfigStr,
 			EnvVars:     []string{cxl.ConfigStrEnvVarName},
+		},
+		&cli.StringFlag{
+			Name:        "nri-name",
+			Usage:       "NRI plugin name to register",
+			Value:       cxlFlags.NRIName,
+			Destination: &cxlFlags.NRIName,
+			EnvVars:     []string{"NRI_PLUGIN_NAME"},
+		},
+		&cli.StringFlag{
+			Name:        "nri-idx",
+			Usage:       "NRI plugin index (place in the plugin chain, higher is later)",
+			Value:       cxlFlags.NRIIdx, // TODO: before or after resource mgmt plugins?
+			Destination: &cxlFlags.NRIIdx,
+			EnvVars:     []string{"NRI_PLUGIN_IDX"},
+		},
+		&cli.StringFlag{
+			Name:        "nri-socket",
+			Usage:       "NRI socket path (empty for default)",
+			Value:       cxlFlags.NRISocket,
+			Destination: &cxlFlags.NRISocket,
+			EnvVars:     []string{"NRI_SOCKET"},
 		},
 	}
 

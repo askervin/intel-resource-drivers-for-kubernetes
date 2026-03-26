@@ -38,10 +38,11 @@ import (
 )
 
 type driver struct {
-	client coreclientset.Interface
-	state  nodeState
-	helper *kubeletplugin.Helper
-	config *DriverConfig
+	client    coreclientset.Interface
+	state     nodeState
+	helper    *kubeletplugin.Helper
+	config    *DriverConfig
+	nriPlugin *nriPlugin
 }
 
 type DriverConfig struct {
@@ -152,6 +153,19 @@ PluginDataDirectoryPath: %v`,
 		return nil, fmt.Errorf("startup error: %v", err)
 	}
 
+	// Start NRI plugin for container lifecycle hooks.
+	nriOpts := NRIOpts{
+		Name:   cxlFlags.NRIName,
+		Idx:    cxlFlags.NRIIdx,
+		Socket: cxlFlags.NRISocket,
+	}
+	nri, err := startNRIPlugin(ctx, &driver.state, nriOpts)
+	if err != nil {
+		klog.Warningf("Failed to start NRI plugin (continuing without it): %v", err)
+	} else {
+		driver.nriPlugin = nri
+	}
+
 	klog.V(3).Info("Finished creating new driver")
 	return driver, nil
 }
@@ -218,6 +232,9 @@ func (d *driver) PublishResourceSlice(ctx context.Context) error {
 func (d *driver) Shutdown(ctx context.Context) error {
 	klog.V(5).Info("Shutting down driver")
 
+	if d.nriPlugin != nil {
+		d.nriPlugin.Stop()
+	}
 	d.helper.Stop()
 
 	return nil
