@@ -1,5 +1,26 @@
 #!/bin/bash
 
+# This is a demo script to show how to use DRA with a CXL memory
+# driver, using the kubelet-cxl-plugin as an example driver.
+#
+# The script connects to a server that is running k8s single-node
+# cluster and has CXL memory attached.
+#
+# The script runs commands to deploy the driver, create resource
+# claims and pods that use them, and verify that the driver is
+# working.
+#
+# One way to setup such a server in a virtual machine is using
+# nri-plugins e2e tests:
+#
+# git clone https://github.com/containers/nri-plugins
+# cd nri-plugins/test/e2e
+# ./run_tests.sh memory.test-suite/memory-policy/n4-cxl
+#
+# Usage:
+#
+# vm=n4-cxl-fedora-43-containerd ./dra-demo-cxl.sh
+
 NAMESPACE="dra-demo-cxl"
 
 # feature gates in kube-apiserver --feature-gates=.... command line syntax
@@ -7,22 +28,16 @@ FEATURE_GATES="DRANodeAllocatableResources=true,DRAConsumableCapacity=true,DRAPa
 
 SSH_OPTS="-o StrictHostKeyChecking=No -o ControlMaster=auto -o ControlPersist=120 -o ControlPath=~/.ssh/%r@%h-%p"
 
-TMPFILE_CMD="/tmp/$USER-dra-demo-cxl.sh/vmsh.output"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR=$(cd "$SCRIPT_DIR"; git rev-parse --show-toplevel)
 
 CXL_DRIVER_BIN="$PROJECT_DIR/bin/kubelet-cxl-plugin"
 
+TMPFILE_CMD="$SCRIPT_DIR/output/dra-demo-cxl/vmsh.output"
+
 if [[ "$DEBUG" == "1" ]]; then
     VMSH_DEBUG_PREFIX="set -x; "
 fi
-
-# [ -f ./run.sh ] || {
-#     echo "file not found: ./run.sh"
-#     echo "run this script in github.com/intel/memtierd/test/e2e"
-#     exit 1
-# }
 
 error() {
     echo "dra-demo-cxl.sh error: $*" >&2
@@ -121,6 +136,9 @@ vmwaitsh() {
 
 create-cluster() {
     error "no, you don't want to create a cluster right now.... creating cxl vm cluster not implemented yet"
+
+    # Following would create a multinode cluster using govm (qemu)
+    # with github.com/intel/memtierd/test/e2e/run.sh script.
 
     export topology='[{"mem":"8G","cores":"2"}]'
     export distro=fedora
@@ -299,6 +317,38 @@ spec:
 EOF" \
          "kubectl get resourceclaim sys-memory-claim -n $NAMESPACE -o yaml"
 
+    vmsh "kubectl apply -n $NAMESPACE -f - <<EOF
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: cxl-memory-policy-claim
+spec:
+  devices:
+    requests:
+    - name: some-cxl-memory
+      exactly:
+        deviceClassName: cxl-memory-class
+        capacity:
+          requests:
+            memory: 100Mi
+    - name: some-dram-memory
+      exactly:
+        deviceClassName: dram-memory-class
+        capacity:
+          requests:
+            memory: 1Gi
+    config:
+    - opaque:
+        driver: cxl.generic
+        parameters:
+          apiVersion: cxl.generic/v1alpha1
+          kind: MemoryPolicyConfig
+          memoryUseOrder: \"first-dram\"
+          minStep: \"128M\"
+          maxStep: \"1G\"
+EOF" \
+         "kubectl get resourceclaim cxl-memory-policy-claim -n $NAMESPACE -o yaml"
+
     log "you should have resource claims now. 'exit' to continue"
     interactive
 
@@ -365,9 +415,9 @@ EOF" \
 
 section "delete the pod"
 (
-    vmsh "kubectl delete pod cxl-memory-pod -n $NAMESPACE"
+    vmsh "kubectl delete pod cxl-memory-pod -n $NAMESPACE --now"
 
-    vmwaitsh 'kubectl get resourceclaim cxl-memory-claim -n $NAMESPACE -o json | jq -e ".status == {}"'
+    vmwaitsh "kubectl get resourceclaim cxl-memory-claim -n $NAMESPACE -o json | jq -e '.status == {}'"
 
     # vmsh "kubectl logs -l app.kubernetes.io/name=dra-example-driver -n dra-tutorial"
 )
