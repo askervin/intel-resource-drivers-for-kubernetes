@@ -89,26 +89,35 @@ func (p *nriPlugin) onClose() {
 }
 
 // CreateContainer is called by the container runtime (via NRI) when a
-// new container is about to be created. This is where we look up the
-// memory policy for the pod's resource claims and will eventually
-// configure cgroup memory steering.
+// new container is about to be created. It identifies which resource
+// claims belong to this specific container by scanning CDI-injected
+// CXL_CLAIM_* environment variables, then looks up memory policies
+// from in-process state.
 func (p *nriPlugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	podUID := pod.GetUid()
 	podName := pod.GetNamespace() + "/" + pod.GetName()
 	ctrName := ctr.GetName()
 
-	klog.V(3).Infof("NRI CreateContainer: pod=%s ctr=%s uid=%s", podName, ctrName, podUID)
+	klog.V(3).Infof("NRI CreateContainer: pod=%s ctr=%s", podName, ctrName)
 
-	// Look up memory policies for all claims prepared for this pod.
-	policies := p.state.GetMemoryPoliciesForPod(podUID)
-	if len(policies) == 0 {
-		klog.V(5).Infof("NRI CreateContainer: no memory policies for pod %s", podName)
+	// Scan container env vars for CDI-injected claim markers.
+	claimUIDs := extractClaimUIDs(ctr.GetEnv())
+	if len(claimUIDs) == 0 {
+		klog.V(5).Infof("NRI CreateContainer: no CXL claims for pod=%s ctr=%s", podName, ctrName)
 		return nil, nil, nil
 	}
 
-	for claimUID, policy := range policies {
-		klog.V(3).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s policy: order=%s minStep=%s maxStep=%s",
-			podName, ctrName, claimUID, policy.MemoryUseOrder, policy.MinStep, policy.MaxStep)
+	klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s has %d CXL claim(s): %v", podName, ctrName, len(claimUIDs), claimUIDs)
+
+	// Look up memory policy for each claim from shared state.
+	for _, claimUID := range claimUIDs {
+		policy := p.state.GetMemoryPolicy(claimUID)
+		if policy == nil {
+			klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s: no memory policy (may be nil or driver restarted)",
+				podName, ctrName, claimUID)
+			continue
+		}
+		klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s policy: order=%s waypoints=%v minStep=%s maxStep=%s",
+			podName, ctrName, claimUID, policy.MemoryUseOrder, policy.MemoryUseWaypoints, policy.MinStep, policy.MaxStep)
 	}
 
 	// TODO: Start cgmpolmgr.Manager for this container's cgroup
@@ -119,15 +128,37 @@ func (p *nriPlugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr 
 }
 
 // RemoveContainer is called by the container runtime (via NRI) when a
-// container is being removed. This is where we will stop the cgroup
-// memory policy manager for the container.
+// container is being removed. It logs which claims were associated
+// with the container for diagnostic purposes.
 func (p *nriPlugin) RemoveContainer(_ context.Context, pod *api.PodSandbox, ctr *api.Container) error {
 	podName := pod.GetNamespace() + "/" + pod.GetName()
 	ctrName := ctr.GetName()
 
-	klog.V(3).Infof("NRI RemoveContainer: pod=%s ctr=%s", podName, ctrName)
+	claimUIDs := extractClaimUIDs(ctr.GetEnv())
+	if len(claimUIDs) == 0 {
+		klog.V(5).Infof("NRI RemoveContainer: no CXL claims for pod=%s ctr=%s", podName, ctrName)
+		return nil
+	}
+
+	klog.V(5).Infof("NRI RemoveContainer: pod=%s ctr=%s releasing claims: %v", podName, ctrName, claimUIDs)
 
 	// TODO: Stop cgmpolmgr.Manager for this container.
 
 	return nil
+}
+
+// extractClaimUIDs scans an environment variable list for CDI-injected
+// CXL_CLAIM_* markers and returns the unique claim UIDs. Duplicates
+// are possible because each device in a claim carries the same CDI
+// marker, and kubelet doesn't deduplicate CDI device IDs.
+func extractClaimUIDs(envVars []string) []string {
+	seen := make(map[string]bool)
+	var uids []string
+	for _, env := range envVars {
+		if uid, ok := ClaimUIDFromEnvVar(env); ok && !seen[uid] {
+			seen[uid] = true
+			uids = append(uids, uid)
+		}
+	}
+	return uids
 }
