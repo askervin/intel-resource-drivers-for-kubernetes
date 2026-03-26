@@ -18,7 +18,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -33,14 +36,20 @@ import (
 
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/cdihelpers"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
+	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/memorypolicy"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/helpers"
 
 	nricxl "github.com/containers/nri-plugins/pkg/cxl"
 )
 
+// PreparedPolicies maps claim UIDs to their parsed memory policy configs.
+type PreparedPolicies map[string]*memorypolicy.MemoryPolicyConfig
+
 type nodeState struct {
 	*helpers.NodeState
-	config *DriverConfig
+	config           *DriverConfig
+	preparedPolicies PreparedPolicies
+	policiesFilePath string
 }
 
 func newNodeState(detectedDevices *nricxl.Devices, cdiRoot, preparedClaimsFilePath, nodeName string, driverConfig *DriverConfig) (*nodeState, error) {
@@ -73,6 +82,13 @@ func newNodeState(detectedDevices *nricxl.Devices, cdiRoot, preparedClaimsFilePa
 		return nil, fmt.Errorf("failed to get prepared claims: %v", err)
 	}
 
+	policiesFilePath := filepath.Join(filepath.Dir(preparedClaimsFilePath), "preparedPolicies.json")
+	policies, err := getOrCreatePreparedPolicies(policiesFilePath)
+	if err != nil {
+		klog.Errorf("failed to get prepared policies: %v", err)
+		return nil, fmt.Errorf("failed to get prepared policies: %v", err)
+	}
+
 	klog.V(5).Info("Creating NodeState")
 	// TODO: allocatable should include cdi-described
 	state := nodeState{
@@ -83,7 +99,9 @@ func newNodeState(detectedDevices *nricxl.Devices, cdiRoot, preparedClaimsFilePa
 			PreparedClaimsFilePath: preparedClaimsFilePath,
 			NodeName:               nodeName,
 		},
-		config: driverConfig,
+		config:           driverConfig,
+		preparedPolicies: policies,
+		policiesFilePath: policiesFilePath,
 	}
 	fmt.Printf("type ofstate.Allocatable: %T\n", state.Allocatable)
 
@@ -303,6 +321,31 @@ func ptr[T any](v T) *T {
 	return &v
 }
 
+// Unprepare overrides helpers.NodeState.Unprepare to also clean up
+// the memory policy associated with a claim.
+func (s *nodeState) Unprepare(ctx context.Context, claimUID string) error {
+	s.Lock()
+	defer s.Unlock()
+
+	if _, found := s.Prepared[claimUID]; !found {
+		return nil
+	}
+
+	klog.V(5).Infof("Freeing devices from claim %v", claimUID)
+	delete(s.Prepared, claimUID)
+	delete(s.preparedPolicies, claimUID)
+
+	if err := helpers.WritePreparedClaimsToFile(s.PreparedClaimsFilePath, s.Prepared); err != nil {
+		return fmt.Errorf("failed to write prepared claims to file: %v", err)
+	}
+
+	if err := writePreparedPoliciesToFile(s.policiesFilePath, s.preparedPolicies); err != nil {
+		return fmt.Errorf("failed to write prepared policies to file: %v", err)
+	}
+
+	return nil
+}
+
 func (s *nodeState) Prepare(ctx context.Context, claim *resourcev1.ResourceClaim) error {
 	// To prevent concurrent writing of prepared claims file and potential data loss.
 	s.Lock()
@@ -312,23 +355,33 @@ func (s *nodeState) Prepare(ctx context.Context, claim *resourcev1.ResourceClaim
 		return fmt.Errorf("no allocation found in claim %v/%v status", claim.Namespace, claim.Name)
 	}
 
-	allocatedDevices, err := s.prepareAllocatedDevices(ctx, claim)
+	allocatedDevices, policy, err := s.prepareAllocatedDevices(ctx, claim)
 	if err != nil {
 		return err
 	}
 
 	s.Prepared[string(claim.UID)] = allocatedDevices
+	if policy != nil {
+		s.preparedPolicies[string(claim.UID)] = policy
+		klog.V(3).Infof("Claim %v has memory policy: order=%s minStep=%s maxStep=%s",
+			claim.UID, policy.MemoryUseOrder, policy.MinStep, policy.MaxStep)
+	}
 
 	if err = helpers.WritePreparedClaimsToFile(s.PreparedClaimsFilePath, s.Prepared); err != nil {
 		klog.Errorf("failed to write prepared claims to file: %v", err)
 		return fmt.Errorf("failed to write prepared claims to file: %v", err)
 	}
 
+	if err = writePreparedPoliciesToFile(s.policiesFilePath, s.preparedPolicies); err != nil {
+		klog.Errorf("failed to write prepared policies to file: %v", err)
+		return fmt.Errorf("failed to write prepared policies to file: %v", err)
+	}
+
 	klog.V(5).Infof("Created prepared claim %v allocation", claim.UID)
 	return nil
 }
 
-func (s *nodeState) prepareAllocatedDevices(ctx context.Context, claim *resourcev1.ResourceClaim) (allocatedDevices kubeletplugin.PrepareResult, err error) {
+func (s *nodeState) prepareAllocatedDevices(ctx context.Context, claim *resourcev1.ResourceClaim) (allocatedDevices kubeletplugin.PrepareResult, policy *memorypolicy.MemoryPolicyConfig, err error) {
 	allocatedDevices = kubeletplugin.PrepareResult{}
 
 	for _, allocatedDevice := range claim.Status.Allocation.Devices.Results {
@@ -340,12 +393,12 @@ func (s *nodeState) prepareAllocatedDevices(ctx context.Context, claim *resource
 
 		allocatableDevices, ok := s.Allocatable.(device.DevicesInfo)
 		if !ok {
-			return allocatedDevices, fmt.Errorf("internal error: unexpected type for state.Allocatable %T", s.Allocatable)
+			return allocatedDevices, nil, fmt.Errorf("internal error: unexpected type for state.Allocatable %T", s.Allocatable)
 		}
 
 		allocatableDevice, found := allocatableDevices[allocatedDevice.Device]
 		if !found {
-			return allocatedDevices, fmt.Errorf("could not find allocatable device %v (pool %v)", allocatedDevice.Device, allocatedDevice.Pool)
+			return allocatedDevices, nil, fmt.Errorf("could not find allocatable device %v (pool %v)", allocatedDevice.Device, allocatedDevice.Pool)
 		}
 
 		klog.V(5).Infof("TODO: device %v for claim %v: allocatable device info: %+v", allocatedDevice.Device, claim.UID, allocatableDevice)
@@ -359,11 +412,103 @@ func (s *nodeState) prepareAllocatedDevices(ctx context.Context, claim *resource
 		allocatedDevices.Devices = append(allocatedDevices.Devices, newDevice)
 	}
 
-	// no need to inject CDI devices
-	// if len(allocatedDevices.Devices) > 0 {
-	// 	cdiName := cdiparser.QualifiedName(device.CDIVendor, device.CDIClass, string(claim.UID))
-	// 	allocatedDevices.Devices[0].CDIDeviceIDs = append(allocatedDevices.Devices[0].CDIDeviceIDs, cdiName)
-	// }
+	// Parse opaque device configuration for memory policy.
+	policy, err = parseMemoryPolicyFromClaim(claim)
+	if err != nil {
+		return allocatedDevices, nil, fmt.Errorf("failed to parse memory policy config from claim %v/%v: %w", claim.Namespace, claim.Name, err)
+	}
 
-	return allocatedDevices, nil
+	return allocatedDevices, policy, nil
+}
+
+// parseMemoryPolicyFromClaim extracts a MemoryPolicyConfig from the
+// opaque device configuration entries in a claim's allocation. It
+// looks at both claim-level and class-level config entries, with
+// claim-level taking precedence.
+func parseMemoryPolicyFromClaim(claim *resourcev1.ResourceClaim) (*memorypolicy.MemoryPolicyConfig, error) {
+	if claim.Status.Allocation == nil {
+		return nil, nil
+	}
+
+	var claimPolicy, classPolicy *memorypolicy.MemoryPolicyConfig
+
+	for _, cfg := range claim.Status.Allocation.Devices.Config {
+		if cfg.Opaque == nil || cfg.Opaque.Driver != device.DriverName {
+			continue
+		}
+
+		var candidate memorypolicy.MemoryPolicyConfig
+		if err := json.Unmarshal(cfg.Opaque.Parameters.Raw, &candidate); err != nil {
+			klog.V(5).Infof("skipping opaque config entry for driver %s: unmarshal error: %v", device.DriverName, err)
+			continue
+		}
+
+		if candidate.Kind != memorypolicy.Kind {
+			klog.V(5).Infof("skipping opaque config entry with kind %q (expected %q)", candidate.Kind, memorypolicy.Kind)
+			continue
+		}
+
+		if err := candidate.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid MemoryPolicyConfig in claim: %w", err)
+		}
+
+		switch cfg.Source {
+		case resourcev1.AllocationConfigSourceClaim:
+			claimPolicy = &candidate
+		case resourcev1.AllocationConfigSourceClass:
+			if classPolicy == nil {
+				classPolicy = &candidate
+			}
+		}
+	}
+
+	// Claim-level config takes precedence over class-level.
+	if claimPolicy != nil {
+		return claimPolicy, nil
+	}
+	return classPolicy, nil
+}
+
+// GetMemoryPolicy returns the memory policy config for a given claim
+// UID, or nil if no policy was configured.
+func (s *nodeState) GetMemoryPolicy(claimUID string) *memorypolicy.MemoryPolicyConfig {
+	s.Lock()
+	defer s.Unlock()
+	return s.preparedPolicies[claimUID]
+}
+
+// getOrCreatePreparedPolicies loads the prepared policies from the
+// file or creates an empty file.
+func getOrCreatePreparedPolicies(filePath string) (PreparedPolicies, error) {
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		klog.V(5).Infof("creating empty prepared policies file %v", filePath)
+		if err := os.WriteFile(filePath, []byte("{}"), 0600); err != nil {
+			return nil, fmt.Errorf("failed creating %v: %v", filePath, err)
+		}
+		return make(PreparedPolicies), nil
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed reading %v: %v", filePath, err)
+	}
+
+	policies := make(PreparedPolicies)
+	if err := json.Unmarshal(data, &policies); err != nil {
+		return nil, fmt.Errorf("failed parsing %v: %v", filePath, err)
+	}
+
+	return policies, nil
+}
+
+// writePreparedPoliciesToFile serializes the prepared policies to a JSON file.
+func writePreparedPoliciesToFile(filePath string, policies PreparedPolicies) error {
+	if policies == nil {
+		policies = PreparedPolicies{}
+	}
+	data, err := json.MarshalIndent(policies, "", "  ")
+	if err != nil {
+		return fmt.Errorf("prepared policies JSON encoding failed: %v", err)
+	}
+	return os.WriteFile(filePath, data, 0600)
 }
