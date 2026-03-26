@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -33,6 +34,8 @@ import (
 	"k8s.io/utils/cpuset"
 
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
+	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
+	cdiSpecs "tags.cncf.io/container-device-interface/specs-go"
 
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/cdihelpers"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
@@ -40,6 +43,17 @@ import (
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/helpers"
 
 	nricxl "github.com/containers/nri-plugins/pkg/cxl"
+)
+
+const (
+	// cdiClaimEnvPrefix is the prefix for CDI-injected environment
+	// variables that mark which claims are associated with a container.
+	// The full env var name is CXL_CLAIM_<claimUID_with_underscores>=1.
+	cdiClaimEnvPrefix = "CXL_CLAIM_"
+
+	// cdiClaimSpecName is the name of the CDI spec file used for
+	// claim marker devices (separate from the hardware device spec).
+	cdiClaimSpecName = "cxl-claims"
 )
 
 // PreparedPolicies maps claim UIDs to their parsed memory policy configs.
@@ -347,6 +361,11 @@ func (s *nodeState) Unprepare(ctx context.Context, claimUID string) error {
 		}
 	}
 
+	// Remove CDI claim marker device.
+	if err := s.removeCDIClaimMarker(claimUID); err != nil {
+		klog.Warningf("failed to remove CDI claim marker for %v: %v", claimUID, err)
+	}
+
 	if err := helpers.WritePreparedClaimsToFile(s.PreparedClaimsFilePath, s.Prepared); err != nil {
 		return fmt.Errorf("failed to write prepared claims to file: %v", err)
 	}
@@ -433,9 +452,19 @@ func (s *nodeState) prepareAllocatedDevices(ctx context.Context, claim *resource
 			Requests:   []string{allocatedDevice.Request},
 			PoolName:   allocatedDevice.Pool,
 			DeviceName: allocatedDevice.Device,
-			// no need to inject CDI devices // CDIDeviceIDs: []string{allocatableDevice.CDIName()},
+			CDIDeviceIDs: []string{
+				cdiparser.QualifiedName(device.CDIVendor, device.CDIClass, claimCDIDeviceName(string(claim.UID))),
+			},
 		}
 		allocatedDevices.Devices = append(allocatedDevices.Devices, newDevice)
+	}
+
+	// Create a CDI marker device for this claim so that the container
+	// runtime injects a CXL_CLAIM_<uid>=1 env var into containers
+	// that reference this claim. The NRI CreateContainer handler uses
+	// these env vars to identify which claims belong to a container.
+	if err := s.addCDIClaimMarker(string(claim.UID)); err != nil {
+		return allocatedDevices, nil, fmt.Errorf("failed to create CDI claim marker for %v: %w", claim.UID, err)
 	}
 
 	// Parse opaque device configuration for memory policy.
@@ -558,4 +587,102 @@ func writePreparedPoliciesToFile(filePath string, policies PreparedPolicies) err
 		return fmt.Errorf("prepared policies JSON encoding failed: %v", err)
 	}
 	return os.WriteFile(filePath, data, 0600)
+}
+
+// claimCDIDeviceName returns the CDI device name for a claim marker.
+// The name is "claim-<claimUID>" which is valid per CDI naming rules.
+func claimCDIDeviceName(claimUID string) string {
+	return "claim-" + claimUID
+}
+
+// claimEnvVarName returns the environment variable name for a claim
+// marker. Hyphens in the UID are replaced with underscores since env
+// var names don't allow hyphens.
+func claimEnvVarName(claimUID string) string {
+	return cdiClaimEnvPrefix + strings.ReplaceAll(claimUID, "-", "_")
+}
+
+// ClaimUIDFromEnvVar extracts a claim UID from a CXL_CLAIM_* env var
+// name, reversing the hyphen→underscore mapping. Returns the UID and
+// true if the env var matches the prefix, or "" and false otherwise.
+func ClaimUIDFromEnvVar(envVar string) (string, bool) {
+	// envVar is "KEY=VALUE"
+	parts := strings.SplitN(envVar, "=", 2)
+	key := parts[0]
+	if !strings.HasPrefix(key, cdiClaimEnvPrefix) {
+		return "", false
+	}
+	uidWithUnderscores := key[len(cdiClaimEnvPrefix):]
+	// Restore hyphens. UID format is 8-4-4-4-12 hex digits.
+	uid := strings.ReplaceAll(uidWithUnderscores, "_", "-")
+	return uid, true
+}
+
+// addCDIClaimMarker adds a CDI device entry for the given claim UID
+// to the claims CDI spec file. The device injects an env var
+// CXL_CLAIM_<uid>=1 into the container.
+func (s *nodeState) addCDIClaimMarker(claimUID string) error {
+	spec := s.buildClaimMarkerSpec()
+	// Add the new claim device.
+	devName := claimCDIDeviceName(claimUID)
+	spec.Devices = append(spec.Devices, cdiSpecs.Device{
+		Name: devName,
+		ContainerEdits: cdiSpecs.ContainerEdits{
+			Env: []string{claimEnvVarName(claimUID) + "=1"},
+		},
+	})
+	return s.writeClaimMarkerSpec(spec)
+}
+
+// removeCDIClaimMarker rebuilds the CDI claim marker spec without the
+// given claim UID. Since it rebuilds from s.Prepared (which should
+// already have the claim removed), this effectively removes the
+// claim's CDI device entry.
+func (s *nodeState) removeCDIClaimMarker(claimUID string) error {
+	spec := s.buildClaimMarkerSpec()
+	return s.writeClaimMarkerSpec(spec)
+}
+
+// buildClaimMarkerSpec builds a CDI spec containing marker devices
+// for all currently prepared claims. This is built from
+// preparedPolicies (not from the existing CDI file) so it is safe
+// even after a driver restart where the CDI file may be stale.
+func (s *nodeState) buildClaimMarkerSpec() *cdiSpecs.Spec {
+	spec := &cdiSpecs.Spec{
+		Kind: device.CDIKind,
+	}
+	for claimUID := range s.Prepared {
+		devName := claimCDIDeviceName(claimUID)
+		spec.Devices = append(spec.Devices, cdiSpecs.Device{
+			Name: devName,
+			ContainerEdits: cdiSpecs.ContainerEdits{
+				Env: []string{claimEnvVarName(claimUID) + "=1"},
+			},
+		})
+	}
+	return spec
+}
+
+// writeClaimMarkerSpec writes the claims CDI spec file.
+func (s *nodeState) writeClaimMarkerSpec(spec *cdiSpecs.Spec) error {
+	cdiVersion, err := cdiapi.MinimumRequiredVersion(spec)
+	if err != nil {
+		return fmt.Errorf("failed to get minimum required CDI spec version: %v", err)
+	}
+	spec.Version = cdiVersion
+
+	if len(spec.Devices) == 0 {
+		if err := s.CdiCache.RemoveSpec(cdiClaimSpecName); err != nil {
+			klog.V(5).Infof("Could not remove CDI claim spec (may not exist): %v", err)
+		} else {
+			klog.V(5).Info("Removed empty CDI claim marker spec")
+		}
+		return nil
+	}
+
+	if err := s.CdiCache.WriteSpec(spec, cdiClaimSpecName); err != nil {
+		return fmt.Errorf("failed to write CDI claim spec: %v", err)
+	}
+	klog.V(5).Infof("Wrote CDI claim marker spec with %d devices", len(spec.Devices))
+	return nil
 }
