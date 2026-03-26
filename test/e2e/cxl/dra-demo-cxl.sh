@@ -321,7 +321,7 @@ EOF" \
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaim
 metadata:
-  name: cxl-memory-policy-claim
+  name: dram-then-cxl-claim
 spec:
   devices:
     requests:
@@ -330,13 +330,13 @@ spec:
         deviceClassName: cxl-memory-class
         capacity:
           requests:
-            memory: 100Mi
+            memory: 128Mi
     - name: some-dram-memory
       exactly:
         deviceClassName: dram-memory-class
         capacity:
           requests:
-            memory: 1Gi
+            memory: 384Mi
     config:
     - opaque:
         driver: cxl.generic
@@ -344,10 +344,10 @@ spec:
           apiVersion: cxl.generic/v1alpha1
           kind: MemoryPolicyConfig
           memoryUseOrder: \"first-dram\"
-          minStep: \"128M\"
-          maxStep: \"1G\"
+          minStep: \"64M\"
+          maxStep: \"128M\"
 EOF" \
-         "kubectl get resourceclaim cxl-memory-policy-claim -n $NAMESPACE -o yaml"
+         "kubectl get resourceclaim dram-then-cxl-claim -n $NAMESPACE -o yaml"
 
     log "you should have resource claims now. 'exit' to continue"
     interactive
@@ -374,11 +374,19 @@ spec:
     resources:
       claims:
       - name: sys-memory
+  - name: ctr2
+    image: busybox
+    command: [\"sh\", \"-c\", \"env; sleep 3600\"]
+    resources:
+      claims:
+      - name: both-memories
   resourceClaims:
   - name: cxl-memory
     resourceClaimName: cxl-memory-claim
   - name: sys-memory
     resourceClaimName: sys-memory-claim
+  - name: both-memories
+    resourceClaimName: dram-then-cxl-claim
 EOF" \
          "kubectl get pod cxl-memory-pod -n $NAMESPACE -o yaml"
 
