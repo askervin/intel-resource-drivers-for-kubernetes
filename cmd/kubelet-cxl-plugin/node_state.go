@@ -50,6 +50,9 @@ type nodeState struct {
 	config           *DriverConfig
 	preparedPolicies PreparedPolicies
 	policiesFilePath string
+	// podClaims maps pod UID → set of claim UIDs prepared for that pod.
+	// Built during Prepare from claim.Status.ReservedFor.
+	podClaims map[string]map[string]bool
 }
 
 func newNodeState(detectedDevices *nricxl.Devices, cdiRoot, preparedClaimsFilePath, nodeName string, driverConfig *DriverConfig) (*nodeState, error) {
@@ -102,6 +105,7 @@ func newNodeState(detectedDevices *nricxl.Devices, cdiRoot, preparedClaimsFilePa
 		config:           driverConfig,
 		preparedPolicies: policies,
 		policiesFilePath: policiesFilePath,
+		podClaims:        make(map[string]map[string]bool),
 	}
 	fmt.Printf("type ofstate.Allocatable: %T\n", state.Allocatable)
 
@@ -335,6 +339,14 @@ func (s *nodeState) Unprepare(ctx context.Context, claimUID string) error {
 	delete(s.Prepared, claimUID)
 	delete(s.preparedPolicies, claimUID)
 
+	// Clean up pod→claim mapping.
+	for podUID, claims := range s.podClaims {
+		delete(claims, claimUID)
+		if len(claims) == 0 {
+			delete(s.podClaims, podUID)
+		}
+	}
+
 	if err := helpers.WritePreparedClaimsToFile(s.PreparedClaimsFilePath, s.Prepared); err != nil {
 		return fmt.Errorf("failed to write prepared claims to file: %v", err)
 	}
@@ -365,6 +377,20 @@ func (s *nodeState) Prepare(ctx context.Context, claim *resourcev1.ResourceClaim
 		s.preparedPolicies[string(claim.UID)] = policy
 		klog.V(3).Infof("Claim %v has memory policy: order=%s minStep=%s maxStep=%s",
 			claim.UID, policy.MemoryUseOrder, policy.MinStep, policy.MaxStep)
+	}
+
+	// Record pod→claim mapping from ReservedFor so that NRI
+	// CreateContainer can look up policies by pod UID.
+	claimUID := string(claim.UID)
+	for _, consumer := range claim.Status.ReservedFor {
+		if consumer.Resource == "pods" {
+			podUID := string(consumer.UID)
+			if s.podClaims[podUID] == nil {
+				s.podClaims[podUID] = make(map[string]bool)
+			}
+			s.podClaims[podUID][claimUID] = true
+			klog.V(5).Infof("Recorded pod %s (%s) → claim %s mapping", consumer.Name, podUID, claimUID)
+		}
 	}
 
 	if err = helpers.WritePreparedClaimsToFile(s.PreparedClaimsFilePath, s.Prepared); err != nil {
@@ -475,6 +501,27 @@ func (s *nodeState) GetMemoryPolicy(claimUID string) *memorypolicy.MemoryPolicyC
 	s.Lock()
 	defer s.Unlock()
 	return s.preparedPolicies[claimUID]
+}
+
+// GetMemoryPoliciesForPod returns all memory policies associated with
+// a pod, keyed by claim UID. Returns nil if no policies exist.
+func (s *nodeState) GetMemoryPoliciesForPod(podUID string) map[string]*memorypolicy.MemoryPolicyConfig {
+	s.Lock()
+	defer s.Unlock()
+	claimUIDs, ok := s.podClaims[podUID]
+	if !ok || len(claimUIDs) == 0 {
+		return nil
+	}
+	result := make(map[string]*memorypolicy.MemoryPolicyConfig)
+	for claimUID := range claimUIDs {
+		if policy := s.preparedPolicies[claimUID]; policy != nil {
+			result[claimUID] = policy
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
 }
 
 // getOrCreatePreparedPolicies loads the prepared policies from the
