@@ -29,7 +29,7 @@ LDFLAGS = \
 ifeq ($(DEBUG),1)
     GCFLAGS ?= -gcflags "all=-N -l"
 else
-    LDFLAGS=" -s -w ${LDFLAGS}"
+    LDFLAGS += -s -w
 endif
 
 GOLICENSES_VERSION?=v1.6.0
