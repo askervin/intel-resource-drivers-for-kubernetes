@@ -45,6 +45,19 @@ type driver struct {
 	nriPlugin *nriPlugin
 }
 
+// TestabilityConfig holds configuration for injecting fake CXL
+// devices for testing without real hardware. Fake devices are
+// appended to the real detected devices before buildDevInfos()
+// processes them.
+type TestabilityConfig struct {
+	// FakeRegionDevices lists CXL region devices to inject.
+	// Each entry is appended to nricxl.Devices.RegionDevices
+	// right after DevicesFromSysfs() returns. Memory devices
+	// referenced in Memories are also appended to
+	// nricxl.Devices.MemoryDevices.
+	FakeRegionDevices []nricxl.RegionDevice `json:"fakeRegionDevices,omitempty"`
+}
+
 type DriverConfig struct {
 	// IgnoreDevices is a list of CXL memory devices. Matches
 	// uevent DEVNAME, <major>:<minor>, or serial number in
@@ -68,6 +81,10 @@ type DriverConfig struct {
 	// will be ignored by the driver. By default, DRAM nodes are
 	// exposed in DRAM ResourceSlices.
 	IgnoreDRAMNodes bool
+
+	// Testability enables injection of fake CXL devices for
+	// testing without real hardware.
+	Testability *TestabilityConfig `json:"testability,omitempty"`
 }
 
 func getCXLFlags(someFlags any) (*CXLFlags, error) {
@@ -85,6 +102,48 @@ func newDriverConfigFromString(configStr string) (*DriverConfig, error) {
 		return nil, fmt.Errorf("failed to parse driver config: %v", err)
 	}
 	return driverConfig, nil
+}
+
+// injectFakeDevices appends fake CXL region devices from the
+// testability configuration into the detected devices structure.
+// Sensible defaults are applied for fields left unset.
+func injectFakeDevices(tc *TestabilityConfig, devices *nricxl.Devices) {
+	if len(tc.FakeRegionDevices) == 0 {
+		return
+	}
+	klog.Warning("Testability: injecting fake CXL devices — do not use in production")
+	for i := range tc.FakeRegionDevices {
+		reg := &tc.FakeRegionDevices[i]
+		if reg.SysfsPath == "" {
+			reg.SysfsPath = fmt.Sprintf("/fake/sys/bus/cxl/devices/%s", reg.Name)
+		}
+		if reg.Mode == "" {
+			reg.Mode = "ram"
+		}
+		if reg.Node >= 0 {
+			reg.Enabled = true
+		}
+		if reg.OnlineSize == 0 && reg.Enabled {
+			reg.OnlineSize = reg.Size
+		}
+		for j := range reg.Memories {
+			mem := reg.Memories[j]
+			if mem.SysfsPath == "" {
+				mem.SysfsPath = fmt.Sprintf("/fake/sys/bus/cxl/devices/%s", mem.Name)
+			}
+			if mem.Driver == "" {
+				mem.Driver = "cxl_mem"
+			}
+			if mem.DevName == "" {
+				mem.DevName = fmt.Sprintf("cxl/%s", mem.Name)
+			}
+			mem.Enabled = true
+			devices.MemoryDevices = append(devices.MemoryDevices, mem)
+		}
+		klog.Infof("Testability: injecting fake region %q (node %d, size %d, memories %d)",
+			reg.Name, reg.Node, reg.Size, len(reg.Memories))
+		devices.RegionDevices = append(devices.RegionDevices, reg)
+	}
 }
 
 func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, error) {
@@ -110,6 +169,10 @@ func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, err
 	detectedDevices, err := nricxl.DevicesFromSysfs(sysfsRoot)
 	if err != nil {
 		return nil, fmt.Errorf("failed to detect devices: %v", err)
+	}
+
+	if driverConfig.Testability != nil {
+		injectFakeDevices(driverConfig.Testability, detectedDevices)
 	}
 
 	if len(detectedDevices.RegionDevices) == 0 {
