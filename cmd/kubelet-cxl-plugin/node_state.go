@@ -298,13 +298,13 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 					},
 				},
 				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
-					"memory": {
+					device.CapacityMemory: {
 						Value: *resource.NewQuantity(int64(dev.Size), resource.BinarySI),
 					},
 				},
 				NodeAllocatableResourceMappings: map[v1.ResourceName]resourcev1.NodeAllocatableResourceMapping{
 					v1.ResourceMemory: {
-						CapacityKey: ptr(resourcev1.QualifiedName("memory")),
+						CapacityKey: ptr(device.CapacityMemory),
 					},
 				},
 				AllowMultipleAllocations: ptr(true),
@@ -330,13 +330,13 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 					},
 				},
 				Capacity: map[resourcev1.QualifiedName]resourcev1.DeviceCapacity{
-					"memory": {
+					device.CapacityMemory: {
 						Value: *resource.NewQuantity(int64(dev.Size), resource.BinarySI),
 					},
 				},
 				NodeAllocatableResourceMappings: map[v1.ResourceName]resourcev1.NodeAllocatableResourceMapping{
 					v1.ResourceMemory: {
-						CapacityKey: ptr(resourcev1.QualifiedName("memory")),
+						CapacityKey: ptr(device.CapacityMemory),
 					},
 				},
 				AllowMultipleAllocations: ptr(true),
@@ -507,7 +507,7 @@ func (s *nodeState) prepareAllocatedDevices(ctx context.Context, claim *resource
 		}
 		// ConsumedCapacity is populated by the scheduler when
 		// DRAConsumableCapacity feature gate is enabled.
-		if consumed, ok := allocatedDevice.ConsumedCapacity["memory"]; ok {
+		if consumed, ok := allocatedDevice.ConsumedCapacity[device.CapacityMemory]; ok {
 			devInfo.ConsumedBytes = consumed.Value()
 		}
 		claimInfo.Devices = append(claimInfo.Devices, devInfo)

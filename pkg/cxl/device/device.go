@@ -19,6 +19,8 @@ package device
 import (
 	"fmt"
 	"regexp"
+
+	resourcev1 "k8s.io/api/resource/v1"
 )
 
 var (
@@ -39,6 +41,10 @@ const (
 	DeviceTypeCXLNode = "cxl-node"
 	// DeviceTypeDRAM is the device type for system DRAM devices.
 	DeviceTypeDRAM = "dram"
+
+	// CapacityMemory is the capacity key used in ResourceSlice device
+	// capacity and in ConsumedCapacity. Matches v1.ResourceMemory.
+	CapacityMemory resourcev1.QualifiedName = "memory"
 
 	PreparedClaimsFileName = "preparedClaims.json"
 
