@@ -163,6 +163,24 @@ func (p *nriPlugin) RemoveContainer(_ context.Context, pod *api.PodSandbox, ctr 
 	return nil
 }
 
+// StartContainer is called by the container runtime (via NRI) after a
+// container has been started.
+func (p *nriPlugin) StartContainer(_ context.Context, pod *api.PodSandbox, ctr *api.Container) error {
+	podName := pod.GetNamespace() + "/" + pod.GetName()
+	ctrName := ctr.GetName()
+	klog.V(3).Infof("NRI StartContainer: pod=%s ctr=%s", podName, ctrName)
+	return nil
+}
+
+// StopContainer is called by the container runtime (via NRI) when a
+// container is being stopped.
+func (p *nriPlugin) StopContainer(_ context.Context, pod *api.PodSandbox, ctr *api.Container) ([]*api.ContainerUpdate, error) {
+	podName := pod.GetNamespace() + "/" + pod.GetName()
+	ctrName := ctr.GetName()
+	klog.V(3).Infof("NRI StopContainer: pod=%s ctr=%s", podName, ctrName)
+	return nil, nil
+}
+
 // extractClaimUIDs scans an environment variable list for CDI-injected
 // CXL_CLAIM_* markers and returns the unique claim UIDs. Duplicates
 // are possible because each device in a claim carries the same CDI
