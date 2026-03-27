@@ -190,8 +190,8 @@ if [[ -z "$vm" ]]; then
     error "specify vm=NAME-OF-HOST where to ssh and run cluster commands"
 fi
 
-echo "Dropping to interactive mode, try check-feature-gates, to start with"
-interactive
+# echo "Dropping to interactive mode, try check-feature-gates, to start with"
+# interactive
 
 SSH_OPT="-o ConnectTimeout=2s" vmsh "exit 42"
 if [[ "$?" != "42" ]]; then
@@ -247,7 +247,7 @@ EOF" \
          "kubectl get deviceclass cxl-memory-class -o yaml && kubectl get deviceclass dram-memory-class -o yaml"
 
     log "you should have deviceclasses now. 'exit' to continue"
-    interactive
+    # interactive
 
     log "skip driver install, you should have it running already"
     # rsync -av "$CXL_DRIVER_BIN" "$vm:" || error "failed to copy CXL driver binary to VM"
@@ -350,7 +350,7 @@ EOF" \
          "kubectl get resourceclaim dram-then-cxl-claim -n $NAMESPACE -o yaml"
 
     log "you should have resource claims now. 'exit' to continue"
-    interactive
+    # interactive
 
     # vmsh "kubectl apply --server-side -f http://k8s.io/examples/dra/driver-install/example/resourceclaim.yaml" \
         #      "kubectl get resourceclaim some-gpu -n dra-tutorial -o yaml"
@@ -380,6 +380,10 @@ spec:
     resources:
       claims:
       - name: both-memories
+  - name: ctr3
+    image: busybox
+    command: [\"sh\", \"-c\", \"env; sleep 3600\"]
+    # no claims
   resourceClaims:
   - name: cxl-memory
     resourceClaimName: cxl-memory-claim
