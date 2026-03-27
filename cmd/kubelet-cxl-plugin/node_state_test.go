@@ -225,62 +225,138 @@ func TestParseMemoryPolicyFromClaim_InvalidConfig(t *testing.T) {
 	}
 }
 
-func TestPreparedPolicies_Persistence(t *testing.T) {
+func TestPreparedClaimsInfo_Persistence(t *testing.T) {
 	tmpDir := t.TempDir()
-	filePath := filepath.Join(tmpDir, "preparedPolicies.json")
+	filePath := filepath.Join(tmpDir, "preparedClaimsInfo.json")
 
-	// Write policies.
-	policies := PreparedPolicies{
+	// Write claims info.
+	claims := PreparedClaimsInfo{
 		"uid-1": {
-			APIVersion:     memorypolicy.APIVersion,
-			Kind:           memorypolicy.Kind,
-			MemoryUseOrder: "first-dram",
-			MinStep:        "128M",
-			MaxStep:        "1G",
+			ClaimName: "test-ns/test-claim",
+			Policy: &memorypolicy.MemoryPolicyConfig{
+				APIVersion:     memorypolicy.APIVersion,
+				Kind:           memorypolicy.Kind,
+				MemoryUseOrder: "first-dram",
+				MinStep:        "128M",
+				MaxStep:        "1G",
+			},
+			Devices: []PreparedDeviceInfo{
+				{
+					RequestName:    "req1",
+					DeviceName:     "region0",
+					DeviceType:     device.DeviceTypeCXLNode,
+					SysfsPath:      "/sys/bus/cxl/devices/region0",
+					NUMANodes:      []int{2},
+					NodeAffinities: []int{0},
+					TotalBytes:     4294967296,
+					ConsumedBytes:  1073741824,
+				},
+			},
 		},
 	}
-	if err := writePreparedPoliciesToFile(filePath, policies); err != nil {
+	if err := writePreparedClaimsInfoToFile(filePath, claims); err != nil {
 		t.Fatalf("failed to write: %v", err)
 	}
 
 	// Read them back.
-	loaded, err := getOrCreatePreparedPolicies(filePath)
+	loaded, err := getOrCreatePreparedClaimsInfo(filePath)
 	if err != nil {
 		t.Fatalf("failed to load: %v", err)
 	}
 
 	if len(loaded) != 1 {
-		t.Fatalf("expected 1 policy, got %d", len(loaded))
+		t.Fatalf("expected 1 claim, got %d", len(loaded))
 	}
-	p := loaded["uid-1"]
-	if p == nil {
-		t.Fatal("expected non-nil policy for uid-1")
+	info := loaded["uid-1"]
+	if info == nil {
+		t.Fatal("expected non-nil claim info for uid-1")
 	}
-	if p.MemoryUseOrder != "first-dram" {
-		t.Errorf("expected first-dram, got %s", p.MemoryUseOrder)
+	if info.ClaimName != "test-ns/test-claim" {
+		t.Errorf("expected test-ns/test-claim, got %s", info.ClaimName)
 	}
-	if p.MinStep != "128M" {
-		t.Errorf("expected 128M, got %s", p.MinStep)
+	if info.Policy == nil {
+		t.Fatal("expected non-nil policy")
 	}
-	if p.MaxStep != "1G" {
-		t.Errorf("expected 1G, got %s", p.MaxStep)
+	if info.Policy.MemoryUseOrder != "first-dram" {
+		t.Errorf("expected first-dram, got %s", info.Policy.MemoryUseOrder)
+	}
+	if info.Policy.MinStep != "128M" {
+		t.Errorf("expected 128M, got %s", info.Policy.MinStep)
+	}
+	if len(info.Devices) != 1 {
+		t.Fatalf("expected 1 device, got %d", len(info.Devices))
+	}
+	dev := info.Devices[0]
+	if dev.DeviceType != device.DeviceTypeCXLNode {
+		t.Errorf("expected %s, got %s", device.DeviceTypeCXLNode, dev.DeviceType)
+	}
+	if dev.SysfsPath != "/sys/bus/cxl/devices/region0" {
+		t.Errorf("expected sysfs path, got %s", dev.SysfsPath)
+	}
+	if dev.TotalBytes != 4294967296 {
+		t.Errorf("expected 4GiB total, got %d", dev.TotalBytes)
+	}
+	if dev.ConsumedBytes != 1073741824 {
+		t.Errorf("expected 1GiB consumed, got %d", dev.ConsumedBytes)
+	}
+	if len(dev.NUMANodes) != 1 || dev.NUMANodes[0] != 2 {
+		t.Errorf("expected NUMA [2], got %v", dev.NUMANodes)
 	}
 }
 
-func TestPreparedPolicies_CreateEmpty(t *testing.T) {
+func TestPreparedClaimsInfo_CreateEmpty(t *testing.T) {
 	tmpDir := t.TempDir()
-	filePath := filepath.Join(tmpDir, "preparedPolicies.json")
+	filePath := filepath.Join(tmpDir, "preparedClaimsInfo.json")
 
-	policies, err := getOrCreatePreparedPolicies(filePath)
+	claims, err := getOrCreatePreparedClaimsInfo(filePath)
 	if err != nil {
 		t.Fatalf("failed: %v", err)
 	}
-	if len(policies) != 0 {
-		t.Fatalf("expected empty policies, got %d", len(policies))
+	if len(claims) != 0 {
+		t.Fatalf("expected empty claims, got %d", len(claims))
 	}
 
 	// Verify the file exists.
 	if _, err := os.Stat(filePath); err != nil {
 		t.Fatalf("file should exist: %v", err)
+	}
+}
+
+func TestPreparedClaimsInfo_NilPolicy(t *testing.T) {
+	tmpDir := t.TempDir()
+	filePath := filepath.Join(tmpDir, "preparedClaimsInfo.json")
+
+	claims := PreparedClaimsInfo{
+		"uid-no-policy": {
+			ClaimName: "ns/claim-no-policy",
+			Devices: []PreparedDeviceInfo{
+				{
+					RequestName: "req1",
+					DeviceName:  "dram-0",
+					DeviceType:  device.DeviceTypeDRAM,
+					NUMANodes:   []int{0, 1},
+					TotalBytes:  8589934592,
+				},
+			},
+		},
+	}
+	if err := writePreparedClaimsInfoToFile(filePath, claims); err != nil {
+		t.Fatalf("failed to write: %v", err)
+	}
+
+	loaded, err := getOrCreatePreparedClaimsInfo(filePath)
+	if err != nil {
+		t.Fatalf("failed to load: %v", err)
+	}
+
+	info := loaded["uid-no-policy"]
+	if info == nil {
+		t.Fatal("expected claim info")
+	}
+	if info.Policy != nil {
+		t.Errorf("expected nil policy, got %+v", info.Policy)
+	}
+	if info.Devices[0].DeviceType != device.DeviceTypeDRAM {
+		t.Errorf("expected %s, got %s", device.DeviceTypeDRAM, info.Devices[0].DeviceType)
 	}
 }

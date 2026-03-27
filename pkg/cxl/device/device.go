@@ -35,6 +35,11 @@ const (
 
 	CXLDevicePattern = "cxl-[-a-z0-9]*"
 
+	// DeviceTypeCXLNode is the device type for CXL region devices.
+	DeviceTypeCXLNode = "cxl-node"
+	// DeviceTypeDRAM is the device type for system DRAM devices.
+	DeviceTypeDRAM = "dram"
+
 	PreparedClaimsFileName = "preparedClaims.json"
 
 	// "classic", for CDI names to be more user-friendly, and readable when discovery code is used by cdi-specs-generator,

@@ -91,7 +91,7 @@ func (p *nriPlugin) onClose() {
 // CreateContainer is called by the container runtime (via NRI) when a
 // new container is about to be created. It identifies which resource
 // claims belong to this specific container by scanning CDI-injected
-// CXL_CLAIM_* environment variables, then looks up memory policies
+// CXL_CLAIM_* environment variables, then looks up full claim info
 // from in-process state.
 func (p *nriPlugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	podName := pod.GetNamespace() + "/" + pod.GetName()
@@ -108,16 +108,32 @@ func (p *nriPlugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr 
 
 	klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s has %d CXL claim(s): %v", podName, ctrName, len(claimUIDs), claimUIDs)
 
-	// Look up memory policy for each claim from shared state.
+	// Look up full claim information from shared state.
 	for _, claimUID := range claimUIDs {
-		policy := p.state.GetMemoryPolicy(claimUID)
-		if policy == nil {
-			klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s: no memory policy (may be nil or driver restarted)",
+		info := p.state.GetClaimInfo(claimUID)
+		if info == nil {
+			klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s: no claim info (driver may have restarted)",
 				podName, ctrName, claimUID)
 			continue
 		}
-		klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s policy: order=%s waypoints=%v minStep=%s maxStep=%s",
-			podName, ctrName, claimUID, policy.MemoryUseOrder, policy.MemoryUseWaypoints, policy.MinStep, policy.MaxStep)
+
+		klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s (%s) devices=%d",
+			podName, ctrName, claimUID, info.ClaimName, len(info.Devices))
+
+		for i, dev := range info.Devices {
+			klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s device[%d]: name=%s type=%s sysfs=%s numa=%v affinities=%v total=%s consumed=%s request=%s",
+				podName, ctrName, claimUID, i,
+				dev.DeviceName, dev.DeviceType, dev.SysfsPath, dev.NUMANodes, dev.NodeAffinities,
+				formatBytes(dev.TotalBytes), formatBytes(uint64(dev.ConsumedBytes)),
+				dev.RequestName)
+		}
+
+		if info.Policy != nil {
+			klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s policy: order=%s waypoints=%v minStep=%s maxStep=%s",
+				podName, ctrName, claimUID,
+				info.Policy.MemoryUseOrder, info.Policy.MemoryUseWaypoints,
+				info.Policy.MinStep, info.Policy.MaxStep)
+		}
 	}
 
 	// TODO: Start cgmpolmgr.Manager for this container's cgroup
@@ -161,4 +177,24 @@ func extractClaimUIDs(envVars []string) []string {
 		}
 	}
 	return uids
+}
+
+// formatBytes formats a byte count as a human-readable string using
+// binary units (KiB, MiB, GiB).
+func formatBytes(bytes uint64) string {
+	const (
+		kib = 1024
+		mib = 1024 * kib
+		gib = 1024 * mib
+	)
+	switch {
+	case bytes >= gib:
+		return fmt.Sprintf("%.1fGiB", float64(bytes)/float64(gib))
+	case bytes >= mib:
+		return fmt.Sprintf("%.1fMiB", float64(bytes)/float64(mib))
+	case bytes >= kib:
+		return fmt.Sprintf("%.1fKiB", float64(bytes)/float64(kib))
+	default:
+		return fmt.Sprintf("%dB", bytes)
+	}
 }
