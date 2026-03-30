@@ -18,6 +18,9 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	nricxl "github.com/containers/nri-plugins/pkg/cxl"
@@ -403,5 +406,159 @@ func TestTestabilityConfig_JSONRoundTrip(t *testing.T) {
 	}
 	if len(reg.Memories) != 1 || reg.Memories[0].Serial != 42 {
 		t.Errorf("unexpected memory values after round-trip: %+v", reg.Memories)
+	}
+}
+
+func TestNewDriverConfigFromString_YAML(t *testing.T) {
+	configYAML := `
+IgnoreDevices:
+  - mem0
+  - mem1
+IgnoreRegions:
+  - region0
+IgnoreNodes:
+  - 1
+  - 3
+IgnoreDRAMNodes: true
+`
+	cfg, err := newDriverConfigFromString(configYAML)
+	if err != nil {
+		t.Fatalf("unexpected error parsing YAML: %v", err)
+	}
+	if len(cfg.IgnoreDevices) != 2 || cfg.IgnoreDevices[0] != "mem0" || cfg.IgnoreDevices[1] != "mem1" {
+		t.Errorf("expected IgnoreDevices [mem0 mem1], got %v", cfg.IgnoreDevices)
+	}
+	if len(cfg.IgnoreRegions) != 1 || cfg.IgnoreRegions[0] != "region0" {
+		t.Errorf("expected IgnoreRegions [region0], got %v", cfg.IgnoreRegions)
+	}
+	if len(cfg.IgnoreNodes) != 2 || cfg.IgnoreNodes[0] != 1 || cfg.IgnoreNodes[1] != 3 {
+		t.Errorf("expected IgnoreNodes [1 3], got %v", cfg.IgnoreNodes)
+	}
+	if !cfg.IgnoreDRAMNodes {
+		t.Error("expected IgnoreDRAMNodes=true")
+	}
+}
+
+func TestNewDriverConfigFromString_YAMLWithTestability(t *testing.T) {
+	configYAML := `
+testability:
+  fakeRegionDevices:
+    - Name: fakeregion0
+      Size: 1073741824
+      Mode: ram
+      Node: 2
+      Memories:
+        - Name: fakemem0
+          RamSize: 1073741824
+          Serial: 12345
+`
+	cfg, err := newDriverConfigFromString(configYAML)
+	if err != nil {
+		t.Fatalf("unexpected error parsing YAML: %v", err)
+	}
+	if cfg.Testability == nil {
+		t.Fatal("expected non-nil Testability")
+	}
+	if len(cfg.Testability.FakeRegionDevices) != 1 {
+		t.Fatalf("expected 1 fake region, got %d", len(cfg.Testability.FakeRegionDevices))
+	}
+	reg := cfg.Testability.FakeRegionDevices[0]
+	if reg.Name != "fakeregion0" {
+		t.Errorf("expected name fakeregion0, got %s", reg.Name)
+	}
+	if reg.Size != 1073741824 {
+		t.Errorf("expected size 1073741824, got %d", reg.Size)
+	}
+	if reg.Node != 2 {
+		t.Errorf("expected node 2, got %d", reg.Node)
+	}
+	if len(reg.Memories) != 1 || reg.Memories[0].Serial != 12345 {
+		t.Errorf("unexpected memory: %+v", reg.Memories)
+	}
+}
+
+func TestResolveConfigStr_StringOnly(t *testing.T) {
+	flags := &CXLFlags{ConfigStr: `{"IgnoreDevices": ["mem0"]}`}
+	result, err := resolveConfigStr(flags)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != flags.ConfigStr {
+		t.Errorf("expected config string to be returned as-is, got %q", result)
+	}
+}
+
+func TestResolveConfigStr_FileOnly(t *testing.T) {
+	content := `{"IgnoreDevices": ["mem1"]}`
+	tmpFile := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+
+	flags := &CXLFlags{ConfigFile: tmpFile}
+	result, err := resolveConfigStr(flags)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != content {
+		t.Errorf("expected %q, got %q", content, result)
+	}
+}
+
+func TestResolveConfigStr_BothError(t *testing.T) {
+	flags := &CXLFlags{
+		ConfigStr:  `{"IgnoreDevices": ["mem0"]}`,
+		ConfigFile: "/some/file.json",
+	}
+	_, err := resolveConfigStr(flags)
+	if err == nil {
+		t.Fatal("expected error when both -c and -f are provided")
+	}
+	if !strings.Contains(err.Error(), "not both") {
+		t.Errorf("expected error about mutual exclusivity, got: %v", err)
+	}
+}
+
+func TestResolveConfigStr_NeitherReturnsEmpty(t *testing.T) {
+	flags := &CXLFlags{}
+	result, err := resolveConfigStr(flags)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "" {
+		t.Errorf("expected empty string, got %q", result)
+	}
+}
+
+func TestResolveConfigStr_FileNotFound(t *testing.T) {
+	flags := &CXLFlags{ConfigFile: "/nonexistent/path/config.yaml"}
+	_, err := resolveConfigStr(flags)
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+}
+
+func TestResolveConfigStr_YAMLFile(t *testing.T) {
+	content := "IgnoreDevices:\n  - mem0\nIgnoreDRAMNodes: true\n"
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write temp file: %v", err)
+	}
+
+	flags := &CXLFlags{ConfigFile: tmpFile}
+	result, err := resolveConfigStr(flags)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	cfg, err := newDriverConfigFromString(result)
+	if err != nil {
+		t.Fatalf("failed to parse config from file: %v", err)
+	}
+	if len(cfg.IgnoreDevices) != 1 || cfg.IgnoreDevices[0] != "mem0" {
+		t.Errorf("expected IgnoreDevices [mem0], got %v", cfg.IgnoreDevices)
+	}
+	if !cfg.IgnoreDRAMNodes {
+		t.Error("expected IgnoreDRAMNodes=true")
 	}
 }

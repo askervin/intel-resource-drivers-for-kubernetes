@@ -18,9 +18,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path"
 
 	resourceapi "k8s.io/api/resource/v1"
@@ -29,6 +29,7 @@ import (
 	coreclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/yaml"
 
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/helpers"
@@ -98,10 +99,31 @@ func getCXLFlags(someFlags any) (*CXLFlags, error) {
 
 func newDriverConfigFromString(configStr string) (*DriverConfig, error) {
 	driverConfig := &DriverConfig{}
-	if err := json.Unmarshal([]byte(configStr), driverConfig); err != nil {
+	if err := yaml.UnmarshalStrict([]byte(configStr), driverConfig); err != nil {
 		return nil, fmt.Errorf("failed to parse driver config: %v", err)
 	}
 	return driverConfig, nil
+}
+
+// resolveConfigStr returns the configuration string from either the
+// -c flag or the -f flag. It returns an error if both are provided.
+func resolveConfigStr(flags *CXLFlags) (string, error) {
+	hasStr := flags.ConfigStr != ""
+	hasFile := flags.ConfigFile != ""
+
+	if hasStr && hasFile {
+		return "", fmt.Errorf("provide configuration as a file (-f) or as a string (-c), but not both")
+	}
+
+	if hasFile {
+		data, err := os.ReadFile(flags.ConfigFile)
+		if err != nil {
+			return "", fmt.Errorf("failed to read configuration file %q: %v", flags.ConfigFile, err)
+		}
+		return string(data), nil
+	}
+
+	return flags.ConfigStr, nil
 }
 
 // injectFakeDevices appends fake CXL region devices from the
@@ -156,7 +178,12 @@ func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, err
 		return nil, fmt.Errorf("getCXLFlags: %w", err)
 	}
 
-	driverConfig, err := newDriverConfigFromString(cxlFlags.ConfigStr)
+	configStr, err := resolveConfigStr(cxlFlags)
+	if err != nil {
+		return nil, fmt.Errorf("resolveConfigStr: %w", err)
+	}
+
+	driverConfig, err := newDriverConfigFromString(configStr)
 	if err != nil {
 		return nil, fmt.Errorf("newDriverConfigFromString: %w", err)
 	}

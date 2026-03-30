@@ -27,11 +27,12 @@ import (
 )
 
 type CXLFlags struct {
-	SysfsRoot string
-	ConfigStr string
-	NRIName   string
-	NRIIdx    string
-	NRISocket string
+	SysfsRoot  string
+	ConfigStr  string
+	ConfigFile string
+	NRIName    string
+	NRIIdx     string
+	NRISocket  string
 }
 
 func main() {
@@ -53,10 +54,16 @@ func main() {
 		&cli.StringFlag{
 			Name:        "config-str",
 			Aliases:     []string{"c"},
-			Usage:       "driver configuration as a string",
+			Usage:       "driver configuration as a JSON or YAML string",
 			Value:       cxl.DefaultConfigStr,
 			Destination: &cxlFlags.ConfigStr,
 			EnvVars:     []string{cxl.ConfigStrEnvVarName},
+		},
+		&cli.StringFlag{
+			Name:        "config-file",
+			Aliases:     []string{"f"},
+			Usage:       "path to a JSON or YAML configuration file (mutually exclusive with -c)",
+			Destination: &cxlFlags.ConfigFile,
 		},
 		&cli.StringFlag{
 			Name:        "nri-name",
