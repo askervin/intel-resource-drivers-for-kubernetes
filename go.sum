@@ -6,8 +6,8 @@ github.com/antlr4-go/antlr/v4 v4.13.0 h1:lxCg3LAv+EUK6t1i0y1V6/SLeUi0eKEKdhQAlS8
 github.com/antlr4-go/antlr/v4 v4.13.0/go.mod h1:pfChB/xh/Unjila75QW7+VU4TSnWnnk9UTnmpPaOR2g=
 github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5 h1:0CwZNZbxp69SHPdPJAN/hZIm0C4OItdklCFmMRWYpio=
 github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5/go.mod h1:wHh0iHkYZB8zMSxRWpUBQtwG5a7fFgvEO+odwuTv2gs=
-github.com/askervin/nri-plugins v0.11.1-0.20260323104223-7ee77c333601 h1:HcNvFBknd1E6MOOISIbeM4V1PgXjx4GPfSJBYP2+flY=
-github.com/askervin/nri-plugins v0.11.1-0.20260323104223-7ee77c333601/go.mod h1:P1fMLXbZNuqpJFB350rP5bW/8iEPx6igh/QQT9t80SU=
+github.com/askervin/nri-plugins v0.11.1-0.20260331121111-dac693fc0b66 h1:RKL2Nn15/gEuR4BsQTqAp4GBsGDqLb1LZErQUz63JzA=
+github.com/askervin/nri-plugins v0.11.1-0.20260331121111-dac693fc0b66/go.mod h1:P1fMLXbZNuqpJFB350rP5bW/8iEPx6igh/QQT9t80SU=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
 github.com/blang/semver/v4 v4.0.0 h1:1PFHFE6yCCTv8C1TeyNNarDzntLi7wMI5i/pzqYIsAM=
