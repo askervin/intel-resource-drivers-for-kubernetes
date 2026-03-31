@@ -420,12 +420,12 @@ func buildCgroupConfig(cgroupPath string, info *PreparedClaimInfo) (*cgmpolmgr.C
 			for _, n := range dev.NUMANodes {
 				dramNodeSet[n] = true
 			}
-			dramQuota += dev.TotalBytes
+			dramQuota += uint64(dev.ConsumedBytes)
 		case device.DeviceTypeCXLNode:
 			for _, n := range dev.NUMANodes {
 				cxlNodeSet[n] = true
 			}
-			cxlQuota += dev.TotalBytes
+			cxlQuota += uint64(dev.ConsumedBytes)
 		}
 	}
 
