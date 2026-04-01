@@ -249,11 +249,32 @@ EOF" \
     log "you should have deviceclasses now. 'exit' to continue"
     # interactive
 
-    log "skip driver install, you should have it running already"
+    log "SKIP DRIVER INSTALL"
+    # log "driver install"
     # rsync -av "$CXL_DRIVER_BIN" "$vm:" || error "failed to copy CXL driver binary to VM"
 
-    # vmsh "( KUBECONFIG=/root/.kube/config ./$(basename $CXL_DRIVER_BIN) --node-name \$(hostname) -c '{}' -v 5 >& $(basename $CXL_DRIVER_BIN).output ) </dev/null >&/dev/null &" \
+    log "create cxl region fake configuration"
+    vmsh 'tee cxl-driver-config.yaml <<EOF
+testability:
+  fakeRegionDevices:
+  - Name: fakeregion0
+    Size: 1073741824
+    Mode: ram
+    Node: 1
+    Memories:
+    - Name: fakemem0
+      RamSize: 1073741824
+      Serial: 12345
+      NodeAffinity: 0
+EOF' \
+         '[[ -n "$(find -H cxl-driver-config.yaml -prune -newermt 2\ seconds\ ago )" ]]'
+
+    log "SKIP LAUNCHING DRIVER"
+    # vmsh "( KUBECONFIG=/root/.kube/config ./$(basename $CXL_DRIVER_BIN) --node-name \$(hostname) -f cxl-driver-config.yaml -v 5 >& $(basename $CXL_DRIVER_BIN).output ) </dev/null >&/dev/null &" \
     #      "pgrep $(basename $CXL_DRIVER_BIN)"
+
+    log "driver should be running now."
+    vmsh "pgrep -f $(basename $CXL_DRIVER_BIN)" || error "driver not running"
 
     # vmsh "kubectl apply --server-side -f http://k8s.io/examples/dra/driver-install/serviceaccount.yaml" \
     #      "kubectl get serviceaccount -n dra-tutorial dra-example-driver-service-account -o yaml"
@@ -283,7 +304,7 @@ section "check that the driver is running"
 section "create a resource claim and a pod that uses it"
 (
 
-    vmsh "kubectl apply -n $NAMESPACE -f - <<EOF
+    vmsh "cat > cxl-memory-claim.yaml <<EOF
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaim
 metadata:
@@ -297,10 +318,11 @@ spec:
         capacity:
           requests:
             memory: 100Mi
-EOF" \
+EOF
+kubectl apply -n $NAMESPACE -f cxl-memory-claim.yaml" \
          "kubectl get resourceclaim cxl-memory-claim -n $NAMESPACE -o yaml"
 
-    vmsh "kubectl apply -n $NAMESPACE -f - <<EOF
+    vmsh "cat > sys-memory-claim.yaml <<EOF
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaim
 metadata:
@@ -314,10 +336,11 @@ spec:
         capacity:
           requests:
             memory: 1Gi
-EOF" \
+EOF
+kubectl apply -n $NAMESPACE -f sys-memory-claim.yaml" \
          "kubectl get resourceclaim sys-memory-claim -n $NAMESPACE -o yaml"
 
-    vmsh "kubectl apply -n $NAMESPACE -f - <<EOF
+    vmsh "cat > dram-then-cxl-claim.yaml <<EOF
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaim
 metadata:
@@ -346,8 +369,42 @@ spec:
           memoryUseOrder: \"first-dram\"
           minStep: \"64M\"
           maxStep: \"128M\"
-EOF" \
+EOF
+kubectl apply -n $NAMESPACE -f dram-then-cxl-claim.yaml" \
          "kubectl get resourceclaim dram-then-cxl-claim -n $NAMESPACE -o yaml"
+
+    vmsh "cat > cxl-dram-interleave-claim.yaml <<EOF
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: cxl-dram-interleave-claim
+spec:
+  devices:
+    requests:
+    - name: some-cxl-memory
+      exactly:
+        deviceClassName: cxl-memory-class
+        capacity:
+          requests:
+            memory: 384Mi
+    - name: some-dram-memory
+      exactly:
+        deviceClassName: dram-memory-class
+        capacity:
+          requests:
+            memory: 256Mi
+    config:
+    - opaque:
+        driver: cxl.generic
+        parameters:
+          apiVersion: cxl.generic/v1alpha1
+          kind: MemoryPolicyConfig
+          memoryUseOrder: \"start-interleaved\"
+          minStep: \"128M\"
+          maxStep: \"512M\"
+EOF
+kubectl apply -n $NAMESPACE -f cxl-dram-interleave-claim.yaml" \
+         "kubectl get resourceclaim cxl-dram-interleave-claim -n $NAMESPACE -o yaml"
 
     log "you should have resource claims now. 'exit' to continue"
     # interactive
@@ -355,11 +412,11 @@ EOF" \
     # vmsh "kubectl apply --server-side -f http://k8s.io/examples/dra/driver-install/example/resourceclaim.yaml" \
         #      "kubectl get resourceclaim some-gpu -n dra-tutorial -o yaml"
 
-    vmsh "kubectl apply -n $NAMESPACE -f -<<EOF
+    vmsh "cat > single-claim-containers-pod.yaml <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
-  name: cxl-memory-pod
+  name: single-claims-containers-pod
 spec:
   containers:
   - name: ctr0
@@ -384,6 +441,13 @@ spec:
     image: busybox
     command: [\"sh\", \"-c\", \"env; sleep 3600\"]
     # no claims
+  - name: ctr4
+    image: busybox
+    command: [\"sh\", \"-c\", \"env; sleep 3600\"]
+    resources:
+      claims:
+      - name: both-memories-interleaved
+  terminationGracePeriodSeconds: 2
   resourceClaims:
   - name: cxl-memory
     resourceClaimName: cxl-memory-claim
@@ -391,17 +455,20 @@ spec:
     resourceClaimName: sys-memory-claim
   - name: both-memories
     resourceClaimName: dram-then-cxl-claim
-EOF" \
-         "kubectl get pod cxl-memory-pod -n $NAMESPACE -o yaml"
+  - name: both-memories-interleaved
+    resourceClaimName: cxl-dram-interleave-claim
+EOF
+kubectl apply -n $NAMESPACE -f single-claim-containers-pod.yaml" \
+         "kubectl get pod single-claims-containers-pod -n $NAMESPACE -o yaml"
 
-    vmwaitsh "kubectl logs cxl-memory-pod -c ctr0 -n $NAMESPACE | grep -E CXL"
+    vmwaitsh "kubectl logs single-claims-containers-pod -c ctr0 -n $NAMESPACE | grep -E CXL"
 
     # vmsh "kubectl apply --server-side -f http://k8s.io/examples/dra/driver-install/example/pod.yaml" \
     #      "kubectl get pod pod0 -n dra-tutorial -o yaml"
 
     # vmwaitsh "kubectl logs pod0 -c ctr0 -n dra-tutorial | grep -E 'GPU_DEVICE_[0-9]+='"
 
-    interactive
+    # interactive
 
     vmsh "kubectl get resourceclaims -n $NAMESPACE"
 
@@ -414,10 +481,11 @@ EOF" \
     # 	logger.V(5).Info("Patched pod status with NodeAllocatableResourceClaimStatuses", "pod", klog.KObj(pod), "status", targetStatus.NodeAllocatableResourceClaimStatuses)
     # line 432 in nodeallocatabledynamicresources.go
 
-    vmsh "echo 'You might be running buggy kubelet: pod .status.nodeAllocatableResources does not exist, could be accidentaly dropped (not copied on status update) by kubelet'" \
-         "kubectl get pod -n dra-demo-cxl cxl-memory-pod  -o yaml | grep nodeAllocatableResource -A10"
+    vmsh "echo 'You might be running buggy kubelet: pod .status.nodeAllocatableResources does not exist, see kubernetes PR#138030'" \
+         "kubectl get pod -n dra-demo-cxl single-claims-containers-pod  -o yaml | grep nodeAllocatableResource -A10"
 
-
+    log "there's nothing more but cleanup ahead"
+    interactive
 )
 
 # section "peek under the hood"
@@ -427,7 +495,7 @@ EOF" \
 
 section "delete the pod"
 (
-    vmsh "kubectl delete pod cxl-memory-pod -n $NAMESPACE --now"
+    vmsh "kubectl delete pod single-claims-containers-pod -n $NAMESPACE --now"
 
     vmwaitsh "kubectl get resourceclaim cxl-memory-claim -n $NAMESPACE -o json | jq -e '.status == {}'"
 
