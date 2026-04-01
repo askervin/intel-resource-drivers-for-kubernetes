@@ -31,6 +31,7 @@ import (
 	"github.com/containers/nri-plugins/pkg/cgmpolmgr"
 
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
+	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/memorypolicy"
 
 	"k8s.io/klog/v2"
 )
@@ -51,9 +52,9 @@ const cgroupV2MountPoint = "/sys/fs/cgroup"
 type nriPlugin struct {
 	stub     stub.Stub
 	state    *nodeState
-	pending  map[string][]cgmpolmgr.ManagerConfig // key: containerID; validated configs awaiting Start
-	managers map[string]*cgmpolmgr.Manager        // key: containerID:claimUID; running managers
-	mu       sync.Mutex                           // protects pending and managers
+	pending  map[string]*cgmpolmgr.ManagerConfig // key: containerID; single validated config awaiting Start
+	managers map[string]*cgmpolmgr.Manager       // key: containerID; running manager
+	mu       sync.Mutex                          // protects pending and managers
 }
 
 // startNRIPlugin creates and starts the NRI plugin. It connects to
@@ -63,7 +64,7 @@ type nriPlugin struct {
 func startNRIPlugin(ctx context.Context, state *nodeState, opts NRIOpts) (*nriPlugin, error) {
 	p := &nriPlugin{
 		state:    state,
-		pending:  make(map[string][]cgmpolmgr.ManagerConfig),
+		pending:  make(map[string]*cgmpolmgr.ManagerConfig),
 		managers: make(map[string]*cgmpolmgr.Manager),
 	}
 
@@ -117,96 +118,108 @@ func (p *nriPlugin) onClose() {
 }
 
 // CreateContainer is called by the container runtime (via NRI) when a
-// new container is about to be created. It validates memory policies
-// and builds ManagerConfig for claims that request memory steering.
-// Returns an error if a memory policy is requested but invalid,
-// blocking container creation. Managers are created and started later
-// in StartContainer, once the container is confirmed to exist and its
+// new container is about to be created. It aggregates all CXL claims
+// for the container and builds a single ManagerConfig that covers all
+// claimed memory. Returns an error if a user-specified memory policy
+// is invalid, blocking container creation. The manager is created and
+// started later in StartContainer, once the container exists and its
 // cgroup directory is available.
 func (p *nriPlugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
-	podName := pod.GetNamespace() + "/" + pod.GetName()
-	ctrName := ctr.GetName()
+	ctrName := pod.GetNamespace() + "/" + pod.GetName() + "/" + ctr.GetName()
 	ctrID := ctr.GetId()
 
-	klog.V(3).Infof("NRI CreateContainer: pod=%s ctr=%s id=%s", podName, ctrName, ctrID)
-
-	// Debug: log cgroup-related info from NRI at this stage.
-	klog.V(3).Infof("NRI CreateContainer: pod=%s ctr=%s ctr.Linux.CgroupsPath=%q",
-		podName, ctrName, ctr.GetLinux().GetCgroupsPath())
-	if podLinux := pod.GetLinux(); podLinux != nil {
-		klog.V(3).Infof("NRI CreateContainer: pod=%s pod.Linux.CgroupParent=%q pod.Linux.CgroupsPath=%q",
-			podName, podLinux.GetCgroupParent(), podLinux.GetCgroupsPath())
-	}
+	klog.V(3).Infof("NRI CreateContainer: ctr=%s id=%s", ctrName, ctrID)
 
 	// Scan container env vars for CDI-injected claim markers.
 	claimUIDs := extractClaimUIDs(ctr.GetEnv())
 	if len(claimUIDs) == 0 {
-		klog.V(5).Infof("NRI CreateContainer: no CXL claims for pod=%s ctr=%s", podName, ctrName)
+		klog.V(5).Infof("NRI CreateContainer: ctr=%s: no CXL claims", ctrName)
 		return nil, nil, nil
 	}
 
-	klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s has %d CXL claim(s): %v", podName, ctrName, len(claimUIDs), claimUIDs)
+	klog.V(5).Infof("NRI CreateContainer: ctr=%s has %d CXL claim(s): %v", ctrName, len(claimUIDs), claimUIDs)
 
-	var pendingConfigs []cgmpolmgr.ManagerConfig
+	// Aggregate all devices across all claims and collect the
+	// user-specified policy (if any). Only one policy per
+	// container is supported — multiple conflicting policies are
+	// rejected.
+	dramNodeSet := make(map[int]bool)
+	cxlNodeSet := make(map[int]bool)
+	var dramQuota, cxlQuota uint64
+	var userPolicy *memorypolicy.MemoryPolicyConfig
 
-	// Look up full claim information from shared state.
 	for _, claimUID := range claimUIDs {
 		info := p.state.GetClaimInfo(claimUID)
 		if info == nil {
-			klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s: no claim info (driver may have restarted)",
-				podName, ctrName, claimUID)
+			klog.V(5).Infof("NRI CreateContainer: ctr=%s claim=%s: no claim info (driver may have restarted)",
+				ctrName, claimUID)
 			continue
 		}
 
-		klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s (%s) devices=%d",
-			podName, ctrName, claimUID, info.ClaimName, len(info.Devices))
+		klog.V(5).Infof("NRI CreateContainer: ctr=%s claim=%s (%s) devices=%d",
+			ctrName, claimUID, info.ClaimName, len(info.Devices))
 
 		for i, dev := range info.Devices {
-			klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s device[%d]: name=%s type=%s sysfs=%s numa=%v affinities=%v total=%s consumed=%s request=%s",
-				podName, ctrName, claimUID, i,
+			klog.V(5).Infof("NRI CreateContainer: ctr=%s claim=%s device[%d]: name=%s type=%s sysfs=%s numa=%v affinities=%v total=%s consumed=%s request=%s",
+				ctrName, claimUID, i,
 				dev.DeviceName, dev.DeviceType, dev.SysfsPath, dev.NUMANodes, dev.NodeAffinities,
 				formatBytes(dev.TotalBytes), formatBytes(uint64(dev.ConsumedBytes)),
 				dev.RequestName)
+			switch dev.DeviceType {
+			case device.DeviceTypeDRAM:
+				for _, n := range dev.NUMANodes {
+					dramNodeSet[n] = true
+				}
+				dramQuota += uint64(dev.ConsumedBytes)
+			case device.DeviceTypeCXLNode:
+				for _, n := range dev.NUMANodes {
+					cxlNodeSet[n] = true
+				}
+				cxlQuota += uint64(dev.ConsumedBytes)
+			}
 		}
 
-		if info.Policy != nil {
-			klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s policy: order=%s waypoints=%v minStep=%s maxStep=%s",
-				podName, ctrName, claimUID,
+		// Collect user-specified policy.
+		if info.Policy != nil && info.Policy.MemoryUseOrder != "" {
+			klog.V(5).Infof("NRI CreateContainer: ctr=%s claim=%s policy: order=%s waypoints=%v minStep=%s maxStep=%s",
+				ctrName, claimUID,
 				info.Policy.MemoryUseOrder, info.Policy.MemoryUseWaypoints,
 				info.Policy.MinStep, info.Policy.MaxStep)
+			if userPolicy != nil {
+				return nil, nil, fmt.Errorf("NRI CreateContainer: ctr=%s: multiple claims specify memory policies, only one is allowed per container",
+					ctrName)
+			}
+			userPolicy = info.Policy
 		}
-
-		// Skip claims without a memory policy.
-		if info.Policy == nil || info.Policy.MemoryUseOrder == "" {
-			continue
-		}
-
-		if err := validatePolicy(info); err != nil {
-			return nil, nil, fmt.Errorf("NRI CreateContainer: pod=%s ctr=%s claim=%s: invalid policy: %w",
-				podName, ctrName, claimUID, err)
-		}
-
-		// Build config with a placeholder cgroup path. The real
-		// filesystem path is resolved in StartContainer where the
-		// cgroup directory exists and we can read pid/cgroup.
-		cgroupName := fmt.Sprintf("%s/%s/%s", podName, ctrName, info.ClaimName)
-		cgCfg, err := buildManagerConfig("", cgroupName, info)
-		if err != nil {
-			return nil, nil, fmt.Errorf("NRI CreateContainer: pod=%s ctr=%s claim=%s: failed to build cgroup config: %w",
-				podName, ctrName, claimUID, err)
-		}
-
-		pendingConfigs = append(pendingConfigs, *cgCfg)
-
-		klog.V(3).Infof("NRI CreateContainer: pod=%s ctr=%s claim=%s: validated policy (order=%s), will start cgmpolmgr in StartContainer",
-			podName, ctrName, claimUID, info.Policy.MemoryUseOrder)
 	}
 
-	if len(pendingConfigs) > 0 {
-		p.mu.Lock()
-		p.pending[ctrID] = pendingConfigs
-		p.mu.Unlock()
+	// If no memory devices were found at all, nothing to manage.
+	if len(dramNodeSet) == 0 && len(cxlNodeSet) == 0 {
+		klog.V(5).Infof("NRI CreateContainer: ctr=%s: no DRAM or CXL devices in claims", ctrName)
+		return nil, nil, nil
 	}
+
+	// Validate user-specified policy if present.
+	if userPolicy != nil {
+		if err := validatePolicy(userPolicy); err != nil {
+			return nil, nil, fmt.Errorf("NRI CreateContainer: ctr=%s: invalid policy: %w",
+				ctrName, err)
+		}
+	}
+
+	// Build a single ManagerConfig for this container.
+	cfg, err := buildManagerConfig("", ctrName, dramNodeSet, cxlNodeSet, dramQuota, cxlQuota, userPolicy)
+	if err != nil {
+		return nil, nil, fmt.Errorf("NRI CreateContainer: ctr=%s: failed to build manager config: %w",
+			ctrName, err)
+	}
+
+	p.mu.Lock()
+	p.pending[ctrID] = cfg
+	p.mu.Unlock()
+
+	klog.V(5).Infof("NRI CreateContainer: ctr=%s: prepared cgmpolmgr configuration (order=%s, dramNodes=%s, cxlNodes=%s, dramQuota=%s, cxlQuota=%s)",
+		ctrName, cfg.MemoryUseOrder, cfg.DRAMNodes, cfg.CXLNodes, cfg.DRAMQuota, cfg.CXLQuota)
 
 	return nil, nil, nil
 }
@@ -215,86 +228,80 @@ func (p *nriPlugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr 
 // container is being removed. It stops any active cgroup managers for
 // the container's claims.
 func (p *nriPlugin) RemoveContainer(_ context.Context, pod *api.PodSandbox, ctr *api.Container) error {
-	podName := pod.GetNamespace() + "/" + pod.GetName()
-	ctrName := ctr.GetName()
+	ctrName := pod.GetNamespace() + "/" + pod.GetName() + "/" + ctr.GetName()
 	ctrID := ctr.GetId()
 
 	claimUIDs := extractClaimUIDs(ctr.GetEnv())
 	if len(claimUIDs) == 0 {
-		klog.V(5).Infof("NRI RemoveContainer: no CXL claims for pod=%s ctr=%s", podName, ctrName)
+		klog.V(5).Infof("NRI RemoveContainer: ctr=%s: no CXL claims", ctrName)
 		return nil
 	}
 
-	klog.V(5).Infof("NRI RemoveContainer: pod=%s ctr=%s releasing claims: %v", podName, ctrName, claimUIDs)
+	klog.V(5).Infof("NRI RemoveContainer: ctr=%s releasing claims: %v", ctrName, claimUIDs)
 
-	p.stopContainerManagers(ctrID, podName, ctrName)
+	p.stopContainerManagers(ctrID, ctrName)
 
 	return nil
 }
 
 // StartContainer is called by the container runtime (via NRI) after a
 // container has been started. It resolves the real cgroup filesystem
-// path, creates cgmpolmgr.Manager instances from the pending configs
-// stored in CreateContainer, and starts them.
+// path, creates a cgmpolmgr.Manager from the pending config stored in
+// CreateContainer, and starts it.
 func (p *nriPlugin) StartContainer(_ context.Context, pod *api.PodSandbox, ctr *api.Container) error {
-	podName := pod.GetNamespace() + "/" + pod.GetName()
-	ctrName := ctr.GetName()
+	ctrName := pod.GetNamespace() + "/" + pod.GetName() + "/" + ctr.GetName()
 	ctrID := ctr.GetId()
 	ctrPid := ctr.GetPid()
 
 	p.mu.Lock()
-	configs, hasPending := p.pending[ctrID]
+	cfg, hasPending := p.pending[ctrID]
 	if hasPending {
 		delete(p.pending, ctrID)
 	}
 	p.mu.Unlock()
 
 	if !hasPending {
-		klog.V(3).Infof("NRI StartContainer pod=%s ctr=%s id=%s: no memory claims to be managed", podName, ctrName, ctrID)
+		klog.V(3).Infof("NRI StartContainer: ctr=%s id=%s: no memory claims to be managed", ctrName, ctrID)
 		return nil
 	}
 
 	// Resolve the container's cgroup directory in the filesystem.
 	cgroupDir, err := resolveContainerCgroupDir(ctr)
 	if err != nil {
-		klog.Errorf("NRI StartContainer: pod=%s ctr=%s id=%s: failed to resolve cgroup directory: %v",
-			podName, ctrName, ctrID, err)
+		klog.Errorf("NRI StartContainer: ctr=%s id=%s: failed to resolve cgroup directory: %v",
+			ctrName, ctrID, err)
 		return nil
 	}
 
-	klog.V(3).Infof("NRI StartContainer pod=%s ctr=%s id=%s pid=%d cgroupsPath=%s", podName, ctrName, ctrID, ctrPid, cgroupDir)
+	klog.V(3).Infof("NRI StartContainer: ctr=%s id=%s pid=%d cgroupsPath=%s", ctrName, ctrID, ctrPid, cgroupDir)
 
-	for i := range configs {
-		cfg := &configs[i]
-		cfg.CgroupPath = cgroupDir
+	cfg.CgroupPath = cgroupDir
 
-		mgr, err := cgmpolmgr.NewManager(*cfg)
-		if err != nil {
-			klog.Warningf("NRI StartContainer: pod=%s ctr=%s: failed to create cgroup manager (order=%s): %v",
-				podName, ctrName, cfg.MemoryUseOrder, err)
-			continue
-		}
-
-		if err := mgr.Initialize(); err != nil {
-			klog.Warningf("NRI StartContainer: pod=%s ctr=%s: failed to initialize cgroup manager: %v",
-				podName, ctrName, err)
-			continue
-		}
-
-		if err := mgr.Start(); err != nil {
-			klog.Warningf("NRI StartContainer: pod=%s ctr=%s: failed to start cgroup manager: %v",
-				podName, ctrName, err)
-			continue
-		}
-
-		key := fmt.Sprintf("%s:%d", ctrID, i)
-		p.mu.Lock()
-		p.managers[key] = mgr
-		p.mu.Unlock()
-
-		klog.V(3).Infof("NRI StartContainer: pod=%s ctr=%s: started cgmpolmgr (order=%s, cgroup=%s)",
-			podName, ctrName, cfg.MemoryUseOrder, cfg.CgroupPath)
+	mgr, err := cgmpolmgr.NewManager(*cfg)
+	if err != nil {
+		klog.Warningf("NRI StartContainer: ctr=%s: failed to create cgroup manager (order=%s): %v",
+			ctrName, cfg.MemoryUseOrder, err)
+		return nil
 	}
+
+	if err := mgr.Initialize(); err != nil {
+		klog.Warningf("NRI StartContainer: ctr=%s: failed to initialize cgroup manager: %v",
+			ctrName, err)
+		return nil
+	}
+
+	if err := mgr.Start(); err != nil {
+		klog.Warningf("NRI StartContainer: ctr=%s: failed to start cgroup manager: %v",
+			ctrName, err)
+		return nil
+	}
+
+	p.mu.Lock()
+	p.managers[ctrID] = mgr
+	p.mu.Unlock()
+
+	klog.V(3).Infof("NRI StartContainer: ctr=%s: started cgmpolmgr (order=%s, cgroup=%s)",
+		ctrName, cfg.MemoryUseOrder, cfg.CgroupPath)
 
 	return nil
 }
@@ -303,43 +310,37 @@ func (p *nriPlugin) StartContainer(_ context.Context, pod *api.PodSandbox, ctr *
 // container is being stopped. Stops cgroup managers as a safety net
 // in case RemoveContainer is not called.
 func (p *nriPlugin) StopContainer(_ context.Context, pod *api.PodSandbox, ctr *api.Container) ([]*api.ContainerUpdate, error) {
-	podName := pod.GetNamespace() + "/" + pod.GetName()
-	ctrName := ctr.GetName()
+	ctrName := pod.GetNamespace() + "/" + pod.GetName() + "/" + ctr.GetName()
 	ctrID := ctr.GetId()
-	klog.V(3).Infof("NRI StopContainer: pod=%s ctr=%s", podName, ctrName)
+	klog.V(3).Infof("NRI StopContainer: ctr=%s", ctrName)
 
-	p.stopContainerManagers(ctrID, podName, ctrName)
+	p.stopContainerManagers(ctrID, ctrName)
 
 	return nil, nil
 }
 
-// stopContainerManagers stops and removes all cgroup managers and
-// pending configs associated with the given container.
-func (p *nriPlugin) stopContainerManagers(ctrID string, podName, ctrName string) {
+// stopContainerManagers stops and removes the cgroup manager and
+// pending config associated with the given container.
+func (p *nriPlugin) stopContainerManagers(ctrID string, ctrName string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	delete(p.pending, ctrID)
 
-	prefix := ctrID + ":"
-	for key, mgr := range p.managers {
-		if strings.HasPrefix(key, prefix) {
-			mgr.Stop()
-			delete(p.managers, key)
-			klog.V(3).Infof("NRI: stopped cgmpolmgr for pod=%s ctr=%s key=%s", podName, ctrName, key)
-		}
+	if mgr, ok := p.managers[ctrID]; ok {
+		mgr.Stop()
+		delete(p.managers, ctrID)
+		klog.V(3).Infof("NRI: stopped cgmpolmgr for ctr=%s", ctrName)
 	}
 }
 
-// validatePolicy checks that a PreparedClaimInfo has a valid memory
-// policy suitable for cgmpolmgr. Returns nil if info.Policy is nil
-// (no policy means no steering requested).
-func validatePolicy(info *PreparedClaimInfo) error {
-	if info.Policy == nil {
+// validatePolicy checks that a MemoryPolicyConfig has valid fields
+// suitable for cgmpolmgr. Returns nil if policy is nil (no policy
+// means no steering requested).
+func validatePolicy(p *memorypolicy.MemoryPolicyConfig) error {
+	if p == nil {
 		return nil
 	}
-
-	p := info.Policy
 
 	if p.MemoryUseOrder == "" {
 		return fmt.Errorf("memoryUseOrder is required")
@@ -352,24 +353,6 @@ func validatePolicy(info *PreparedClaimInfo) error {
 
 	if strings.EqualFold(p.MemoryUseOrder, "waypoints") && len(p.MemoryUseWaypoints) == 0 {
 		return fmt.Errorf("memoryUseWaypoints must be non-empty when memoryUseOrder is \"waypoints\"")
-	}
-
-	// Verify DRAM and CXL devices are present.
-	hasDRAM := false
-	hasCXL := false
-	for _, dev := range info.Devices {
-		switch dev.DeviceType {
-		case device.DeviceTypeDRAM:
-			hasDRAM = true
-		case device.DeviceTypeCXLNode:
-			hasCXL = true
-		}
-	}
-	if !hasDRAM {
-		return fmt.Errorf("no DRAM devices in claim, memory steering requires both DRAM and CXL")
-	}
-	if !hasCXL {
-		return fmt.Errorf("no CXL devices in claim, memory steering requires both DRAM and CXL")
 	}
 
 	// Validate step sizes if provided.
@@ -400,51 +383,81 @@ func validatePolicy(info *PreparedClaimInfo) error {
 	return nil
 }
 
-// buildManagerConfig creates a cgmpolmgr.ManagerConfig from the
-// claim's device/policy information. The cgroupPath parameter is
-// stored as-is in the config's Path field; pass an empty string if
-// the path will be resolved later (e.g. in StartContainer).
-// cgroupName is a pretty name used in log messages.
-func buildManagerConfig(cgroupPath, cgroupName string, info *PreparedClaimInfo) (*cgmpolmgr.ManagerConfig, error) {
-	// Aggregate DRAM and CXL NUMA nodes and quotas.
-	dramNodeSet := make(map[int]bool)
-	cxlNodeSet := make(map[int]bool)
-	var dramQuota, cxlQuota uint64
+// buildManagerConfig creates a cgmpolmgr.ManagerConfig from
+// aggregated device data and an optional user policy. The cgroupPath
+// parameter is stored as-is; pass an empty string if it will be
+// resolved later (e.g. in StartContainer). cgroupName is a pretty
+// name used in log messages.
+//
+// When no user policy is specified, the function picks a default:
+//   - CXL-only  → "first-cxl"
+//   - DRAM-only → "first-dram"
+//   - Both      → "start-interleaved"
+//
+// MinStep and MaxStep default to the total requested memory if the
+// user has not specified a policy.
+func buildManagerConfig(cgroupPath, cgroupName string,
+	dramNodeSet, cxlNodeSet map[int]bool,
+	dramQuota, cxlQuota uint64,
+	policy *memorypolicy.MemoryPolicyConfig,
+) (*cgmpolmgr.ManagerConfig, error) {
 
-	for _, dev := range info.Devices {
-		switch dev.DeviceType {
-		case device.DeviceTypeDRAM:
-			for _, n := range dev.NUMANodes {
-				dramNodeSet[n] = true
-			}
-			dramQuota += uint64(dev.ConsumedBytes)
-		case device.DeviceTypeCXLNode:
-			for _, n := range dev.NUMANodes {
-				cxlNodeSet[n] = true
-			}
-			cxlQuota += uint64(dev.ConsumedBytes)
+	hasDRAM := len(dramNodeSet) > 0 && dramQuota > 0
+	hasCXL := len(cxlNodeSet) > 0 && cxlQuota > 0
+
+	if !hasDRAM && !hasCXL {
+		return nil, fmt.Errorf("no DRAM or CXL devices with non-zero quota")
+	}
+
+	// Determine memory use order and step sizes.
+	var order, minLimit, maxLimit string
+	var waypoints []cgmpolmgr.MemoryUseWaypoint
+
+	if policy != nil {
+		order = policy.MemoryUseOrder
+		minLimit = policy.MinStep
+		maxLimit = policy.MaxStep
+		waypoints = policy.MemoryUseWaypoints
+	} else {
+		// Pick default order based on which memory types are present.
+		switch {
+		case hasCXL && !hasDRAM:
+			order = "first-cxl"
+		case hasDRAM && !hasCXL:
+			order = "first-dram"
+		default:
+			order = "start-interleaved"
 		}
+		totalBytes := dramQuota + cxlQuota
+		defaultStep := strconv.FormatUint(totalBytes, 10)
+		minLimit = defaultStep
+		maxLimit = defaultStep
 	}
 
-	if len(dramNodeSet) == 0 {
-		return nil, fmt.Errorf("no DRAM NUMA nodes found in claim devices")
-	}
-	if len(cxlNodeSet) == 0 {
-		return nil, fmt.Errorf("no CXL NUMA nodes found in claim devices")
-	}
-
-	return &cgmpolmgr.ManagerConfig{
+	cfg := &cgmpolmgr.ManagerConfig{
 		CgroupPath:         cgroupPath,
 		CgroupName:         cgroupName,
-		MemoryUseOrder:     info.Policy.MemoryUseOrder,
-		MemoryUseWaypoints: info.Policy.MemoryUseWaypoints,
-		DRAMNodes:          formatNodeset(dramNodeSet),
-		CXLNodes:           formatNodeset(cxlNodeSet),
-		DRAMQuota:          strconv.FormatUint(dramQuota, 10),
-		CXLQuota:           strconv.FormatUint(cxlQuota, 10),
-		MinLimit:           info.Policy.MinStep,
-		MaxLimit:           info.Policy.MaxStep,
-	}, nil
+		MemoryUseOrder:     order,
+		MemoryUseWaypoints: waypoints,
+		MinLimit:           minLimit,
+		MaxLimit:           maxLimit,
+	}
+
+	if hasDRAM {
+		cfg.DRAMNodes = formatNodeset(dramNodeSet)
+		cfg.DRAMQuota = strconv.FormatUint(dramQuota, 10)
+	} else {
+		cfg.DRAMQuota = "0"
+	}
+
+	if hasCXL {
+		cfg.CXLNodes = formatNodeset(cxlNodeSet)
+		cfg.CXLQuota = strconv.FormatUint(cxlQuota, 10)
+	} else {
+		cfg.CXLQuota = "0"
+	}
+
+	return cfg, nil
 }
 
 // formatNodeset formats a set of NUMA node IDs as a sorted
