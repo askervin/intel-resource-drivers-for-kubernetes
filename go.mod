@@ -132,4 +132,4 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2 // indirect
 )
 
-replace github.com/containers/nri-plugins => github.com/askervin/nri-plugins v0.11.1-0.20260331131158-d6462eddeba8
+replace github.com/containers/nri-plugins => github.com/askervin/nri-plugins v0.11.1-0.20260401084317-66eb5d915b08
