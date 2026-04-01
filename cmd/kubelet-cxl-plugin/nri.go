@@ -51,7 +51,7 @@ const cgroupV2MountPoint = "/sys/fs/cgroup"
 type nriPlugin struct {
 	stub     stub.Stub
 	state    *nodeState
-	pending  map[string][]cgmpolmgr.CgroupConfig // key: containerID; validated configs awaiting Start
+	pending  map[string][]cgmpolmgr.ManagerConfig // key: containerID; validated configs awaiting Start
 	managers map[string]*cgmpolmgr.Manager        // key: containerID:claimUID; running managers
 	mu       sync.Mutex                            // protects pending and managers
 }
@@ -63,7 +63,7 @@ type nriPlugin struct {
 func startNRIPlugin(ctx context.Context, state *nodeState, opts NRIOpts) (*nriPlugin, error) {
 	p := &nriPlugin{
 		state:    state,
-		pending:  make(map[string][]cgmpolmgr.CgroupConfig),
+		pending:  make(map[string][]cgmpolmgr.ManagerConfig),
 		managers: make(map[string]*cgmpolmgr.Manager),
 	}
 
@@ -118,7 +118,7 @@ func (p *nriPlugin) onClose() {
 
 // CreateContainer is called by the container runtime (via NRI) when a
 // new container is about to be created. It validates memory policies
-// and builds CgroupConfig for claims that request memory steering.
+// and builds ManagerConfig for claims that request memory steering.
 // Returns an error if a memory policy is requested but invalid,
 // blocking container creation. Managers are created and started later
 // in StartContainer, once the container is confirmed to exist and its
@@ -147,7 +147,7 @@ func (p *nriPlugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr 
 
 	klog.V(5).Infof("NRI CreateContainer: pod=%s ctr=%s has %d CXL claim(s): %v", podName, ctrName, len(claimUIDs), claimUIDs)
 
-	var pendingConfigs []cgmpolmgr.CgroupConfig
+	var pendingConfigs []cgmpolmgr.ManagerConfig
 
 	// Look up full claim information from shared state.
 	for _, claimUID := range claimUIDs {
@@ -189,7 +189,8 @@ func (p *nriPlugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr 
 		// Build config with a placeholder cgroup path. The real
 		// filesystem path is resolved in StartContainer where the
 		// cgroup directory exists and we can read pid/cgroup.
-		cgCfg, err := buildCgroupConfig("", info)
+		cgroupName := fmt.Sprintf("%s/%s/%s", podName, ctrName, info.ClaimName)
+		cgCfg, err := buildManagerConfig("", cgroupName, info)
 		if err != nil {
 			return nil, nil, fmt.Errorf("NRI CreateContainer: pod=%s ctr=%s claim=%s: failed to build cgroup config: %w",
 				podName, ctrName, claimUID, err)
@@ -270,7 +271,7 @@ func (p *nriPlugin) StartContainer(_ context.Context, pod *api.PodSandbox, ctr *
 
 	for i := range configs {
 		cfg := &configs[i]
-		cfg.Path = cgroupDir
+		cfg.CgroupPath = cgroupDir
 
 		mgr, err := cgmpolmgr.NewManager(*cfg)
 		if err != nil {
@@ -297,7 +298,7 @@ func (p *nriPlugin) StartContainer(_ context.Context, pod *api.PodSandbox, ctr *
 		p.mu.Unlock()
 
 		klog.V(3).Infof("NRI StartContainer: pod=%s ctr=%s: started cgmpolmgr (order=%s, cgroup=%s)",
-			podName, ctrName, cfg.MemoryUseOrder, cfg.Path)
+			podName, ctrName, cfg.MemoryUseOrder, cfg.CgroupPath)
 	}
 
 	return nil
@@ -404,11 +405,12 @@ func validatePolicy(info *PreparedClaimInfo) error {
 	return nil
 }
 
-// buildCgroupConfig creates a cgmpolmgr.CgroupConfig from the
+// buildManagerConfig creates a cgmpolmgr.ManagerConfig from the
 // claim's device/policy information. The cgroupPath parameter is
 // stored as-is in the config's Path field; pass an empty string if
 // the path will be resolved later (e.g. in StartContainer).
-func buildCgroupConfig(cgroupPath string, info *PreparedClaimInfo) (*cgmpolmgr.CgroupConfig, error) {
+// cgroupName is a pretty name used in log messages.
+func buildManagerConfig(cgroupPath, cgroupName string, info *PreparedClaimInfo) (*cgmpolmgr.ManagerConfig, error) {
 	// Aggregate DRAM and CXL NUMA nodes and quotas.
 	dramNodeSet := make(map[int]bool)
 	cxlNodeSet := make(map[int]bool)
@@ -436,8 +438,9 @@ func buildCgroupConfig(cgroupPath string, info *PreparedClaimInfo) (*cgmpolmgr.C
 		return nil, fmt.Errorf("no CXL NUMA nodes found in claim devices")
 	}
 
-	return &cgmpolmgr.CgroupConfig{
-		Path:               cgroupPath,
+	return &cgmpolmgr.ManagerConfig{
+		CgroupPath:         cgroupPath,
+		CgroupName:         cgroupName,
 		MemoryUseOrder:     info.Policy.MemoryUseOrder,
 		MemoryUseWaypoints: info.Policy.MemoryUseWaypoints,
 		DRAMNodes:          formatNodeset(dramNodeSet),
