@@ -53,7 +53,7 @@ type nriPlugin struct {
 	state    *nodeState
 	pending  map[string][]cgmpolmgr.ManagerConfig // key: containerID; validated configs awaiting Start
 	managers map[string]*cgmpolmgr.Manager        // key: containerID:claimUID; running managers
-	mu       sync.Mutex                            // protects pending and managers
+	mu       sync.Mutex                           // protects pending and managers
 }
 
 // startNRIPlugin creates and starts the NRI plugin. It connects to
@@ -242,12 +242,6 @@ func (p *nriPlugin) StartContainer(_ context.Context, pod *api.PodSandbox, ctr *
 	ctrID := ctr.GetId()
 	ctrPid := ctr.GetPid()
 
-	klog.V(3).Infof("NRI StartContainer: pod=%s ctr=%s id=%s pid=%d", podName, ctrName, ctrID, ctrPid)
-
-	// Debug: log cgroup paths available now.
-	klog.V(3).Infof("NRI StartContainer: pod=%s ctr=%s ctr.Linux.CgroupsPath=%q",
-		podName, ctrName, ctr.GetLinux().GetCgroupsPath())
-
 	p.mu.Lock()
 	configs, hasPending := p.pending[ctrID]
 	if hasPending {
@@ -256,18 +250,19 @@ func (p *nriPlugin) StartContainer(_ context.Context, pod *api.PodSandbox, ctr *
 	p.mu.Unlock()
 
 	if !hasPending {
+		klog.V(3).Infof("NRI StartContainer pod=%s ctr=%s id=%s: no memory claims to be managed", podName, ctrName, ctrID)
 		return nil
 	}
 
 	// Resolve the container's cgroup directory in the filesystem.
 	cgroupDir, err := resolveContainerCgroupDir(ctr)
 	if err != nil {
-		klog.Warningf("NRI StartContainer: pod=%s ctr=%s: failed to resolve cgroup directory: %v",
-			podName, ctrName, err)
+		klog.Errorf("NRI StartContainer: pod=%s ctr=%s id=%s: failed to resolve cgroup directory: %v",
+			podName, ctrName, ctrID, err)
 		return nil
 	}
 
-	klog.V(3).Infof("NRI StartContainer: pod=%s ctr=%s: resolved cgroup dir=%s", podName, ctrName, cgroupDir)
+	klog.V(3).Infof("NRI StartContainer pod=%s ctr=%s id=%s pid=%d cgroupsPath=%s", podName, ctrName, ctrID, ctrPid, cgroupDir)
 
 	for i := range configs {
 		cfg := &configs[i]
