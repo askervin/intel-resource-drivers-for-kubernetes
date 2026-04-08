@@ -1,20 +1,77 @@
-resourceclaims-consumed() {
-    kubectl get resourceclaims.resource.k8s.io -o json -A | jq -r '
-def to_bytes:
-  capture("(?<num>[0-9.]+)(?<unit>Ki|Mi|Gi|Ti)?") as $m
-  | ($m.num|tonumber) *
-    (if $m.unit=="Ki" then 1024
-     elif $m.unit=="Mi" then 1024*1024
-     elif $m.unit=="Gi" then 1024*1024*1024
-     elif $m.unit=="Ti" then 1024*1024*1024*1024
-     else 1 end);
+indent4() {
+    sed 's/^/    /g'
+}
 
-.items[]
-| .metadata.name as $name
-| (.status.allocation.devices.results // [])
-| map("\(.device) \(.consumedCapacity.memory | to_bytes | floor)")
-| "\($name) " + join(" ")
-'
+hr-if-hr() {
+    if [[ "$hr" == "1" ]]; then
+        numhr -b0
+    else
+        cat
+    fi
+}
+
+hrecho() {
+    if [[ "$hr" == "1" ]]; then
+        echo "$@"
+    fi
+}
+
+watch-statuses() {
+    while true; do
+        statuses > /tmp/$USER.dra-demo.statuses
+        clear
+        cat /tmp/$USER.dra-demo.statuses
+        sleep 2
+    done
+}
+
+statuses() {
+    echo ""
+    echo "Hardware topology:"
+    (
+        echo -e "Node\tSize\tUsed"
+        numactl -H | awk '/size:/{size=$4}/free:/{free=$4;print "node"$2"\t"size"Mi\t"(size-free)"Mi"}'
+    ) | numhr -r | numdelta -c2 -M nodesizeused | numhr | column -t | indent4
+
+    echo ""
+    echo "ResourceSlices: (what can be consumed)"
+    (
+        echo -e "Node\tDevice\tMemory"
+        kubectl get resourceslices.resource.k8s.io -o json | jq -r '.items[] | (first(.metadata.ownerReferences[] | select(.kind=="Node") | .name)) as $node | .spec.devices[] | [$node, .name, .capacity.memory.value] | @tsv'
+    ) | numhr -r | numhr | column -tR3 | indent4
+
+    echo ""
+    echo "ResourceClaims: (what is consumed)"
+    (
+        hr=1 resourceclaims-consumed
+    ) | indent4
+
+    echo ""
+    echo "Pods: (who consumes)"
+    (
+        echo -e "Pod\tNativeMemory\tContainers"
+        for pod in $(kubectl get pods -n dra-demo-cxl -o name); do
+            kubectl get $pod -n dra-demo-cxl -o json \
+                | jq -r '.metadata.name as $pod
+                        | .status.nodeAllocatableResourceClaimStatuses[]
+                        | [$pod,.resources.memory, "\(.containers|join(","))"]
+                        | @tsv'
+        done
+    ) | column -tR2 | indent4
+
+}
+
+resourceclaims-consumed() {
+    (
+        hrecho -e "Claim\tDeviceClass\tMemory\tPod"
+        for claim in $(kubectl get resourceclaims.resource.k8s.io -n dra-demo-cxl -o name); do
+            kubectl get -n dra-demo-cxl $claim -o json \
+                | jq -r '.metadata.name as $name
+                         | (first(.status?.reservedFor[]? | .name) // "n/a") as $pod
+                         | .spec.devices.requests[].exactly
+                         | [$name, .deviceClassName, .capacity.requests.memory, $pod] | @tsv'
+        done
+    ) | numhr -r | hr-if-hr | column -tR3
 }
 
 resourceclaims-coords() {
