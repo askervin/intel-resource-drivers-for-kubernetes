@@ -46,6 +46,7 @@ type driver struct {
 	config      *DriverConfig
 	nriPlugin   *nriPlugin
 	udevWatcher *UdevEventWatcher
+	sysfsRoot   string
 }
 
 // TestabilityConfig holds configuration for injecting fake CXL
@@ -199,6 +200,32 @@ func injectFakeDevices(tc *TestabilityConfig, devices *nricxl.Devices) {
 	}
 }
 
+// scanDevices discovers CXL and DRAM devices from sysfs, injects
+// fake devices if testability is configured, and builds the filtered
+// DevicesInfo map. This is the single place where device scanning
+// happens, used both at startup and on udev-triggered rescans.
+func scanDevices(sysfsRoot string, driverConfig *DriverConfig) (device.DevicesInfo, error) {
+	detectedDevices, err := nricxl.DevicesFromSysfs(sysfsRoot)
+	if err != nil {
+		return nil, fmt.Errorf("failed to detect devices: %v", err)
+	}
+
+	if driverConfig.Testability != nil {
+		injectFakeDevices(driverConfig.Testability, detectedDevices)
+	}
+
+	if len(detectedDevices.RegionDevices) == 0 {
+		klog.Info("No region devices detected")
+	}
+
+	devInfos, err := buildDevInfos(driverConfig, detectedDevices)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build device infos: %v", err)
+	}
+
+	return devInfos, nil
+}
+
 func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, error) {
 	driverVersion.PrintDriverVersion(device.DriverName)
 
@@ -224,29 +251,23 @@ func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, err
 	if len(sysfsRoot) >= 4 && sysfsRoot[len(sysfsRoot)-4:] == "/sys" {
 		cxlFlags.SysfsRoot = sysfsRoot[:len(sysfsRoot)-4]
 	}
-	detectedDevices, err := nricxl.DevicesFromSysfs(sysfsRoot)
+
+	devInfos, err := scanDevices(sysfsRoot, driverConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to detect devices: %v", err)
-	}
-
-	if driverConfig.Testability != nil {
-		injectFakeDevices(driverConfig.Testability, detectedDevices)
-	}
-
-	if len(detectedDevices.RegionDevices) == 0 {
-		klog.Info("No region devices detected")
+		return nil, err
 	}
 
 	klog.V(3).Info("Creating new NodeState")
-	state, err := newNodeState(detectedDevices, config.CommonFlags.CdiRoot, preparedClaimsFilePath, config.CommonFlags.NodeName, driverConfig)
+	state, err := newNodeState(devInfos, config.CommonFlags.CdiRoot, preparedClaimsFilePath, config.CommonFlags.NodeName, driverConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create new NodeState: %v", err)
 	}
 
 	driver := &driver{
-		state:  *state,
-		client: config.Coreclient,
-		config: driverConfig,
+		state:     *state,
+		client:    config.Coreclient,
+		config:    driverConfig,
+		sysfsRoot: sysfsRoot,
 	}
 
 	klog.Infof(`Starting DRA resource-driver kubelet-plugin
@@ -386,12 +407,26 @@ func (d *driver) udevRescanLoop(ctx context.Context) {
 }
 
 // rescanAndPublish re-discovers hardware resources and republishes
-// ResourceSlices if anything changed.
-// TODO: implement full rescan — re-run DevicesFromSysfs, diff against
-// current nodeState.Allocatable, update state and call
-// PublishResourceSlice if changed.
+// ResourceSlices if the set of allocatable devices has changed.
 func (d *driver) rescanAndPublish(ctx context.Context) {
-	klog.Infof("rescanAndPublish: udev node event triggered rescan (not yet implemented)")
+	klog.Infof("rescanAndPublish: udev event triggered rescan")
+
+	newDevInfos, err := scanDevices(d.sysfsRoot, d.config)
+	if err != nil {
+		klog.Errorf("rescanAndPublish: %v", err)
+		return
+	}
+
+	d.state.Lock()
+	d.state.Allocatable = newDevInfos
+	d.state.Unlock()
+
+	if err := d.PublishResourceSlice(ctx); err != nil {
+		klog.Errorf("rescanAndPublish: failed to publish resources: %v", err)
+		return
+	}
+
+	klog.Infof("rescanAndPublish: published updated resources (%d devices)", len(newDevInfos))
 }
 
 func (d *driver) Shutdown(ctx context.Context) error {
