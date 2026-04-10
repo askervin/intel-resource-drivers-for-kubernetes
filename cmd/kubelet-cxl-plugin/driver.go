@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"time"
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -39,11 +40,12 @@ import (
 )
 
 type driver struct {
-	client    coreclientset.Interface
-	state     nodeState
-	helper    *kubeletplugin.Helper
-	config    *DriverConfig
-	nriPlugin *nriPlugin
+	client      coreclientset.Interface
+	state       nodeState
+	helper      *kubeletplugin.Helper
+	config      *DriverConfig
+	nriPlugin   *nriPlugin
+	udevWatcher *UdevEventWatcher
 }
 
 // TestabilityConfig holds configuration for injecting fake CXL
@@ -57,6 +59,12 @@ type TestabilityConfig struct {
 	// referenced in Memories are also appended to
 	// nricxl.Devices.MemoryDevices.
 	FakeRegionDevices []nricxl.RegionDevice `json:"fakeRegionDevices,omitempty"`
+	// FakeUdevFifo is a path to a named pipe (FIFO) from which
+	// the driver reads fake udev events. Each line is a JSON
+	// object whose keys and values are udev event properties.
+	// The driver creates the FIFO if it does not exist. Example:
+	//   {"ACTION":"add","SUBSYSTEM":"node","DEVPATH":"/devices/system/node/node2"}
+	FakeUdevFifo string `json:"fakeUdevFifo,omitempty"`
 }
 
 type DriverConfig struct {
@@ -83,6 +91,11 @@ type DriverConfig struct {
 	// exposed in DRAM ResourceSlices.
 	IgnoreDRAMNodes bool
 
+	// UdevStableDuration is the quiet period after the last udev
+	// event before a rescan is triggered. Parsed as a Go
+	// duration string (e.g. "200ms", "1s"). Default: "200ms".
+	UdevStableDuration string `json:"udevStableDuration,omitempty"`
+
 	// Testability enables injection of fake CXL devices for
 	// testing without real hardware.
 	Testability *TestabilityConfig `json:"testability,omitempty"`
@@ -95,6 +108,24 @@ func getCXLFlags(someFlags any) (*CXLFlags, error) {
 	default:
 		return &CXLFlags{}, fmt.Errorf("could not parse driver flags as CXLFlags (got type: %T)", v)
 	}
+}
+
+const defaultUdevStableDuration = 200 * time.Millisecond
+
+// parseUdevStableDuration parses the UdevStableDuration config string.
+// Returns the default (200ms) when the string is empty.
+func parseUdevStableDuration(s string) (time.Duration, error) {
+	if s == "" {
+		return defaultUdevStableDuration, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid udevStableDuration %q: %w", s, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("udevStableDuration must not be negative, got %v", d)
+	}
+	return d, nil
 }
 
 func newDriverConfigFromString(configStr string) (*DriverConfig, error) {
@@ -256,6 +287,32 @@ PluginDataDirectoryPath: %v`,
 		driver.nriPlugin = nri
 	}
 
+	// Start udev event watcher for NUMA node hotplug detection.
+	if !driverConfig.IgnoreNewNodes {
+		stableDuration, err := parseUdevStableDuration(driverConfig.UdevStableDuration)
+		if err != nil {
+			return nil, err
+		}
+
+		watcher, err := NewUdevEventWatcher(stableDuration)
+		if err != nil {
+			klog.Warningf("Failed to create udev watcher (continuing without it): %v", err)
+		} else {
+			var fifoPath string
+			if driverConfig.Testability != nil {
+				fifoPath = driverConfig.Testability.FakeUdevFifo
+			}
+			if err := watcher.Start(fifoPath); err != nil {
+				klog.Warningf("Failed to start udev watcher (continuing without it): %v", err)
+			} else {
+				driver.udevWatcher = watcher
+				go driver.udevRescanLoop(ctx)
+			}
+		}
+	} else {
+		klog.V(3).Info("Udev node watcher disabled (ignoreNewNodes=true)")
+	}
+
 	klog.V(3).Info("Finished creating new driver")
 	return driver, nil
 }
@@ -319,9 +376,30 @@ func (d *driver) PublishResourceSlice(ctx context.Context) error {
 	return nil
 }
 
+// udevRescanLoop reads stable-notifications from the udev watcher and
+// triggers a resource rescan on each one.
+func (d *driver) udevRescanLoop(ctx context.Context) {
+	for range d.udevWatcher.Events() {
+		d.rescanAndPublish(ctx)
+	}
+	klog.V(3).Info("udevRescanLoop: exiting (watcher channel closed)")
+}
+
+// rescanAndPublish re-discovers hardware resources and republishes
+// ResourceSlices if anything changed.
+// TODO: implement full rescan — re-run DevicesFromSysfs, diff against
+// current nodeState.Allocatable, update state and call
+// PublishResourceSlice if changed.
+func (d *driver) rescanAndPublish(ctx context.Context) {
+	klog.Infof("rescanAndPublish: udev node event triggered rescan (not yet implemented)")
+}
+
 func (d *driver) Shutdown(ctx context.Context) error {
 	klog.V(5).Info("Shutting down driver")
 
+	if d.udevWatcher != nil {
+		d.udevWatcher.Stop()
+	}
 	if d.nriPlugin != nil {
 		d.nriPlugin.Stop()
 	}
