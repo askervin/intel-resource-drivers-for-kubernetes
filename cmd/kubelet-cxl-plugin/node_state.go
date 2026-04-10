@@ -92,8 +92,7 @@ type nodeState struct {
 	podClaims map[string]map[string]bool
 }
 
-func newNodeState(detectedDevices *nricxl.Devices, cdiRoot, preparedClaimsFilePath, nodeName string, driverConfig *DriverConfig) (*nodeState, error) {
-	// was: detectedDevices map[string]*device.DeviceInfo
+func newNodeState(devInfo device.DevicesInfo, cdiRoot, preparedClaimsFilePath, nodeName string, driverConfig *DriverConfig) (*nodeState, error) {
 	klog.V(5).Info("Refreshing CDI registry")
 	if err := cdiapi.Configure(cdiapi.WithSpecDirs(cdiRoot)); err != nil {
 		return nil, fmt.Errorf("unable to refresh the CDI registry: %v", err)
@@ -101,10 +100,6 @@ func newNodeState(detectedDevices *nricxl.Devices, cdiRoot, preparedClaimsFilePa
 
 	cdiCache := cdiapi.GetDefaultCache()
 
-	devInfo, err := buildDevInfos(driverConfig, detectedDevices)
-	if err != nil {
-		return nil, fmt.Errorf("failed to filter discovered devices: %v", err)
-	}
 	if err := cdihelpers.AddDetectedDevicesToCDIRegistry(cdiCache, devInfo, true); err != nil {
 		return nil, fmt.Errorf("failed to add detected devices to CDI registry: %v", err)
 	}
