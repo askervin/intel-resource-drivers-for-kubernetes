@@ -27,11 +27,12 @@ import (
 	"k8s.io/klog/v2"
 )
 
-// UdevEventWatcher monitors udev events for NUMA node changes and
-// delivers debounced "stable" notifications. It watches for node
-// add/remove events and waits for a quiet period (no new events)
-// before signaling that sysfs has stabilized and a rescan is
-// warranted.
+// UdevEventWatcher monitors udev events for CXL memory topology
+// changes and delivers debounced "stable" notifications. It watches
+// the node, memory, and cxl subsystems so that the debounce timer
+// accounts for the full hotplug sequence (CXL device bind → region
+// creation → memory onlining → NUMA node appearance) before
+// signaling that sysfs has stabilized and a rescan is warranted.
 type UdevEventWatcher struct {
 	monitor        *udev.Monitor
 	stableDuration time.Duration
@@ -41,9 +42,14 @@ type UdevEventWatcher struct {
 }
 
 // NewUdevEventWatcher creates a watcher that monitors udev events
-// for NUMA node additions and removals. The stableDuration parameter
-// controls how long the watcher waits after the last event before
-// signaling stability.
+// relevant to CXL memory topology changes. It watches:
+//   - node: add/remove (NUMA node hotplug)
+//   - memory: any action (memory block online/offline)
+//   - cxl: any action (CXL device/region changes)
+//
+// All these subsystems feed into the same debounce timer so the
+// driver waits for the full sequence (e.g. CXL region creation →
+// memory onlining → node appearance) to stabilize before rescanning.
 func NewUdevEventWatcher(stableDuration time.Duration) (*UdevEventWatcher, error) {
 	m, err := udev.NewMonitor(
 		udev.WithFilters(
@@ -54,6 +60,12 @@ func NewUdevEventWatcher(stableDuration time.Duration) (*UdevEventWatcher, error
 			map[string]string{
 				udev.PropertySubsystem: "node",
 				udev.PropertyAction:    "remove",
+			},
+			map[string]string{
+				udev.PropertySubsystem: "memory",
+			},
+			map[string]string{
+				udev.PropertySubsystem: "cxl",
 			},
 		),
 	)
