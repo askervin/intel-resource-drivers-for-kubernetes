@@ -15,9 +15,11 @@ import (
 
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	coreclientset "k8s.io/client-go/kubernetes"
-	devicemetadata "k8s.io/dynamic-resource-allocation/api/metadata/v1alpha1"
+	devicemetadatav1alpha1 "k8s.io/dynamic-resource-allocation/api/metadata/v1alpha1"
+	devicemetadatav1beta1 "k8s.io/dynamic-resource-allocation/api/metadata/v1beta1"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/klog/v2"
 	drahealthv1alpha1 "k8s.io/kubelet/pkg/apis/dra-health/v1alpha1"
@@ -109,8 +111,12 @@ PluginDataDirectoryPath: %v`,
 		kubeletplugin.DriverName(device.DriverName),
 		kubeletplugin.RegistrarDirectoryPath(config.CommonFlags.KubeletPluginsRegistryDir),
 		kubeletplugin.PluginDataDirectoryPath(config.CommonFlags.KubeletPluginDir),
-		kubeletplugin.EnableDeviceMetadata(true),
-		kubeletplugin.MetadataVersions(devicemetadata.SchemeGroupVersion),
+		// The latest metadata version must always be enabled. v1alpha1
+		// stays enabled for kubelets that do not know v1beta1 yet.
+		kubeletplugin.EnableDeviceMetadata(true, []schema.GroupVersion{
+			devicemetadatav1beta1.SchemeGroupVersion,
+			devicemetadatav1alpha1.SchemeGroupVersion,
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to start kubelet-plugin: %v", err)
@@ -242,4 +248,19 @@ func (d *driver) HandleError(ctx context.Context, err error, message string) {
 	}
 
 	runtime.HandleErrorWithContext(ctx, err, message)
+}
+
+// WatchHealthStatus is required by the kubeletplugin.DRAPlugin
+// interface, which k8s v1.37 uses for device health reporting.
+//
+// TODO: migrate the health reporting of this driver to it. Until then
+// no device health reaches the kubelet: up to k8s v1.36 the helper
+// duck-typed the versioned drahealthv1alpha1.DRAResourceHealthServer
+// out of the driver, which is what NodeWatchResources in
+// resourceHealthPodStatus.go implements. Since v1.37 the helper always
+// registers its own bridge, which calls this method instead, leaving
+// NodeWatchResources and the healthStreams machinery unused.
+func (d *driver) WatchHealthStatus(ctx context.Context, reports chan<- kubeletplugin.DeviceHealthReport) error {
+	klog.Warning("device health reporting is not implemented on the kubeletplugin.WatchHealthStatus API yet, GPU health will not show up in pod status")
+	return kubeletplugin.ErrHealthNotSupported
 }

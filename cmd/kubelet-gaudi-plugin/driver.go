@@ -240,3 +240,10 @@ func (d *driver) Shutdown(ctx context.Context) error {
 
 	return nil
 }
+
+// WatchHealthStatus is required by the kubeletplugin.DRAPlugin
+// interface. This driver does not report per-device health, so it
+// declines the kubelet's health stream.
+func (d *driver) WatchHealthStatus(ctx context.Context, reports chan<- kubeletplugin.DeviceHealthReport) error {
+	return kubeletplugin.ErrHealthNotSupported
+}
