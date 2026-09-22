@@ -461,3 +461,10 @@ func (d *driver) HandleError(ctx context.Context, err error, message string) {
 
 	runtime.HandleErrorWithContext(ctx, err, message)
 }
+
+// WatchHealthStatus is required by the kubeletplugin.DRAPlugin
+// interface. This driver does not report per-device health, so it
+// declines the kubelet's health stream.
+func (d *driver) WatchHealthStatus(ctx context.Context, reports chan<- kubeletplugin.DeviceHealthReport) error {
+	return kubeletplugin.ErrHealthNotSupported
+}

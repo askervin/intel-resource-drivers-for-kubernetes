@@ -297,11 +297,7 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 						Value: *resource.NewQuantity(int64(dev.Size), resource.BinarySI),
 					},
 				},
-				NodeAllocatableResourceMappings: map[v1.ResourceName]resourcev1.NodeAllocatableResourceMapping{
-					v1.ResourceMemory: {
-						CapacityKey: ptr(device.CapacityMemory),
-					},
-				},
+				NodeAllocatableResources: memoryNodeAllocatableResources(),
 				AllowMultipleAllocations: ptr(true),
 			}
 			devices = append(devices, newDevice)
@@ -329,11 +325,7 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 						Value: *resource.NewQuantity(int64(dev.Size), resource.BinarySI),
 					},
 				},
-				NodeAllocatableResourceMappings: map[v1.ResourceName]resourcev1.NodeAllocatableResourceMapping{
-					v1.ResourceMemory: {
-						CapacityKey: ptr(device.CapacityMemory),
-					},
-				},
+				NodeAllocatableResources: memoryNodeAllocatableResources(),
 				AllowMultipleAllocations: ptr(true),
 			}
 			devices = append(devices, newDevice)
@@ -355,6 +347,26 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 
 func ptr[T any](v T) *T {
 	return &v
+}
+
+// memoryNodeAllocatableResources maps the memory capacity that a
+// claim consumes from a device to the node allocatable "memory"
+// resource, so that kubelet accounts claimed memory in the pod and
+// container cgroups. Memory capacity (device and node) is in bytes,
+// hence capacityMultiplier is 1.
+//
+// Requires DRANodeAllocatableResources feature gate. Without it the
+// apiserver drops the field from published ResourceSlices and the
+// driver logs "some fields were dropped by the apiserver".
+func memoryNodeAllocatableResources() map[v1.ResourceName]resourcev1.NodeAllocatableResource {
+	return map[v1.ResourceName]resourcev1.NodeAllocatableResource{
+		v1.ResourceMemory: {
+			Mapping: &resourcev1.NodeAllocatableMapping{
+				CapacityKey:        ptr(device.CapacityMemory),
+				CapacityMultiplier: ptr(resource.MustParse("1")),
+			},
+		},
+	}
 }
 
 // Unprepare overrides helpers.NodeState.Unprepare to also clean up
