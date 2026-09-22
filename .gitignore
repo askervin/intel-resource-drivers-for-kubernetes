@@ -2,6 +2,9 @@
 /vendor/
 /cmd/kubelet-gaudi-plugin/vendor
 
+# output of test/e2e scripts
+/test/e2e/*/output/
+
 # macOS
 .DS_Store
 
