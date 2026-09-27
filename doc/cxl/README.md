@@ -4,20 +4,19 @@ CAUTION: This is a beta / non-production software, do not use on production clus
 
 ## About resource driver
 
-With structured parameters (K8s v1.31+), the DRA driver publishes ResourceSlice, scheduler allocates
-the resources and resource driver's kubelet-plugin ensures that the allocated devices are prepared
-and available for Pods.
-
-DRA API graduated to GA with v1 resource.k8s.io API in K8s v1.34, backwards compatibility may vary
-depending on features enabled.
+The DRA driver publishes ResourceSlices, the scheduler allocates the resources, and the resource
+driver's kubelet-plugin ensures that the allocated devices are prepared and available for Pods.
 
 ## Supported Kubernetes Versions
 
-Supported Kubernetes versions are listed below:
+Kubernetes v1.37 is the minimum supported version.
 
 | Branch            | Kubernetes branch/version       | Status      | DRA                            |
 |:------------------|:--------------------------------|:------------|:-------------------------------|
-| v0.1.0            | Kubernetes v1.35+               | Supported   | Structured Parameters          |
+| v0.1.0            | Kubernetes v1.37+               | Supported   | Structured Parameters          |
+
+The driver needs the `DRANodeAllocatableResources` feature gate to account claimed memory against
+the node's allocatable memory.
 
 ## Documentation
 

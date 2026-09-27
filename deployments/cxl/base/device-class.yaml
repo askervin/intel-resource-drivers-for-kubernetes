@@ -6,6 +6,6 @@ spec:
   selectors:
   - cel:
       expression: device.driver == "cxl.intel.com"
-  # Available in K8s v1.34 requires feature gate enabled, uncomment if needed.
-  # See https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/5004-dra-extended-resource
+  # Uncomment to request the devices as an extended resource. See
+  # https://github.com/kubernetes/enhancements/tree/master/keps/sig-scheduling/5004-dra-extended-resource
   # extendedResourceName: intel.com/cxl
