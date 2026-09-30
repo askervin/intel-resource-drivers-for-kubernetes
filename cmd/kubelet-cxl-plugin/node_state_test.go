@@ -27,6 +27,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
+	"github.com/containers/nri-plugins/pkg/cgmpolmgr"
+
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/memorypolicy"
 )
@@ -89,11 +91,13 @@ func TestParseMemoryPolicyFromClaim_NoAllocation(t *testing.T) {
 
 func TestParseMemoryPolicyFromClaim_ClaimConfig(t *testing.T) {
 	cfg := memorypolicy.MemoryPolicyConfig{
-		APIVersion:     memorypolicy.APIVersion,
-		Kind:           memorypolicy.Kind,
-		MemoryUseOrder: "first-dram",
-		MinStep:        "128M",
-		MaxStep:        "1G",
+		APIVersion: memorypolicy.APIVersion,
+		Kind:       memorypolicy.Kind,
+		Policy: cgmpolmgr.Policy{
+			MemoryUseOrder: "first-dram",
+			MinStep:        "128M",
+			MaxStep:        "1G",
+		},
 	}
 	claim := makeClaim("uid-2",
 		makeOpaqueConfig(device.DriverName, resourcev1.AllocationConfigSourceClaim, cfg),
@@ -119,9 +123,11 @@ func TestParseMemoryPolicyFromClaim_ClaimConfig(t *testing.T) {
 
 func TestParseMemoryPolicyFromClaim_ClassConfig(t *testing.T) {
 	cfg := memorypolicy.MemoryPolicyConfig{
-		APIVersion:     memorypolicy.APIVersion,
-		Kind:           memorypolicy.Kind,
-		MemoryUseOrder: "first-cxl",
+		APIVersion: memorypolicy.APIVersion,
+		Kind:       memorypolicy.Kind,
+		Policy: cgmpolmgr.Policy{
+			MemoryUseOrder: "first-cxl",
+		},
 	}
 	claim := makeClaim("uid-3",
 		makeOpaqueConfig(device.DriverName, resourcev1.AllocationConfigSourceClass, cfg),
@@ -141,15 +147,19 @@ func TestParseMemoryPolicyFromClaim_ClassConfig(t *testing.T) {
 
 func TestParseMemoryPolicyFromClaim_ClaimOverridesClass(t *testing.T) {
 	classCfg := memorypolicy.MemoryPolicyConfig{
-		APIVersion:     memorypolicy.APIVersion,
-		Kind:           memorypolicy.Kind,
-		MemoryUseOrder: "first-cxl",
+		APIVersion: memorypolicy.APIVersion,
+		Kind:       memorypolicy.Kind,
+		Policy: cgmpolmgr.Policy{
+			MemoryUseOrder: "first-cxl",
+		},
 	}
 	claimCfg := memorypolicy.MemoryPolicyConfig{
-		APIVersion:     memorypolicy.APIVersion,
-		Kind:           memorypolicy.Kind,
-		MemoryUseOrder: "first-dram",
-		MinStep:        "64M",
+		APIVersion: memorypolicy.APIVersion,
+		Kind:       memorypolicy.Kind,
+		Policy: cgmpolmgr.Policy{
+			MemoryUseOrder: "first-dram",
+			MinStep:        "64M",
+		},
 	}
 	claim := makeClaim("uid-4",
 		makeOpaqueConfig(device.DriverName, resourcev1.AllocationConfigSourceClass, classCfg),
@@ -173,9 +183,11 @@ func TestParseMemoryPolicyFromClaim_ClaimOverridesClass(t *testing.T) {
 
 func TestParseMemoryPolicyFromClaim_WrongDriver(t *testing.T) {
 	cfg := memorypolicy.MemoryPolicyConfig{
-		APIVersion:     memorypolicy.APIVersion,
-		Kind:           memorypolicy.Kind,
-		MemoryUseOrder: "first-dram",
+		APIVersion: memorypolicy.APIVersion,
+		Kind:       memorypolicy.Kind,
+		Policy: cgmpolmgr.Policy{
+			MemoryUseOrder: "first-dram",
+		},
 	}
 	claim := makeClaim("uid-5",
 		makeOpaqueConfig("other.driver", resourcev1.AllocationConfigSourceClaim, cfg),
@@ -211,9 +223,11 @@ func TestParseMemoryPolicyFromClaim_WrongKindSkipped(t *testing.T) {
 
 func TestParseMemoryPolicyFromClaim_InvalidConfig(t *testing.T) {
 	cfg := memorypolicy.MemoryPolicyConfig{
-		APIVersion:     memorypolicy.APIVersion,
-		Kind:           memorypolicy.Kind,
-		MemoryUseOrder: "invalid-order",
+		APIVersion: memorypolicy.APIVersion,
+		Kind:       memorypolicy.Kind,
+		Policy: cgmpolmgr.Policy{
+			MemoryUseOrder: "invalid-order",
+		},
 	}
 	claim := makeClaim("uid-7",
 		makeOpaqueConfig(device.DriverName, resourcev1.AllocationConfigSourceClaim, cfg),
@@ -234,11 +248,13 @@ func TestPreparedClaimsInfo_Persistence(t *testing.T) {
 		"uid-1": {
 			ClaimName: "test-ns/test-claim",
 			Policy: &memorypolicy.MemoryPolicyConfig{
-				APIVersion:     memorypolicy.APIVersion,
-				Kind:           memorypolicy.Kind,
-				MemoryUseOrder: "first-dram",
-				MinStep:        "128M",
-				MaxStep:        "1G",
+				APIVersion: memorypolicy.APIVersion,
+				Kind:       memorypolicy.Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "first-dram",
+					MinStep:        "128M",
+					MaxStep:        "1G",
+				},
 			},
 			Devices: []PreparedDeviceInfo{
 				{

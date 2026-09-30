@@ -90,25 +90,25 @@ ctr-waypoints() {
     # namespace/pod/container [wp0node0usage wp0node1usage ...] [wp1node0usage0 wp1node1usage ...] ...
     #
     # parse this information from real log lines like:
-    # 1775047182.322506 DEBUG cgmpolmgr dra-demo-cxl/use-both-memories-pod/ctr0: NewManager: created with waypoints [{ map[1:134217728]} { map[0:402653184 1:134217728]}] for cgroup /sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod15b54f11_0dc3_4e0c_b0e0_81c9bdedd291.slice/cri-containerd-d329b169d1c420f723eb4474c68d4a08bd62dae6b20de993ea8644e92d6353ec.scope
-    # where { map[1:134217728]} means that the first waypoint has 134217728 bytes of memory allocated on node 1, but 0 on node 0.
+    # I0930 10:49:18.610100 1234 nri.go:56] dra-demo-cxl/use-both-memories-pod/ctr0: start steering /sys/fs/cgroup/kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod15b54f11_0dc3_4e0c_b0e0_81c9bdedd291.slice/cri-containerd-d329b169d1c420f723eb4474c68d4a08bd62dae6b20de993ea8644e92d6353ec.scope: waypoints=[[1:134217728] [0:402653184 1:134217728]] minStep=16777216 maxStep=16777216
+    # where [1:134217728] means that the first waypoint has 134217728 bytes of memory allocated on node 1, but 0 on node 0.
 
     # Extract waypoints from driver log.
-    # Look for lines with "NewManager: created waypoints". Then extract the namespace/pod/container,
-    # and finally loop through every map[<node>:<usage> <node>:<usage>...] and every
+    # Look for lines with "start steering". Then extract the namespace/pod/container,
+    # and finally loop through every [<node>:<usage> <node>:<usage>...] and every
     # node:usage pair to print the usage for each node in the format.
     python -c '
 import sys, re
-pattern = re.compile(r"(\S+/\S+/\S+): NewManager: created with waypoints \[(.+)\]")
+pattern = re.compile(r"(\S+/\S+/\S+): start steering \S+: waypoints=\[(.*)\] minStep=")
 for line in sys.stdin:
     match = pattern.search(line)
     if match:
         name = match.group(1)
         waypoints_str = match.group(2)
-        # waypoints_str is something like "{ map[1:134217728]} { map[0:402653184 1:134217728]}"
+        # waypoints_str is something like "[1:134217728] [0:402653184 1:134217728]"
         # We want to extract the usage for each node for each waypoint.
         waypoints = []
-        for wp in re.findall(r"\{ ?map\[([^\]]+)\] ?\}", waypoints_str):
+        for wp in re.findall(r"\[([^\]]*)\]", waypoints_str):
             node_usage = {int(node): int(usage) for node, usage in re.findall(r"(\d+):(\d+)", wp)}
             waypoints.append(node_usage)
         # Now we have a list of waypoints, where each waypoint is a dict of node:usage.
@@ -154,12 +154,12 @@ for line in sys.stdin:
 
 ctr-mem-distribution() {
     # Parse driver.log from stdin for lines like:
-    # 1775047182.326754 DEBUG cgmpolmgr dra-demo-cxl/use-both-memories-pod/ctr0: NUMA memory distribution: [0:4096 1:2912256]
+    # I0930 10:49:18.611100 1234 nri.go:55] dra-demo-cxl/use-both-memories-pod/ctr0: step: usage=[0:4096 1:2912256] nodes=[1] bytes=16777216 procs=1 cpuset.mems=0-1 lower=0 upper=19693568
     # Output format:
     #  namespace/pod/container [4096 2912256]
     python -c '
 import sys, re
-pattern = re.compile(r"(\S+/\S+/\S+): NUMA memory distribution: \[([^\]]+)\]")
+pattern = re.compile(r"(\S+/\S+/\S+): step: usage=\[([^\]]*)\]")
 for line in sys.stdin:
     match = pattern.search(line)
     if match:
@@ -167,6 +167,8 @@ for line in sys.stdin:
         distribution_str = match.group(2)
         # distribution_str is something like "0:4096 1:2912256"
         node_usage = {int(node): int(usage) for node, usage in re.findall(r"(\d+):(\d+)", distribution_str)}
+        if not node_usage:
+            continue
         output = name + " [" + " ".join(str(node_usage.get(node, 0)) for node in range(max(node_usage.keys()) + 1)) + "]"
         print(output)
 '
@@ -201,9 +203,9 @@ ctr-coords() {
     # distribution, then print them in "coords" program input format
     # in the order of appearance in the log.
     while read line; do
-        if [[ "$line" == *"NewManager: created with waypoints"* ]]; then
+        if [[ "$line" == *": start steering "* ]]; then
             echo "$line" | ctr-waypoints-coords
-        elif [[ "$line" == *"NUMA memory distribution"* ]]; then
+        elif [[ "$line" == *": step: usage="* ]]; then
             echo "$line" | ctr-mem-distribution-coords
         fi
     done

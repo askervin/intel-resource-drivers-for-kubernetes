@@ -31,68 +31,80 @@ func TestValidate_ValidConfigs(t *testing.T) {
 		{
 			name: "first-dram order",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "first-dram",
-				MinStep:        "128M",
-				MaxStep:        "1G",
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "first-dram",
+					MinStep:        "128M",
+					MaxStep:        "1G",
+				},
 			},
 		},
 		{
 			name: "first-cxl order",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "first-cxl",
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "first-cxl",
+				},
 			},
 		},
 		{
 			name: "start-interleaved order",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "start-interleaved",
-				MinStep:        "64M",
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "start-interleaved",
+					MinStep:        "64M",
+				},
 			},
 		},
 		{
 			name: "end-interleaved order",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "end-interleaved",
-				MaxStep:        "2G",
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "end-interleaved",
+					MaxStep:        "2G",
+				},
 			},
 		},
 		{
 			name: "waypoints order",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "waypoints",
-				MemoryUseWaypoints: []cgmpolmgr.MemoryUseWaypoint{
-					{
-						TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
-							{MemoryType: "DRAM", Usage: "4G"},
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "waypoints",
+					MemoryUseWaypoints: []cgmpolmgr.MemoryUseWaypoint{
+						{
+							TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
+								{MemoryType: "DRAM", Usage: "4G"},
+							},
+						},
+						{
+							TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
+								{MemoryType: "DRAM", Usage: "8G"},
+								{MemoryType: "CXL", Usage: "40G"},
+							},
 						},
 					},
-					{
-						TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
-							{MemoryType: "DRAM", Usage: "8G"},
-							{MemoryType: "CXL", Usage: "40G"},
-						},
-					},
+					MinStep: "128M",
+					MaxStep: "1G",
 				},
-				MinStep: "128M",
-				MaxStep: "1G",
 			},
 		},
 		{
 			name: "no limits specified",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "first-dram",
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "first-dram",
+				},
 			},
 		},
 	}
@@ -115,49 +127,59 @@ func TestValidate_InvalidConfigs(t *testing.T) {
 		{
 			name: "wrong apiVersion",
 			config: MemoryPolicyConfig{
-				APIVersion:     "wrong/v1",
-				Kind:           Kind,
-				MemoryUseOrder: "first-dram",
+				APIVersion: "wrong/v1",
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "first-dram",
+				},
 			},
 			errContains: "unsupported apiVersion",
 		},
 		{
 			name: "wrong kind",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           "WrongKind",
-				MemoryUseOrder: "first-dram",
+				APIVersion: APIVersion,
+				Kind:       "WrongKind",
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "first-dram",
+				},
 			},
 			errContains: "unsupported kind",
 		},
 		{
 			name: "invalid memoryUseOrder",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "invalid-order",
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "invalid-order",
+				},
 			},
 			errContains: "invalid memoryUseOrder",
 		},
 		{
 			name: "waypoints order without waypoints",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "waypoints",
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "waypoints",
+				},
 			},
 			errContains: "memoryUseWaypoints must be specified",
 		},
 		{
 			name: "non-waypoints order with waypoints",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "first-dram",
-				MemoryUseWaypoints: []cgmpolmgr.MemoryUseWaypoint{
-					{
-						TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
-							{MemoryType: "DRAM", Usage: "4G"},
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "first-dram",
+					MemoryUseWaypoints: []cgmpolmgr.MemoryUseWaypoint{
+						{
+							TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
+								{MemoryType: "DRAM", Usage: "4G"},
+							},
 						},
 					},
 				},
@@ -167,42 +189,50 @@ func TestValidate_InvalidConfigs(t *testing.T) {
 		{
 			name: "invalid minStep",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "first-dram",
-				MinStep:        "notasize",
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "first-dram",
+					MinStep:        "notasize",
+				},
 			},
 			errContains: "invalid minStep",
 		},
 		{
 			name: "invalid maxStep",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "first-dram",
-				MaxStep:        "notasize",
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "first-dram",
+					MaxStep:        "notasize",
+				},
 			},
 			errContains: "invalid maxStep",
 		},
 		{
 			name: "minStep exceeds maxStep",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "first-dram",
-				MinStep:        "2G",
-				MaxStep:        "128M",
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "first-dram",
+					MinStep:        "2G",
+					MaxStep:        "128M",
+				},
 			},
 			errContains: "minStep",
 		},
 		{
 			name: "waypoint with empty target usages",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "waypoints",
-				MemoryUseWaypoints: []cgmpolmgr.MemoryUseWaypoint{
-					{TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{}},
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "waypoints",
+					MemoryUseWaypoints: []cgmpolmgr.MemoryUseWaypoint{
+						{TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{}},
+					},
 				},
 			},
 			errContains: "no target usages",
@@ -210,13 +240,15 @@ func TestValidate_InvalidConfigs(t *testing.T) {
 		{
 			name: "waypoint with unknown memory type",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "waypoints",
-				MemoryUseWaypoints: []cgmpolmgr.MemoryUseWaypoint{
-					{
-						TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
-							{MemoryType: "HBM", Usage: "4G"},
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "waypoints",
+					MemoryUseWaypoints: []cgmpolmgr.MemoryUseWaypoint{
+						{
+							TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
+								{MemoryType: "HBM", Usage: "4G"},
+							},
 						},
 					},
 				},
@@ -226,23 +258,25 @@ func TestValidate_InvalidConfigs(t *testing.T) {
 		{
 			name: "waypoint with decreasing usage",
 			config: MemoryPolicyConfig{
-				APIVersion:     APIVersion,
-				Kind:           Kind,
-				MemoryUseOrder: "waypoints",
-				MemoryUseWaypoints: []cgmpolmgr.MemoryUseWaypoint{
-					{
-						TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
-							{MemoryType: "DRAM", Usage: "8G"},
+				APIVersion: APIVersion,
+				Kind:       Kind,
+				Policy: cgmpolmgr.Policy{
+					MemoryUseOrder: "waypoints",
+					MemoryUseWaypoints: []cgmpolmgr.MemoryUseWaypoint{
+						{
+							TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
+								{MemoryType: "DRAM", Usage: "8G"},
+							},
 						},
-					},
-					{
-						TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
-							{MemoryType: "DRAM", Usage: "4G"},
+						{
+							TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
+								{MemoryType: "DRAM", Usage: "4G"},
+							},
 						},
 					},
 				},
 			},
-			errContains: "non-decreasing",
+			errContains: "less than",
 		},
 	}
 
@@ -261,11 +295,13 @@ func TestValidate_InvalidConfigs(t *testing.T) {
 
 func TestJSONRoundTrip(t *testing.T) {
 	original := MemoryPolicyConfig{
-		APIVersion:     APIVersion,
-		Kind:           Kind,
-		MemoryUseOrder: "first-dram",
-		MinStep:        "128M",
-		MaxStep:        "1G",
+		APIVersion: APIVersion,
+		Kind:       Kind,
+		Policy: cgmpolmgr.Policy{
+			MemoryUseOrder: "first-dram",
+			MinStep:        "128M",
+			MaxStep:        "1G",
+		},
 	}
 
 	data, err := json.Marshal(original)
@@ -295,24 +331,26 @@ func TestJSONRoundTrip(t *testing.T) {
 
 func TestJSONRoundTripWithWaypoints(t *testing.T) {
 	original := MemoryPolicyConfig{
-		APIVersion:     APIVersion,
-		Kind:           Kind,
-		MemoryUseOrder: "waypoints",
-		MemoryUseWaypoints: []cgmpolmgr.MemoryUseWaypoint{
-			{
-				TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
-					{MemoryType: "DRAM", Usage: "4G"},
+		APIVersion: APIVersion,
+		Kind:       Kind,
+		Policy: cgmpolmgr.Policy{
+			MemoryUseOrder: "waypoints",
+			MemoryUseWaypoints: []cgmpolmgr.MemoryUseWaypoint{
+				{
+					TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
+						{MemoryType: "DRAM", Usage: "4G"},
+					},
+				},
+				{
+					TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
+						{MemoryType: "DRAM", Usage: "8G"},
+						{MemoryType: "CXL", Usage: "40G"},
+					},
 				},
 			},
-			{
-				TargetUsages: []cgmpolmgr.MemoryUseWaypointEntry{
-					{MemoryType: "DRAM", Usage: "8G"},
-					{MemoryType: "CXL", Usage: "40G"},
-				},
-			},
+			MinStep: "128M",
+			MaxStep: "1G",
 		},
-		MinStep: "128M",
-		MaxStep: "1G",
 	}
 
 	data, err := json.Marshal(original)

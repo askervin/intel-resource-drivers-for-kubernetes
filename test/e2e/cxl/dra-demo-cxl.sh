@@ -499,8 +499,8 @@ spec:
           apiVersion: cxl.generic/v1alpha1
           kind: MemoryPolicyConfig
           memoryUseOrder: \"first-dram\"
-          minStep: \"16M\"
-          maxStep: \"32M\"
+          minStep: \"16Mi\"
+          maxStep: \"32Mi\"
 EOF
 kubectl apply -n $NAMESPACE -f /root/dram-then-cxl-claim.yaml" \
          "kubectl get resourceclaim dram-then-cxl-claim -n $NAMESPACE -o yaml"
@@ -532,8 +532,8 @@ spec:
           apiVersion: cxl.generic/v1alpha1
           kind: MemoryPolicyConfig
           memoryUseOrder: \"start-interleaved\"
-          minStep: \"16M\"
-          maxStep: \"64M\"
+          minStep: \"16Mi\"
+          maxStep: \"64Mi\"
 EOF
 kubectl apply -n $NAMESPACE -f /root/cxl-dram-interleave-claim.yaml" \
          "kubectl get resourceclaim cxl-dram-interleave-claim -n $NAMESPACE -o yaml"
@@ -724,8 +724,8 @@ spec:
           apiVersion: cxl.generic/v1alpha1
           kind: MemoryPolicyConfig
           memoryUseOrder: \"first-dram\"
-          minStep: \"16M\"
-          maxStep: \"16M\"
+          minStep: \"16Mi\"
+          maxStep: \"16Mi\"
 EOF" \
          "kubectl get resourceclaim steer-dram-then-cxl-claim -n $NAMESPACE -o yaml"
 
@@ -821,7 +821,7 @@ chmod +x /root/cxl-numa-watch.sh'
 
     vmsh "kubectl logs memgrow-first-dram -n $NAMESPACE | tail -3"
 
-    vmsh "grep -E 'memgrow|nextStep returned|Updated cpuset.mems|NUMA memory distribution' /root/$CXL_DRIVER_NAME.output | tail -20"
+    vmsh "grep -E 'memgrow|: step: usage=|: start steering ' /root/$CXL_DRIVER_NAME.output | tail -20"
 
     # The steering worked if the container ended up with memory on
     # both the DRAM and the CXL nodes.
