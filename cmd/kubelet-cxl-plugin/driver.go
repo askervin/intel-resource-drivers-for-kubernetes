@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"path/filepath"
 	"time"
 
 	resourceapi "k8s.io/api/resource/v1"
@@ -31,12 +32,14 @@ import (
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/yaml"
+	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/helpers"
 	driverVersion "github.com/intel/intel-resource-drivers-for-kubernetes/pkg/version"
 
 	nricxl "github.com/containers/nri-plugins/pkg/cxl"
+	"github.com/containers/nri-plugins/pkg/cxl/memctl"
 )
 
 type driver struct {
@@ -47,6 +50,7 @@ type driver struct {
 	nriPlugin   *nriPlugin
 	udevWatcher *UdevEventWatcher
 	sysfsRoot   string
+	pool        *poolDriver // nil when the pool helper is disabled
 }
 
 // TestabilityConfig holds configuration for injecting fake CXL
@@ -204,7 +208,9 @@ func injectFakeDevices(tc *TestabilityConfig, devices *nricxl.Devices) {
 // fake devices if testability is configured, and builds the filtered
 // DevicesInfo map. This is the single place where device scanning
 // happens, used both at startup and on udev-triggered rescans.
-func scanDevices(sysfsRoot string, driverConfig *DriverConfig) (device.DevicesInfo, error) {
+// Regions on memdevs whose serial is in poolSerials belong to the pool
+// helper and are skipped.
+func scanDevices(sysfsRoot string, driverConfig *DriverConfig, poolSerials map[uint64]bool) (device.DevicesInfo, error) {
 	detectedDevices, err := nricxl.DevicesFromSysfs(sysfsRoot)
 	if err != nil {
 		return nil, fmt.Errorf("failed to detect devices: %v", err)
@@ -218,7 +224,7 @@ func scanDevices(sysfsRoot string, driverConfig *DriverConfig) (device.DevicesIn
 		klog.Info("No region devices detected")
 	}
 
-	devInfos, err := buildDevInfos(driverConfig, detectedDevices)
+	devInfos, err := buildDevInfos(driverConfig, detectedDevices, poolSerials)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build device infos: %v", err)
 	}
@@ -252,7 +258,15 @@ func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, err
 		cxlFlags.SysfsRoot = sysfsRoot[:len(sysfsRoot)-4]
 	}
 
-	devInfos, err := scanDevices(sysfsRoot, driverConfig)
+	// The pool helper's prepared claims are loaded before the first
+	// scan, so that its devices are never published as cxl.generic
+	// devices (D29). Its kubelet plugin is started after cxl.generic.
+	pool, err := newPoolHelper(config, cxlFlags, sysfsRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	devInfos, err := scanDevices(sysfsRoot, driverConfig, pool.Serials())
 	if err != nil {
 		return nil, err
 	}
@@ -290,6 +304,12 @@ PluginDataDirectoryPath: %v`,
 	}
 
 	driver.helper = helper
+
+	if err := startPoolHelper(ctx, config, pool); err != nil {
+		helper.Stop()
+		return nil, err
+	}
+	driver.pool = pool
 
 	if err := driver.PublishResourceSlice(ctx); err != nil {
 		return nil, fmt.Errorf("startup error: %v", err)
@@ -336,6 +356,42 @@ PluginDataDirectoryPath: %v`,
 
 	klog.V(3).Info("Finished creating new driver")
 	return driver, nil
+}
+
+// newPoolHelper returns the pool helper with its prepared claims loaded,
+// or nil if it is disabled (empty --pool-driver-name).
+func newPoolHelper(config *helpers.Config, cxlFlags *CXLFlags, sysfsRoot string) (*poolDriver, error) {
+	if cxlFlags.PoolDriverName == "" {
+		return nil, nil
+	}
+	poolDataDir := filepath.Join(filepath.Dir(config.CommonFlags.KubeletPluginDir), cxlFlags.PoolDriverName)
+	if err := os.MkdirAll(poolDataDir, 0750); err != nil {
+		return nil, fmt.Errorf("pool helper data directory: %w", err)
+	}
+	mem := memctl.New()
+	mem.SysRoot = sysfsRoot + "/sys"
+	mem.Logf = func(format string, args ...any) { klog.Infof("memctl: "+format, args...) }
+	pool, err := newPoolDriver(cxlFlags.PoolDriverName, mem, filepath.Join(poolDataDir, poolStateFileName), cxlFlags.PoolPrepareTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("pool helper: %w", err)
+	}
+	return pool, nil
+}
+
+// startPoolHelper registers the pool helper as a second kubelet plugin
+// (nothing if pool is nil). newNodeState removed all old generic/cxl CDI
+// specs, so the pool helper writes its own again first.
+func startPoolHelper(ctx context.Context, config *helpers.Config, pool *poolDriver) error {
+	if pool == nil {
+		return nil
+	}
+	return pool.start(ctx, cdiapi.GetDefaultCache(),
+		kubeletplugin.KubeClient(config.Coreclient),
+		kubeletplugin.NodeName(config.CommonFlags.NodeName),
+		kubeletplugin.DriverName(pool.name),
+		kubeletplugin.RegistrarDirectoryPath(config.CommonFlags.KubeletPluginsRegistryDir),
+		kubeletplugin.PluginDataDirectoryPath(filepath.Dir(pool.stateFile)),
+	)
 }
 
 func (d *driver) PrepareResourceClaims(ctx context.Context, claims []*resourceapi.ResourceClaim) (map[types.UID]kubeletplugin.PrepareResult, error) {
@@ -411,7 +467,7 @@ func (d *driver) udevRescanLoop(ctx context.Context) {
 func (d *driver) rescanAndPublish(ctx context.Context) {
 	klog.Infof("rescanAndPublish: udev event triggered rescan")
 
-	newDevInfos, err := scanDevices(d.sysfsRoot, d.config)
+	newDevInfos, err := scanDevices(d.sysfsRoot, d.config, d.pool.Serials())
 	if err != nil {
 		klog.Errorf("rescanAndPublish: %v", err)
 		return
@@ -438,6 +494,7 @@ func (d *driver) Shutdown(ctx context.Context) error {
 	if d.nriPlugin != nil {
 		d.nriPlugin.Stop()
 	}
+	d.pool.stop()
 	d.helper.Stop()
 
 	return nil

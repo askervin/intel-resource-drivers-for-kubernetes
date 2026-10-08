@@ -22,4 +22,5 @@ the node's allocatable memory.
 
 - [How to setup a Kubernetes cluster with DRA enabled](../CLUSTER_SETUP.md)
 - [How to deploy and use Intel CXL resource driver](USAGE.md)
+- [CXL memory pools: the cxl-pool.generic driver and the pool controller contract](POOL.md)
 - Optional: [How to build Intel CXL resource driver container image](BUILD.md)

@@ -154,12 +154,14 @@ func newNodeState(devInfo device.DevicesInfo, cdiRoot, preparedClaimsFilePath, n
 	return &state, nil
 }
 
-func buildDevInfos(driverConfig *DriverConfig, detectedDevices *nricxl.Devices) (device.DevicesInfo, error) {
+// buildDevInfos returns the devices to publish. Regions on memdevs whose
+// serial is in poolSerials are skipped: the pool helper prepared them (D29).
+func buildDevInfos(driverConfig *DriverConfig, detectedDevices *nricxl.Devices, poolSerials map[uint64]bool) (device.DevicesInfo, error) {
 	cxlNodes := make(map[int]bool)
 	devInfos := make(map[string]*device.DeviceInfo)
 	for _, regDev := range detectedDevices.RegionDevices {
 		klog.V(3).Infof("discovered CXL region device: %+v", regDev)
-		ignoreReason := ""
+		ignoreReason := poolIgnoreReason(regDev, poolSerials)
 		if !regDev.Enabled {
 			ignoreReason = "region is disabled"
 		}
@@ -256,6 +258,17 @@ func buildDevInfos(driverConfig *DriverConfig, detectedDevices *nricxl.Devices) 
 		}
 	}
 	return devInfos, nil
+}
+
+// poolIgnoreReason returns why a region on a pool device is not published,
+// "" if it is not on a pool device.
+func poolIgnoreReason(regDev *nricxl.RegionDevice, poolSerials map[uint64]bool) string {
+	for _, memDev := range regDev.Memories {
+		if poolSerials[memDev.Serial] {
+			return fmt.Sprintf("pool device (%s), memory device serial 0x%x", device.PoolDriverName, memDev.Serial)
+		}
+	}
+	return ""
 }
 
 func (s *nodeState) GetResources() resourceslice.DriverResources {

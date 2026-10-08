@@ -41,6 +41,17 @@ const (
 	DeviceTypeCXLNode = "cxl-node"
 	// DeviceTypeDRAM is the device type for system DRAM devices.
 	DeviceTypeDRAM = "dram"
+	// DeviceTypeCXLPool is the device type for CXL memory devices
+	// attached from a memory pool (driver PoolDriverName).
+	DeviceTypeCXLPool = "cxl-pool"
+
+	// PoolDriverName is the default DRA driver name of the pool
+	// helper, which prepares CXL memory devices hotplugged from a
+	// memory pool. See doc/cxl/POOL.md.
+	PoolDriverName = "cxl-pool.generic"
+	// PoolCDISpecName is the name of the CDI spec file of the
+	// prepared pool devices.
+	PoolCDISpecName = "cxl-pool"
 
 	// CapacityMemory is the capacity key used in ResourceSlice device
 	// capacity and in ConsumedCapacity. Matches v1.ResourceMemory.

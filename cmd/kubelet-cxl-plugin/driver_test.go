@@ -331,7 +331,7 @@ func TestBuildDevInfos_WithFakeDevices(t *testing.T) {
 	}
 
 	driverConfig := &DriverConfig{IgnoreDRAMNodes: true}
-	devInfos, err := buildDevInfos(driverConfig, devices)
+	devInfos, err := buildDevInfos(driverConfig, devices, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

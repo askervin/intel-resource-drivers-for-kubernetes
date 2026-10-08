@@ -19,6 +19,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/urfave/cli/v2"
 
@@ -33,6 +34,13 @@ type CXLFlags struct {
 	NRIName    string
 	NRIIdx     string
 	NRISocket  string
+
+	// PoolDriverName is the DRA driver name of the pool helper,
+	// empty disables it.
+	PoolDriverName string
+	// PoolPrepareTimeout is how long the pool helper waits for a
+	// memdev to appear.
+	PoolPrepareTimeout time.Duration
 }
 
 func main() {
@@ -41,6 +49,9 @@ func main() {
 		ConfigStr: cxl.DefaultConfigStr,
 		NRIName:   "kubelet-cxl-plugin",
 		NRIIdx:    "30",
+
+		PoolDriverName:     cxl.PoolDriverName,
+		PoolPrepareTimeout: defaultPoolPrepareTimeout,
 	}
 	cliFlags := []cli.Flag{
 		&cli.StringFlag{
@@ -85,6 +96,20 @@ func main() {
 			Value:       cxlFlags.NRISocket,
 			Destination: &cxlFlags.NRISocket,
 			EnvVars:     []string{"NRI_SOCKET"},
+		},
+		&cli.StringFlag{
+			Name:        "pool-driver-name",
+			Usage:       "DRA driver name of the CXL memory pool helper (empty disables it)",
+			Value:       cxlFlags.PoolDriverName,
+			Destination: &cxlFlags.PoolDriverName,
+			EnvVars:     []string{"POOL_DRIVER_NAME"},
+		},
+		&cli.DurationFlag{
+			Name:        "pool-prepare-timeout",
+			Usage:       "how long the pool helper waits for a hotplugged CXL memory device to appear",
+			Value:       cxlFlags.PoolPrepareTimeout,
+			Destination: &cxlFlags.PoolPrepareTimeout,
+			EnvVars:     []string{"POOL_PREPARE_TIMEOUT"},
 		},
 	}
 

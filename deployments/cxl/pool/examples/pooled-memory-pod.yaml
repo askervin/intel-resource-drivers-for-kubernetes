@@ -1,0 +1,40 @@
+# A pod that gets 512Mi of exclusive CXL memory from a memory pool. The
+# pool controller attaches a pool device to the node that the scheduler
+# picked, kubelet-cxl-plugin onlines it as a new NUMA node and tells the
+# container which one in CXL_POOL_NODE_<SERIAL>. The container prints its
+# CXL_POOL_* environment and the MemTotal of every NUMA node.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: pooled-memory
+spec:
+  devices:
+    requests:
+    - name: mem
+      exactly:
+        deviceClassName: cxl-pool-memory
+        capacity:
+          requests:
+            memory: 512Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pooled-consumer
+spec:
+  containers:
+  - name: consumer
+    image: registry.k8s.io/e2e-test-images/busybox:1.29-2
+    command:
+    - sh
+    - -c
+    - |
+      env | grep ^CXL_POOL_ | sort
+      grep -H MemTotal /sys/devices/system/node/node*/meminfo
+      sleep infinity
+    resources:
+      claims:
+      - name: mem
+  resourceClaims:
+  - name: mem
+    resourceClaimName: pooled-memory
