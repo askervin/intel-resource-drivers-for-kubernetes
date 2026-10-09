@@ -51,6 +51,7 @@ type driver struct {
 	udevWatcher *UdevEventWatcher
 	sysfsRoot   string
 	pool        *poolDriver // nil when the pool helper is disabled
+	broker      *broker     // nil when lending is disabled
 }
 
 // TestabilityConfig holds configuration for injecting fake CXL
@@ -104,6 +105,10 @@ type DriverConfig struct {
 	// Testability enables injection of fake CXL devices for
 	// testing without real hardware.
 	Testability *TestabilityConfig `json:"testability,omitempty"`
+
+	// PublishDynamicToken publishes the token device "dynamic" (set
+	// from --pool-lend, not part of the configuration file).
+	PublishDynamicToken bool `json:"-"`
 }
 
 func getCXLFlags(someFlags any) (*CXLFlags, error) {
@@ -266,6 +271,9 @@ func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, err
 		return nil, err
 	}
 
+	// The token device and the lease broker need the pool helper.
+	driverConfig.PublishDynamicToken = cxlFlags.PoolLend && pool != nil
+
 	devInfos, err := scanDevices(sysfsRoot, driverConfig, pool.Serials())
 	if err != nil {
 		return nil, err
@@ -282,6 +290,26 @@ func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, err
 		client:    config.Coreclient,
 		config:    driverConfig,
 		sysfsRoot: sysfsRoot,
+	}
+
+	// The lease broker re-creates the sockets of prepared token claims
+	// before kubelet can call Prepare or Unprepare.
+	if driverConfig.PublishDynamicToken {
+		b, err := newBroker(brokerConfig{
+			Client:      config.Coreclient,
+			NodeName:    config.CommonFlags.NodeName,
+			DataDir:     config.CommonFlags.KubeletPluginDir,
+			CDI:         cdiapi.GetDefaultCache(),
+			RequestBin:  cxlFlags.CXLRequestBin,
+			Image:       cxlFlags.CompanionImage,
+			WaitDefault: cxlFlags.LeaseWaitDefault,
+			PoolDriver:  pool.name,
+		})
+		if err != nil {
+			return nil, err
+		}
+		driver.broker = b
+		driver.state.dynamic = b
 	}
 
 	klog.Infof(`Starting DRA resource-driver kubelet-plugin
@@ -326,6 +354,16 @@ PluginDataDirectoryPath: %v`,
 		klog.Warningf("Failed to start NRI plugin (continuing without it): %v", err)
 	} else {
 		driver.nriPlugin = nri
+	}
+	if driver.broker != nil {
+		// A nil lender (NRI not connected) makes lease requests and
+		// companion claims fail with errLendingUnavailable.
+		var lender Lender
+		if driver.nriPlugin != nil {
+			lender = driver.nriPlugin
+		}
+		pool.setLending(lender, driver.broker)
+		driver.broker.start(lender)
 	}
 
 	// Start udev event watcher for NUMA node hotplug detection.
@@ -429,6 +467,15 @@ func (d *driver) UnprepareResourceClaims(ctx context.Context, claims []kubeletpl
 
 	for _, claim := range claims {
 
+		// Leases of a token claim are released first (bounded; an
+		// error makes kubelet retry).
+		if d.broker != nil {
+			if err := d.broker.CloseClaim(ctx, string(claim.UID)); err != nil {
+				response[claim.UID] = err
+				continue
+			}
+		}
+
 		if err := d.state.Unprepare(ctx, string(claim.UID)); err != nil {
 			response[claim.UID] = fmt.Errorf("error freeing devices: %v", err)
 			continue
@@ -491,6 +538,7 @@ func (d *driver) Shutdown(ctx context.Context) error {
 	if d.udevWatcher != nil {
 		d.udevWatcher.Stop()
 	}
+	d.broker.stop()
 	if d.nriPlugin != nil {
 		d.nriPlugin.Stop()
 	}

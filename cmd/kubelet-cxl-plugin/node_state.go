@@ -90,6 +90,9 @@ type nodeState struct {
 	// podClaims maps pod UID → set of claim UIDs prepared for that pod.
 	// Built during Prepare from claim.Status.ReservedFor.
 	podClaims map[string]map[string]bool
+	// dynamic opens the lease socket of claims on the token device,
+	// nil when lending is disabled.
+	dynamic tokenClaims
 }
 
 func newNodeState(devInfo device.DevicesInfo, cdiRoot, preparedClaimsFilePath, nodeName string, driverConfig *DriverConfig) (*nodeState, error) {
@@ -257,6 +260,12 @@ func buildDevInfos(driverConfig *DriverConfig, detectedDevices *nricxl.Devices, 
 			klog.V(3).Infof("discovered system DRAM device: %+v", dramDev)
 		}
 	}
+	if driverConfig.PublishDynamicToken {
+		devInfos[device.DynamicDeviceName] = &device.DeviceInfo{
+			Name: device.DynamicDeviceName,
+			Dev:  &device.DynamicToken{},
+		}
+	}
 	return devInfos, nil
 }
 
@@ -342,6 +351,17 @@ func (s *nodeState) GetResources() resourceslice.DriverResources {
 				AllowMultipleAllocations: ptr(true),
 			}
 			devices = append(devices, newDevice)
+		case *device.DynamicToken:
+			// The token: no capacity, no node allocatable resources,
+			// any number of claims can allocate it.
+			devices = append(devices, resourcev1.Device{
+				Name: cxlUID,
+				Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+					"type": {StringValue: ptr(device.DeviceTypeDynamic)},
+					"name": {StringValue: ptr(device.DynamicDeviceName)},
+				},
+				AllowMultipleAllocations: ptr(true),
+			})
 		default:
 			klog.Warningf("unexpected device type in state.Allocatable: %T", dev)
 		}
@@ -480,6 +500,7 @@ func (s *nodeState) prepareAllocatedDevices(ctx context.Context, claim *resource
 		return allocatedDevices, nil, fmt.Errorf("internal error: unexpected type for state.Allocatable %T", s.Allocatable)
 	}
 
+	hasToken := false
 	for _, allocatedDevice := range claim.Status.Allocation.Devices.Results {
 		// ATM the only pool is cluster node's pool: all devices on current node.
 		if allocatedDevice.Driver != device.DriverName || allocatedDevice.Pool != s.NodeName {
@@ -522,6 +543,11 @@ func (s *nodeState) prepareAllocatedDevices(ctx context.Context, claim *resource
 			devInfo.DeviceType = device.DeviceTypeDRAM
 			devInfo.NUMANodes = dev.Nodes
 			devInfo.TotalBytes = dev.Size
+		case *device.DynamicToken:
+			devInfo.DeviceType = device.DeviceTypeDynamic
+			hasToken = true
+			last := &allocatedDevices.Devices[len(allocatedDevices.Devices)-1]
+			last.CDIDeviceIDs = append(last.CDIDeviceIDs, leaseCDIDeviceID(string(claim.UID)))
 		default:
 			klog.Warningf("unknown device type %T for %v", allocatableDevice.Dev, allocatedDevice.Device)
 		}
@@ -543,6 +569,16 @@ func (s *nodeState) prepareAllocatedDevices(ctx context.Context, claim *resource
 	// these env vars to identify which claims belong to a container.
 	if err := s.addCDIClaimMarker(string(claim.UID)); err != nil {
 		return allocatedDevices, nil, fmt.Errorf("failed to create CDI claim marker for %v: %w", claim.UID, err)
+	}
+
+	// A claim on the token device gets its lease socket.
+	if hasToken {
+		if s.dynamic == nil {
+			return allocatedDevices, nil, fmt.Errorf("claim %v/%v: lending to running containers is disabled (--pool-lend=false or no pool helper)", claim.Namespace, claim.Name)
+		}
+		if err := s.dynamic.OpenClaim(claim); err != nil {
+			return allocatedDevices, nil, fmt.Errorf("claim %v/%v: lease socket: %w", claim.Namespace, claim.Name, err)
+		}
 	}
 
 	// Parse opaque device configuration for memory policy.

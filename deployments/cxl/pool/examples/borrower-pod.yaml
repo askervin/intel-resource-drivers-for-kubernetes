@@ -1,0 +1,47 @@
+# A pod that may borrow CXL pool memory later, while it runs. It claims the
+# token device (DeviceClass cxl-dynamic, device-class-dynamic.yaml) through
+# a template, so the claim follows the pod. Only containers that list the
+# claim get the lease socket and the CLI; here "app" does and "idle" does
+# not (its cpuset.mems is never touched by a lease of "app").
+#
+#   kubectl exec borrower -c app -- cxl-request memory 512Mi
+#     -> {"lease":"1a2b3c4d","state":"Ready","kind":"memory","node":2,...}
+#        numactl --membind/--preferred=2, or mbind(), uses the lent node
+#   kubectl exec borrower -c app -- cxl-request shared 0xc1ae0001 \
+#       --exec python3 -c 'import mmap,os; e=os.environ; m=mmap.mmap(int(e["CXL_LEASE_FD"]), int(e["CXL_LEASE_SIZE"])); print(m[:16])'
+#     (the dax fd is fd 3; devdax mappings must be MAP_SHARED and aligned)
+#   kubectl exec borrower -c app -- cxl-request list
+#   kubectl exec borrower -c app -- cxl-release 1a2b3c4d     # or --all
+#
+# Lent memory counts against the container's memory limit; this example
+# sets none.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: cxl-dynamic
+spec:
+  spec:
+    devices:
+      requests:
+      - name: dyn
+        exactly:
+          deviceClassName: cxl-dynamic
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: borrower
+spec:
+  resourceClaims:
+  - name: dyn
+    resourceClaimTemplateName: cxl-dynamic
+  containers:
+  - name: app
+    image: docker.io/library/python:3-alpine
+    command: ["sleep", "infinity"]
+    resources:
+      claims:
+      - name: dyn
+  - name: idle
+    image: docker.io/library/python:3-alpine
+    command: ["sleep", "infinity"]

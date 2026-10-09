@@ -53,6 +53,21 @@ const (
 	// prepared pool devices.
 	PoolCDISpecName = "cxl-pool"
 
+	// DeviceTypeDynamic is the device type of the token device
+	// "dynamic" in the cxl.generic slice. A claim on it gives the
+	// containers that reference it a lease socket through which they
+	// can borrow pool memory while running. See doc/cxl/POOL.md.
+	DeviceTypeDynamic = "dynamic"
+	// DynamicDeviceName is the name of the token device.
+	DynamicDeviceName = "dynamic"
+	// LeaseCDISpecName is the name of the CDI spec file of the lease
+	// devices (socket directory and CLI mounts of token claims).
+	LeaseCDISpecName = "cxl-leases"
+	// LendConfigKind is the kind of the opaque pool claim configuration
+	// that names the lease and the borrowing container of a companion
+	// claim (apiVersion <pool driver name>/v1alpha1).
+	LendConfigKind = "LendConfig"
+
 	// CapacityMemory is the capacity key used in ResourceSlice device
 	// capacity and in ConsumedCapacity. Matches v1.ResourceMemory.
 	CapacityMemory resourcev1.QualifiedName = "memory"
@@ -85,6 +100,10 @@ type SystemDRAM struct {
 	Nodes []int
 	Size  uint64
 }
+
+// DynamicToken is the Dev of the token device: it has no hardware, no
+// capacity and can be allocated any number of times.
+type DynamicToken struct{}
 
 func (g *DeviceInfo) CDIName() string {
 	return fmt.Sprintf("%s=%s", CDIKind, g.UID)

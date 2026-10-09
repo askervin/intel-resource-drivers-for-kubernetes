@@ -53,13 +53,22 @@ type pendingSteering struct {
 }
 
 // nriPlugin implements the NRI container lifecycle hooks that start
-// and stop memory steering of containers with CXL claims.
+// and stop memory steering of containers with CXL claims, and keeps
+// the table of containers that the lend primitives (lend.go) use.
 type nriPlugin struct {
-	stub     stub.Stub
+	stub     nriStub
 	state    *nodeState
 	pending  map[string]pendingSteering    // key: containerID
 	managers map[string]*cgmpolmgr.Manager // key: containerID
-	mu       sync.Mutex                    // protects pending and managers
+	mu       sync.Mutex                    // protects all fields below too
+
+	ctrs       map[string]*trackedContainer // key: containerID
+	seq        uint64                       // creation counter of ctrs
+	syncedC    chan struct{}                // closed at first Synchronize
+	goneFns    []func(ref containerRef)
+	startedFns []func(ref containerRef)
+
+	lendMu sync.Mutex // serializes LendNode and RevokeNode
 }
 
 // klogLogger writes cgmpolmgr log messages with klog.
@@ -79,6 +88,7 @@ func startNRIPlugin(ctx context.Context, state *nodeState, opts NRIOpts) (*nriPl
 		pending:  make(map[string]pendingSteering),
 		managers: make(map[string]*cgmpolmgr.Manager),
 	}
+	p.initLendState()
 
 	stubOpts := []stub.Option{
 		stub.WithOnClose(p.onClose),
@@ -93,11 +103,11 @@ func startNRIPlugin(ctx context.Context, state *nodeState, opts NRIOpts) (*nriPl
 		stubOpts = append(stubOpts, stub.WithSocketPath(opts.Socket))
 	}
 
-	var err error
-	p.stub, err = stub.New(p, stubOpts...)
+	s, err := stub.New(p, stubOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create NRI plugin stub: %w", err)
 	}
+	p.stub = s
 
 	if err := p.stub.Start(ctx); err != nil {
 		return nil, fmt.Errorf("failed to start NRI plugin: %w", err)
@@ -141,6 +151,10 @@ func (p *nriPlugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr 
 
 	klog.V(3).Infof("NRI CreateContainer: ctr=%s id=%s", ctrName, ctrID)
 
+	p.mu.Lock()
+	p.trackCreated(pod, ctr)
+	p.mu.Unlock()
+
 	// Scan container env vars for CDI-injected claim markers.
 	claimUIDs := extractClaimUIDs(ctr.GetEnv())
 	if len(claimUIDs) == 0 {
@@ -171,6 +185,9 @@ func (p *nriPlugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr 
 
 	p.mu.Lock()
 	p.pending[ctrID] = pendingSteering{name: ctrName, plan: plan}
+	if tc, ok := p.ctrs[ctrID]; ok {
+		tc.steered = true
+	}
 	p.mu.Unlock()
 
 	klog.V(5).Infof("NRI CreateContainer: ctr=%s: prepared memory steering (order=%s, dramNodes=%v, cxlNodes=%v, %s)",
@@ -185,6 +202,8 @@ func (p *nriPlugin) CreateContainer(_ context.Context, pod *api.PodSandbox, ctr 
 func (p *nriPlugin) RemoveContainer(_ context.Context, pod *api.PodSandbox, ctr *api.Container) error {
 	ctrName := pod.GetNamespace() + "/" + pod.GetName() + "/" + ctr.GetName()
 	ctrID := ctr.GetId()
+
+	p.containerGone(ctrID)
 
 	claimUIDs := extractClaimUIDs(ctr.GetEnv())
 	if len(claimUIDs) == 0 {
@@ -213,6 +232,11 @@ func (p *nriPlugin) StartContainer(_ context.Context, pod *api.PodSandbox, ctr *
 	if hasPending {
 		delete(p.pending, ctrID)
 	}
+	tc := p.trackStarted(pod, ctr)
+	tc.steered = tc.steered || hasPending
+	klog.V(4).Infof("NRI StartContainer: ctr=%s id=%s pid=%d cgroup=%s baseMems=%s",
+		ctrName, ctrID, tc.ref.Pid, tc.ref.CgroupPath, tc.base)
+	p.fireStarted(tc)
 	p.mu.Unlock()
 
 	if !hasPending {
@@ -261,6 +285,7 @@ func (p *nriPlugin) StopContainer(_ context.Context, pod *api.PodSandbox, ctr *a
 	ctrID := ctr.GetId()
 	klog.V(3).Infof("NRI StopContainer: ctr=%s", ctrName)
 
+	p.containerGone(ctrID)
 	p.stopContainerManagers(ctrID, ctrName)
 
 	return nil, nil
@@ -376,7 +401,7 @@ func resolveContainerCgroupDir(ctr *api.Container) (string, error) {
 
 	// Read /proc/<pid>/cgroup. For cgroup v2, there's a single
 	// line of the form "0::<path>".
-	procCgroupPath := fmt.Sprintf("/proc/%d/cgroup", pid)
+	procCgroupPath := filepath.Join(procDir, fmt.Sprint(pid), "cgroup")
 	data, err := os.ReadFile(procCgroupPath)
 	if err != nil {
 		return "", fmt.Errorf("failed to read %s: %w", procCgroupPath, err)
@@ -387,7 +412,7 @@ func resolveContainerCgroupDir(ctr *api.Container) (string, error) {
 		parts := strings.SplitN(line, ":", 3)
 		if len(parts) == 3 && parts[0] == "0" && parts[1] == "" {
 			cgroupRelPath := parts[2]
-			absPath := filepath.Join(cgroupV2MountPoint, cgroupRelPath)
+			absPath := filepath.Join(cgroupRoot, cgroupRelPath)
 			klog.V(5).Infof("resolveContainerCgroupDir: pid=%d /proc cgroup line=%q -> absPath=%s",
 				pid, line, absPath)
 			return absPath, nil

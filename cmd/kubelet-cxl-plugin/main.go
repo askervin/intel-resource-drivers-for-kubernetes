@@ -41,6 +41,18 @@ type CXLFlags struct {
 	// PoolPrepareTimeout is how long the pool helper waits for a
 	// memdev to appear.
 	PoolPrepareTimeout time.Duration
+
+	// PoolLend enables lending pool memory to running containers: the
+	// token device "dynamic", lease sockets and companion pods.
+	PoolLend bool
+	// CXLRequestBin is the host path of the static cxl-request CLI
+	// that is bind-mounted into containers with a token claim.
+	CXLRequestBin string
+	// LeaseWaitDefault is how long a lease request waits for Ready
+	// when the request does not say.
+	LeaseWaitDefault time.Duration
+	// CompanionImage is the image of the companion pods.
+	CompanionImage string
 }
 
 func main() {
@@ -52,6 +64,11 @@ func main() {
 
 		PoolDriverName:     cxl.PoolDriverName,
 		PoolPrepareTimeout: defaultPoolPrepareTimeout,
+
+		PoolLend:         true,
+		CXLRequestBin:    defaultCXLRequestBin,
+		LeaseWaitDefault: defaultLeaseWait,
+		CompanionImage:   defaultCompanionImage,
 	}
 	cliFlags := []cli.Flag{
 		&cli.StringFlag{
@@ -110,6 +127,34 @@ func main() {
 			Value:       cxlFlags.PoolPrepareTimeout,
 			Destination: &cxlFlags.PoolPrepareTimeout,
 			EnvVars:     []string{"POOL_PREPARE_TIMEOUT"},
+		},
+		&cli.BoolFlag{
+			Name:        "pool-lend",
+			Usage:       "lend pool memory to running containers that claim the token device \"dynamic\" (needs the pool helper and NRI)",
+			Value:       cxlFlags.PoolLend,
+			Destination: &cxlFlags.PoolLend,
+			EnvVars:     []string{"POOL_LEND"},
+		},
+		&cli.StringFlag{
+			Name:        "cxl-request-bin",
+			Usage:       "host path of the static cxl-request CLI, bind-mounted into containers with a token claim",
+			Value:       cxlFlags.CXLRequestBin,
+			Destination: &cxlFlags.CXLRequestBin,
+			EnvVars:     []string{"CXL_REQUEST_BIN"},
+		},
+		&cli.DurationFlag{
+			Name:        "lease-wait-default",
+			Usage:       "how long a lease request waits for the lease to become Ready when the request does not say",
+			Value:       cxlFlags.LeaseWaitDefault,
+			Destination: &cxlFlags.LeaseWaitDefault,
+			EnvVars:     []string{"LEASE_WAIT_DEFAULT"},
+		},
+		&cli.StringFlag{
+			Name:        "companion-image",
+			Usage:       "container image of the companion pods that hold leased pool devices",
+			Value:       cxlFlags.CompanionImage,
+			Destination: &cxlFlags.CompanionImage,
+			EnvVars:     []string{"COMPANION_IMAGE"},
 		},
 	}
 

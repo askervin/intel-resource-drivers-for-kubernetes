@@ -309,3 +309,219 @@ the pool driver prepared, so pool memory is not offered twice.
   claims and the pool, and re-confirms existing ones.
 - Node plugin restart: the prepared claims file restores the prepared
   devices; regions are found again by serial.
+
+## Lending to running containers
+
+CAUTION: prototype. A pod's claims are fixed when it is created, so a
+running container cannot get a pool device through its own claims. It
+can *borrow* one instead: the node plugin allocates the device for a
+*companion pod* and lends it to the container.
+
+### Opting in
+
+kubelet-cxl-plugin (`--pool-lend`, on by default when the pool driver is
+enabled) publishes a token device `dynamic` in the node's `cxl.generic`
+ResourceSlice: attributes `type: dynamic`, `name: dynamic`, no capacity,
+`allowMultipleAllocations: true`, so any number of pods can claim it.
+Install the DeviceClass
+[`deployments/cxl/pool/device-class-dynamic.yaml`](../../deployments/cxl/pool/device-class-dynamic.yaml)
+(`cxl-dynamic`) and claim it from the pod, see
+[`examples/borrower-pod.yaml`](../../deployments/cxl/pool/examples/borrower-pod.yaml).
+A DeviceClass that selects every `cxl.generic` device would match the
+token too; such classes should add
+`device.attributes["cxl.generic"].type != "dynamic"`.
+
+NodePrepare of a claim on the token creates
+`<plugin data dir>/leases/<claim uid>/cxl.sock` (mode 0666; the directory
+0755, labelled `container_file_t` when SELinux is enabled) and returns,
+besides the usual `CXL_CLAIM_<uid>` marker, the CDI device
+`generic/cxl=lease-<claim uid>` (spec file `cxl-leases`):
+
+- bind mount (rbind, rw) of the directory at `/run/cxl`,
+- bind mounts (ro) of the static CLI (`--cxl-request-bin`, default
+  `/usr/local/bin/cxl-request` on the host) at
+  `/usr/local/bin/cxl-request` and `/usr/local/bin/cxl-release`; they are
+  left out, with a warning, if the file does not exist,
+- env `CXL_LEASE_SOCKET=/run/cxl/cxl.sock`.
+
+Only containers that list the claim in `resources.claims` get them. The
+directory, not the socket, is mounted, so a restarted plugin can create a
+new socket in it that the running containers see.
+
+### Flow
+
+```
+container: cxl-request memory 512Mi
+  -> plugin: authenticate the caller, store lease L (Creating)
+  -> create ResourceClaim cxl-lease-L, then Pod cxl-lease-L   (Pending)
+  -> scheduler allocates a pool device, the pool controller attaches it,
+     binding conditions release the bind
+  -> kubelet prepares cxl-lease-L (pool driver): region, online movable,
+     NUMA node N; LendConfig names lease L and the container   (Lending)
+  -> NRI UpdateContainers: cpuset.mems of THAT container = its own nodes + N
+  -> response {"lease":"L","state":"Ready","node":N,...}        (Ready)
+container: cxl-release L
+  -> revoke (cpuset.mems shrinks, the kernel migrates the pages back)
+  -> delete Pod and ResourceClaim cxl-lease-L                  (Releasing)
+  -> kubelet unprepares (offline, destroy region, disable memdev),
+     the claim is deallocated and deleted, the controller detaches
+  -> lease dropped                                              (Released)
+```
+
+A shared device is the same, with class `cxl-shared-memory` and a serial
+selector, but nothing is lent through cgroups: the plugin opens
+`/dev/daxX.Y` (O_RDWR) and passes the open file descriptor to the
+container over the socket (SCM_RIGHTS). The container needs no device
+node and no device cgroup rule; the device cgroup is checked only at
+open(). `cxl-request shared <serial> --exec CMD` runs CMD with the fd as
+fd 3.
+
+The companion objects live in the requester's namespace:
+
+- ResourceClaim `cxl-lease-<id>`: one request `lease`
+  (`exactly: {deviceClassName: cxl-pool-memory, capacity.requests.memory: <size>}`
+  or `{deviceClassName: cxl-shared-memory, selectors: [serial == ...]}`),
+  opaque config for `cxl-pool.generic`:
+  `{apiVersion: cxl-pool.generic/v1alpha1, kind: LendConfig, lease, pod: {namespace, name, uid}, container}`,
+  ownerReference to the requester pod (controller: true).
+- Pod `cxl-lease-<id>`: ownerReference to the requester pod, required
+  node affinity `metadata.name In [<node>]`, `tolerations: [{operator: Exists}]`,
+  restartPolicy Always, one container `pause` (`--companion-image`,
+  default `registry.k8s.io/pause:3.10`) with requests = limits
+  cpu 100m, memory 8Mi (Guaranteed; 1m made the pause container take ~12 s to start), no `resources.claims`, and
+  `spec.resourceClaims: [{name: lease, resourceClaimName: cxl-lease-<id>}]`.
+  kubelet prepares a pod's claims even if no container references them.
+- Both carry the labels `cxl-pool.generic/lease=<id>`,
+  `cxl-pool.generic/requester-uid=<pod uid>`, `cxl-pool.generic/node=<node>`
+  and the annotation `cxl-pool.generic/requester=<ns>/<pod>/<container>`.
+
+The pool driver accepts a LendConfig only from the claim (not from a
+class), only for the claim's namespace, and only if the lease exists in
+the node plugin's lease table for the same pod and container, so a
+tenant cannot lend to another container by writing a LendConfig.
+
+### Protocol
+
+`SOCK_STREAM` unix socket, one JSON object per line in each direction;
+a connection may carry several requests.
+
+| request | meaning |
+|---|---|
+| `{"op":"lease","kind":"memory","size":"512Mi","wait":"120s","requestId":"r1"}` | exclusive memory, lent as a NUMA node |
+| `{"op":"lease","kind":"shared","serial":"0xc1ae0001","wait":"120s"}` | shared device, fd passed |
+| `{"op":"release","lease":"<id>","wait":"120s"}` | release one lease of the pod |
+| `{"op":"release","all":true}` | release all leases of the pod |
+| `{"op":"list"}` | leases of the pod |
+| `{"op":"fd","lease":"<id>"}` | re-send the fd of a Ready shared lease |
+
+Response: `{"lease":"<8 hex>","state":"...","kind":"memory|shared","node":N,"size":<bytes>,"serial":"0x..","dax":"/dev/daxX.Y","error":"..."}`;
+`list` and `release all` answer `{"leases":[...]}`. States: Creating,
+Pending, Lending, Ready, Releasing, Failed, and Released (in responses
+only: the lease is gone). The response of a Ready shared lease to `lease`
+and `fd` carries the dax fd as SCM_RIGHTS on the same write.
+
+- `wait` (default `--lease-wait-default`, 120s) blocks until Ready or
+  Failed. At the timeout the lease is released and reported Failed
+  `timeout: ...`. `"wait":"0s"` returns the current state at once and
+  keeps the lease.
+- `requestId`: a repeated request with the same id from the same
+  container returns the same lease (a retry after a lost connection).
+- `size` in a response is the device size once Ready (it may be larger
+  than requested), the requested size before.
+- A release waits up to `wait` for the companion objects to disappear and
+  answers Released, or Releasing if they are still going.
+- Errors: `{"error":"lending unavailable: NRI not connected"}`,
+  `{"error":"not a container of the claim's pod"}`, invalid requests.
+  A lend that fails (for example the container is memory-steered, see
+  below, or not running) makes the lease Failed with that message, and
+  it is released.
+
+Caller authentication: the socket identifies the token claim, and the
+claim's `reservedFor` the pod. SO_PEERCRED gives the caller's pid; the
+NRI plugin maps it through `/proc/<pid>/cgroup` to a container. The
+container's pod must be a pod of the claim. A lease is bound to that pod
+and container: memory is lent to the calling container only; any
+container of the same pod with the socket may list and release it.
+
+### CLI
+
+`cxl-request` is a static binary (`CGO_ENABLED=0 go build ./cmd/cxl-request`);
+it uses `$CXL_LEASE_SOCKET` and prints the JSON response line.
+
+```
+cxl-request memory <size> [--wait D] [--request-id ID]
+cxl-request shared <serial> [--wait D] [--exec CMD ARGS...]
+cxl-request fd <lease> --exec CMD ARGS...
+cxl-release <lease>|--all [--wait D]     (also: cxl-request release ...)
+cxl-request list
+```
+
+With `--exec`, CMD runs with the dax fd as fd 3 and `CXL_LEASE_FD=3`,
+`CXL_LEASE`, `CXL_LEASE_DAX` (the host path, informational) and
+`CXL_LEASE_SIZE`; the exit code of CMD is passed through, signals are
+forwarded. Without `--exec` the received fd is closed. Exit codes: 0 ok,
+1 error, 2 usage, 3 lease Failed or not Ready in time (or not Released).
+
+### Life cycle
+
+- The lease table `leases.json` in the `cxl.generic` plugin data
+  directory is written before any object is created. The pool driver
+  stores the lend with the companion claim in `preparedPoolClaims.json`,
+  so it can revoke after a restart.
+- Requester container stops: if the pod is being deleted, finished, gone
+  or has restartPolicy Never, its leases are released. Otherwise they
+  are kept, and exclusive lends are re-applied when the container starts
+  again (a shared fd is gone with the process: request it again with
+  `cxl-request fd <lease> --exec ...`).
+- Requester pod deleted: the companion pods are garbage collected
+  (ownerReference); NodeUnprepare of the token claim releases all leases
+  of the pod first, and fails with "still releasing N leases" (kubelet
+  retries) if that takes longer than 30 s.
+- Companion pod deleted or evicted behind the plugin's back: the pool
+  driver revokes before it releases the device; the lease becomes Failed
+  and is dropped by the reconcile.
+- Reconcile, at start (after NRI synchronized) and every 60 s: restarts
+  interrupted releases, releases leases left in Creating, leases whose
+  companion pod is gone or finished and leases whose requester will not
+  come back, re-applies exclusive lends of Ready leases (this is how a
+  plugin restart restores them), and deletes companion pods and claims of
+  the node that have no lease.
+- Plugin restart: the token claims' sockets are re-created in the
+  mounted directories, leases continue.
+
+### Limitations
+
+- Memory limits: lent memory counts against the container's `memory.max`
+  and the pod cgroup. Without a raise the extra node adds locality, not
+  room. Use requester pods without a memory limit, or raise it with
+  `pods/resize`. Node allocatable never includes pool memory.
+- cpuset.mems has one owner: the lend goes through NRI UpdateContainers.
+  A container that has a local CXL claim (memory steered by cgmpolmgr)
+  cannot borrow: the lend is refused with "container is memory-steered by
+  a local CXL claim; lending is not supported together with steering
+  yet". Both components would own the container's cpuset.mems, and
+  cgmpolmgr writes cgroupfs directly, which the next NRI update reverts.
+  nri-resource-policy or the kubelet memory manager would conflict the
+  same way. A movable pool node is never the only node in cpuset.mems.
+- Release is cooperative. Releasing a shared lease while the device is
+  still mapped makes the holder get SIGBUS at its next access; munmap
+  first. A passed fd cannot be revoked short of release, and can be
+  duplicated or passed on inside the pod. An exclusive release blocks
+  (kubelet retries, the companion stays Terminating) while the pages
+  cannot move.
+- Latency: about 5-7 s per request (the scheduler's binding condition
+  poll), about 8 s for a release.
+- `cxl create-region` right after a hotplug can fail once with
+  "add_dev() failed"; the pool driver retries a region creation once
+  after 3 s.
+- RBAC: the plugin creates and deletes pods and resourceclaims in every
+  namespace (`deployments/cxl/base/resource-driver.yaml`); companions count
+  against the tenant's ResourceQuota. A ValidatingAdmissionPolicy that
+  pins the companion shape and node is future work.
+- The plugin must run in the host pid namespace with the NRI socket (as a
+  host process; the shipped DaemonSet has neither). SELinux labels of the
+  socket are set best effort and unverified.
+- Leases follow the pod object: a finished but undeleted pod keeps its
+  leases until its token claim is unprepared.
+- Do not force-delete a companion pod while it holds a device (the
+  force deletion hazard above).

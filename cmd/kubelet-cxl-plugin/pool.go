@@ -61,7 +61,35 @@ const (
 	// of a memdev that is already present. A memdev disabled by an
 	// earlier release is enabled again by memctl.CreateRegion.
 	defaultMemdevProbeGrace = 2 * time.Second
+	// defaultRegionRetryDelay is the pause before the one retry of a
+	// region creation that failed right after hotplug ("add_dev()
+	// failed", seen in plan-3 measurement B).
+	defaultRegionRetryDelay = 3 * time.Second
 )
+
+// poolLeaseHooks is what the pool helper tells the lease broker about
+// companion claims (claims with a LendConfig). The hooks are called with
+// the pool helper's lock held and must not call back into it.
+type poolLeaseHooks interface {
+	// OnLending validates the LendConfig against the broker's lease and
+	// marks the lease Lending. An error fails the Prepare.
+	OnLending(cfg *lendConfig) error
+	// OnPrepared marks the lease Ready with the prepared devices.
+	OnPrepared(cfg *lendConfig, devs []preparedPoolDevice)
+	// OnLendFailed records a lend error (kubelet retries the Prepare).
+	OnLendFailed(cfg *lendConfig, err error)
+	// OnReleasing is called when the companion claim is unprepared.
+	OnReleasing(lease string)
+}
+
+// poolLend is the lend of a prepared companion claim, persisted with the
+// claim so that Unprepare can revoke it after a plugin restart.
+type poolLend struct {
+	Lease     string `json:"lease"`
+	Pod       podRef `json:"pod"`
+	Container string `json:"container"`
+	Nodes     []int  `json:"nodes,omitempty"` // lent NUMA nodes (exclusive devices)
+}
 
 type poolDriver struct {
 	name       string // cxl-pool.generic
@@ -74,6 +102,12 @@ type poolDriver struct {
 	mu         sync.Mutex
 	prepared   map[string]*preparedPoolClaim // claim uid -> ...
 	inflight   map[uint64]int                // serials being prepared -> count
+	// lender lends exclusive devices of companion claims to the
+	// requesting container, nil when NRI is not connected.
+	lender Lender
+	// leases is the lease broker, nil when lending is disabled.
+	leases     poolLeaseHooks
+	retryDelay time.Duration
 
 	// serials is a snapshot of the serials of prepared and inflight
 	// devices for the cxl.generic publisher (D29). It has its own lock
@@ -104,6 +138,7 @@ type preparedPoolClaim struct {
 	ClaimName string                      `json:"claimName"` // namespace/name
 	Devices   []preparedPoolDevice        `json:"devices"`
 	Result    kubeletplugin.PrepareResult `json:"result"` // what Prepare returned
+	Lend      *poolLend                   `json:"lend,omitempty"`
 }
 
 // poolDeviceData is claim.status.devices[].data written by the pool
@@ -133,6 +168,7 @@ func newPoolDriver(name string, mem *memctl.Manager, stateFile string, timeout t
 		stateFile:  stateFile,
 		timeout:    timeout,
 		probeGrace: defaultMemdevProbeGrace,
+		retryDelay: defaultRegionRetryDelay,
 		prepared:   map[string]*preparedPoolClaim{},
 		inflight:   map[uint64]int{},
 	}
@@ -160,6 +196,18 @@ func (p *poolDriver) start(ctx context.Context, cdi *cdiapi.Cache, opts ...kubel
 	p.helper = helper
 	klog.Infof("pool helper registered as %s", p.name)
 	return nil
+}
+
+// setLending enables lending of companion claims: lender is nil when NRI
+// is not connected (their Prepare then fails), leases is the broker.
+func (p *poolDriver) setLending(lender Lender, leases poolLeaseHooks) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.lender = lender
+	p.leases = leases
 }
 
 func (p *poolDriver) stop() {
@@ -213,11 +261,28 @@ func (p *poolDriver) prepareClaim(ctx context.Context, claim *resourceapi.Resour
 	uid := string(claim.UID)
 	if pc, ok := p.prepared[uid]; ok {
 		klog.V(3).Infof("%s: claim %s (%s) was already prepared", p.name, pc.ClaimName, uid)
+		if pc.Lend != nil && p.leases != nil {
+			cfg := pc.Lend.config()
+			if err := p.leases.OnLending(cfg); err == nil {
+				p.leases.OnPrepared(cfg, pc.Devices)
+			}
+		}
 		return pc.Result
 	}
 	claimName := claim.Namespace + "/" + claim.Name
 	if claim.Status.Allocation == nil {
 		return kubeletplugin.PrepareResult{Err: fmt.Errorf("claim %s has no allocation", claimName)}
+	}
+	lend, err := parseLendConfig(claim, p.name)
+	if err != nil {
+		return kubeletplugin.PrepareResult{Err: fmt.Errorf("%s: preparing claim %s: %w", p.name, claimName, err)}
+	}
+	if lend != nil {
+		if err := p.checkLend(lend); err != nil {
+			err = fmt.Errorf("%s: preparing claim %s: %w", p.name, claimName, err)
+			klog.Error(err)
+			return kubeletplugin.PrepareResult{Err: err}
+		}
 	}
 	pc := &preparedPoolClaim{ClaimName: claimName, Result: kubeletplugin.PrepareResult{Devices: []kubeletplugin.Device{}}}
 	// Serials touched by this Prepare stay inflight (hidden from the
@@ -253,6 +318,14 @@ func (p *poolDriver) prepareClaim(ctx context.Context, claim *resourceapi.Resour
 		p.inflight[data.Serial]++
 		p.updateSerials()
 		dev, err := p.prepareDevice(ctx, &r, data)
+		if err != nil && isAddDevError(err) {
+			klog.Warningf("%s: claim %s: device %s: %v; retrying once in %v", p.name, claimName, r.Device, err, p.retryDelay)
+			select {
+			case <-ctx.Done():
+			case <-time.After(p.retryDelay):
+				dev, err = p.prepareDevice(ctx, &r, data)
+			}
+		}
 		if err != nil {
 			return fail(fmt.Errorf("device %s serial 0x%x: %w", r.Device, data.Serial, err))
 		}
@@ -267,16 +340,127 @@ func (p *poolDriver) prepareClaim(ctx context.Context, claim *resourceapi.Resour
 		klog.Infof("%s: claim %s: prepared %s (serial 0x%x, shared %v) as %s %s dax %s node %d",
 			p.name, claimName, r.Device, data.Serial, data.Shared, dev.Memdev, dev.Region, dev.Dax, dev.Node)
 	}
+	if lend != nil {
+		pl, err := p.lend(ctx, lend, pc.Devices)
+		if err != nil {
+			p.revoke(ctx, pl, claimName)
+			if p.leases != nil {
+				p.leases.OnLendFailed(lend, err)
+			}
+			return fail(err)
+		}
+		pc.Lend = pl
+	}
 	p.prepared[uid] = pc
 	if err := p.sync(); err != nil {
 		delete(p.prepared, uid)
+		if pc.Lend != nil {
+			p.revoke(ctx, pc.Lend, claimName)
+		}
 		res := fail(err)
 		if err := p.sync(); err != nil {
 			klog.Errorf("%s: %v", p.name, err)
 		}
 		return res
 	}
+	if lend != nil && p.leases != nil {
+		p.leases.OnPrepared(lend, pc.Devices)
+	}
 	return pc.Result
+}
+
+// parseLendConfig returns the LendConfig of a companion claim, nil if the
+// claim has none. Only claim-level config counts: a class must not lend.
+func parseLendConfig(claim *resourceapi.ResourceClaim, driver string) (*lendConfig, error) {
+	var found *lendConfig
+	for _, c := range claim.Status.Allocation.Devices.Config {
+		if c.Opaque == nil || c.Opaque.Driver != driver {
+			continue
+		}
+		var cfg lendConfig
+		if err := json.Unmarshal(c.Opaque.Parameters.Raw, &cfg); err != nil {
+			return nil, fmt.Errorf("invalid opaque config for %s: %w", driver, err)
+		}
+		if cfg.Kind != device.LendConfigKind {
+			continue
+		}
+		switch {
+		case c.Source != resourceapi.AllocationConfigSourceClaim:
+			return nil, fmt.Errorf("%s from %s config is not allowed, only from the claim", device.LendConfigKind, c.Source)
+		case cfg.APIVersion != driver+"/v1alpha1":
+			return nil, fmt.Errorf("%s: apiVersion %q, expected %q", device.LendConfigKind, cfg.APIVersion, driver+"/v1alpha1")
+		case cfg.Lease == "" || cfg.Container == "" || cfg.Pod.UID == "" || cfg.Pod.Name == "":
+			return nil, fmt.Errorf("%s: lease, pod.name, pod.uid and container are required", device.LendConfigKind)
+		case cfg.Pod.Namespace != claim.Namespace:
+			return nil, fmt.Errorf("%s: pod namespace %q is not the claim's namespace %q", device.LendConfigKind, cfg.Pod.Namespace, claim.Namespace)
+		case found != nil:
+			return nil, fmt.Errorf("more than one %s", device.LendConfigKind)
+		}
+		found = &cfg
+	}
+	return found, nil
+}
+
+// config returns the LendConfig of a stored lend.
+func (l *poolLend) config() *lendConfig {
+	return &lendConfig{Kind: device.LendConfigKind, Lease: l.Lease, Pod: l.Pod, Container: l.Container}
+}
+
+// checkLend checks that a companion claim can be lent before any device
+// is touched.
+func (p *poolDriver) checkLend(cfg *lendConfig) error {
+	if p.leases == nil {
+		return fmt.Errorf("lease %s: lending to running containers is disabled", cfg.Lease)
+	}
+	if p.lender == nil {
+		return fmt.Errorf("lease %s: %w", cfg.Lease, errLendingUnavailable)
+	}
+	return p.leases.OnLending(cfg)
+}
+
+// lend lends the exclusive devices of a companion claim to the
+// requesting container. Shared devices are passed as an fd by the broker.
+// The returned lend lists the nodes lent so far, also on error.
+func (p *poolDriver) lend(ctx context.Context, cfg *lendConfig, devs []preparedPoolDevice) (*poolLend, error) {
+	pl := &poolLend{Lease: cfg.Lease, Pod: cfg.Pod, Container: cfg.Container}
+	for _, d := range devs {
+		if d.Shared || d.Node < 0 {
+			continue
+		}
+		pl.Nodes = append(pl.Nodes, d.Node)
+		if err := p.lender.LendNode(ctx, cfg.Pod.UID, cfg.Container, d.Node); err != nil {
+			return pl, fmt.Errorf("lease %s: lending node %d to %s/%s/%s: %w", cfg.Lease, d.Node, cfg.Pod.Namespace, cfg.Pod.Name, cfg.Container, err)
+		}
+		klog.Infof("%s: lease %s: lent node %d to %s/%s/%s", p.name, cfg.Lease, d.Node, cfg.Pod.Namespace, cfg.Pod.Name, cfg.Container)
+	}
+	return pl, nil
+}
+
+// revoke revokes the lent nodes of a lend. Without NRI the nodes cannot
+// be revoked: the release then migrates the pages anyway, but the stale
+// node stays in the container's cpuset.mems.
+func (p *poolDriver) revoke(ctx context.Context, pl *poolLend, claimName string) error {
+	if pl == nil || len(pl.Nodes) == 0 {
+		return nil
+	}
+	if p.lender == nil {
+		klog.Warningf("%s: claim %s: lease %s: %v, cannot revoke nodes %v from %s/%s/%s",
+			p.name, claimName, pl.Lease, errLendingUnavailable, pl.Nodes, pl.Pod.Namespace, pl.Pod.Name, pl.Container)
+		return nil
+	}
+	var errs []error
+	for _, n := range pl.Nodes {
+		if err := p.lender.RevokeNode(ctx, pl.Pod.UID, pl.Container, n); err != nil {
+			errs = append(errs, fmt.Errorf("lease %s: revoking node %d from %s/%s/%s: %w", pl.Lease, n, pl.Pod.Namespace, pl.Pod.Name, pl.Container, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// isAddDevError matches the transient region creation failure right
+// after a hotplug.
+func isAddDevError(err error) bool {
+	return strings.Contains(err.Error(), "add_dev")
 }
 
 // preparedDevice returns a device of a prepared claim other than
@@ -452,6 +636,18 @@ func (p *poolDriver) unprepareClaim(ctx context.Context, uid string) error {
 	pc, ok := p.prepared[uid]
 	if !ok {
 		return nil
+	}
+	if pc.Lend != nil {
+		if p.leases != nil {
+			p.leases.OnReleasing(pc.Lend.Lease)
+		}
+		// Revoke before the release: offlining memory that the
+		// container still has in cpuset.mems leaves a stale node there.
+		if err := p.revoke(ctx, pc.Lend, pc.ClaimName); err != nil {
+			err = fmt.Errorf("%s: unpreparing claim %s: %w", p.name, pc.ClaimName, err)
+			klog.Error(err)
+			return err
+		}
 	}
 	var errs []error
 	for _, d := range pc.Devices {
