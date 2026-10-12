@@ -81,7 +81,7 @@ spec:
       size:   {int: 268435456}
     allowMultipleAllocations: true
     capacity:
-      hosts: {value: "4", requestPolicy: {default: "1", validValues: ["1"]}}  # max attached nodes
+      hosts: {value: "4", requestPolicy: {default: "1", validValues: ["1", "4"]}}  # max attached nodes
     bindsToNode: true
     bindingConditions: ["cxl-pool.generic/Attached"]
     bindingFailureConditions: ["cxl-pool.generic/AttachFailed"]
@@ -96,6 +96,13 @@ spec:
   an attribute; `hosts` limits how many nodes may attach it.
 - `bindsToNode` makes the scheduler pin the claim to the node it picked.
   One claim covers one node, so N nodes sharing a device means N claims.
+- A claim of a shared device consumes one of its `hosts` by default. A
+  claim that requests all of them (`validValues` has the value of `hosts`)
+  has the device exclusively: the scheduler allocates the device to no
+  other claim until it is deallocated, and the controller attaches it
+  exclusively, so that no other cluster sharing the pool gets it either.
+  That is the writer of single-writer data sharing, see
+  [Options of pool devices](#options-of-pool-devices).
 
 ## DeviceClasses and claims
 
@@ -146,7 +153,57 @@ spec:
 
 Complete examples with pods:
 [pooled-memory-pod.yaml](../../deployments/cxl/pool/examples/pooled-memory-pod.yaml),
-[shared-memory-pod.yaml](../../deployments/cxl/pool/examples/shared-memory-pod.yaml).
+[shared-memory-pod.yaml](../../deployments/cxl/pool/examples/shared-memory-pod.yaml),
+[read-only-shared-memory-pod.yaml](../../deployments/cxl/pool/examples/read-only-shared-memory-pod.yaml),
+[pooled-dax-pod.yaml](../../deployments/cxl/pool/examples/pooled-dax-pod.yaml).
+
+### Options of pool devices
+
+An opaque configuration of driver `cxl-pool.generic`, kind
+`PoolDeviceConfig`, selects how the node plugin prepares a pool device.
+It may come from the claim or from its DeviceClass (the claim's wins), and
+applies to the requests it lists, or to all requests of the driver:
+
+```yaml
+spec:
+  devices:
+    requests: [...]
+    config:
+    - opaque:
+        driver: cxl-pool.generic
+        parameters: {apiVersion: cxl-pool.generic/v1alpha1, kind: PoolDeviceConfig, mode: dax, readOnly: true}
+```
+
+| field | values | |
+|---|---|---|
+| `mode` | `numa`, `dax` | `numa`: the memory becomes a NUMA node (exclusive devices only, their default). `dax`: a devdax device `/dev/daxX.Y` that containers `mmap` (the only mode of shared devices). |
+| `readOnly` | `false`, `true` | `dax` only: the container gets the device node with CDI permissions `r`, so its device cgroup lets it open the device for reading only. |
+
+So every pool device can be used as a dax device: shared devices always,
+exclusive devices with `mode: dax`. Exclusive access to a shared device is
+a capacity request of all its `hosts`:
+
+| pool device | claim | gets |
+|---|---|---|
+| exclusive | (nothing) | a NUMA node |
+| exclusive | `mode: dax` | a dax device of its own |
+| shared | (nothing) | a dax device, shared with the other claims of the device |
+| shared | `capacity.requests.hosts: "4"` | a dax device, nobody else has the device meanwhile |
+| shared or exclusive dax | `readOnly: true` | the dax device, read-only |
+
+Read-only is enforced by the kernel for every process of the container,
+whatever its capabilities, except in privileged containers (their device
+cgroup allows everything). It is a property of the claim, not of the
+device: another claim of the same device may write, and the readers see
+it. It keeps readers from writing by mistake; consistency of the data is
+the job of exclusive access. Pool appliances have no read-only attach
+either (UnifabriX Maxview 2.0 has none): whatever a host attaches, it can
+write.
+
+Single-writer data sharing: the writer claims the shared device with all
+of its `hosts` and writes; the readers claim it with `readOnly: true`. A
+reader that asks while the writer has the device waits (its pod or lease
+stays pending) until the writer's claim is gone.
 
 ## What the scheduler does
 
@@ -244,16 +301,21 @@ NodePrepareResources, for each allocated device of the driver:
    ??? TODO: make sure the container is allowed to use the memory node
    (update cpuset.mems), and other containers are not.
 
-   Shared device: create a ram region, bind the dax device to
-   `device_dax`. The memory is never onlined: two kernels using the same
-   bytes as RAM would corrupt each other. The container gets the device
-   node `/dev/daxX.Y` and
+   Shared device, and exclusive device in mode `dax`: create a ram
+   region, bind the dax device to `device_dax`. The memory is never
+   onlined: two kernels using the same bytes as RAM would corrupt each
+   other. The container gets the device node `/dev/daxX.Y` and
 
    ```
-   CXL_SHARED_DAX_<SERIAL>=/dev/daxX.Y
-   CXL_SHARED_SIZE_<SERIAL>=<bytes>
-   CXL_SHARED_SERIAL_<SERIAL>=0x<serial>
+   CXL_SHARED_DAX_<SERIAL>=/dev/daxX.Y        (CXL_POOL_DAX_<SERIAL> of an exclusive device)
+   CXL_SHARED_SIZE_<SERIAL>=<bytes>           (CXL_POOL_SIZE_<SERIAL>)
+   CXL_SHARED_SERIAL_<SERIAL>=0x<serial>      (CXL_POOL_SERIAL_<SERIAL>)
+   CXL_SHARED_READONLY_<SERIAL>=1             (readOnly claims only)
    ```
+
+   The CDI device is `generic/cxl=pool-<serial>`, or
+   `generic/cxl=pool-<serial>-ro` with device node permissions `r` for a
+   read-only claim.
 
    Applications `mmap` the device (`MAP_SHARED`, aligned to the device
    alignment, typically 2 MiB) and agree on the layout of the memory
@@ -265,12 +327,14 @@ NodePrepareResources, for each allocated device of the driver:
    `/var/lib/kubelet/plugins/cxl-pool.generic/preparedPoolClaims.json`.
    A repeated prepare of a prepared claim returns the stored result; a
    region that already exists on the device (another claim on this node
-   for the same shared device, or a restart) is reused. If preparing one
+   for the same shared device, or a restart) is reused. A claim that wants
+   a device in another mode than another claim on the node prepared it
+   (or as exclusive when it is shared) fails. If preparing one
    device of a claim fails, the devices prepared for it are released
    again.
 
 NodeUnprepareResources: when no other prepared claim on the node uses the
-device, offline its memory (exclusive), disable and destroy its region
+device, offline its memory (mode `numa`), disable and destroy its region
 and disable the memory device. This is what lets the pool hot-remove it.
 A device that is already gone is not an error.
 
@@ -370,19 +434,32 @@ container: cxl-release L
 
 A shared device is the same, with class `cxl-shared-memory` and a serial
 selector, but nothing is lent through cgroups: the plugin opens
-`/dev/daxX.Y` (O_RDWR) and passes the open file descriptor to the
-container over the socket (SCM_RIGHTS). The container needs no device
-node and no device cgroup rule; the device cgroup is checked only at
-open(). `cxl-request shared <serial> --exec CMD` runs CMD with the fd as
-fd 3.
+`/dev/daxX.Y` (O_RDWR, or O_RDONLY for a read-only lease) and passes the
+open file descriptor to the container over the socket (SCM_RIGHTS). The
+container needs no device node and no device cgroup rule; the device
+cgroup is checked only at open(). `cxl-request shared <serial> --exec CMD`
+runs CMD with the fd as fd 3. A memory lease in mode `dax`
+(`cxl-request memory 512Mi --dax`) gets an exclusive device the same
+way, as a dax fd instead of a NUMA node.
+
+A read-only lease's fd allows mappings for reading only: a writable
+mapping (`mmap` with `PROT_WRITE`, or `mprotect` to it) fails with EACCES,
+a store into the mapping raises SIGSEGV, and reopening the fd through
+`/proc/self/fd` is refused by the device cgroup, whatever the
+capabilities of the container. An exclusive lease of a shared device
+requests all of its `hosts`: the plugin reads the value from the pool's
+ResourceSlice.
 
 The companion objects live in the requester's namespace:
 
 - ResourceClaim `cxl-lease-<id>`: one request `lease`
   (`exactly: {deviceClassName: cxl-pool-memory, capacity.requests.memory: <size>}`
-  or `{deviceClassName: cxl-shared-memory, selectors: [serial == ...]}`),
+  or `{deviceClassName: cxl-shared-memory, selectors: [serial == ...]}`,
+  with `capacity.requests.hosts: <all>` for an exclusive lease),
   opaque config for `cxl-pool.generic`:
   `{apiVersion: cxl-pool.generic/v1alpha1, kind: LendConfig, lease, pod: {namespace, name, uid}, container}`,
+  and for a dax lease
+  `{apiVersion: cxl-pool.generic/v1alpha1, kind: PoolDeviceConfig, mode: dax, readOnly}`,
   ownerReference to the requester pod (controller: true).
 - Pod `cxl-lease-<id>`: ownerReference to the requester pod, required
   node affinity `metadata.name In [<node>]`, `tolerations: [{operator: Exists}]`,
@@ -408,17 +485,24 @@ a connection may carry several requests.
 | request | meaning |
 |---|---|
 | `{"op":"lease","kind":"memory","size":"512Mi","wait":"120s","requestId":"r1"}` | exclusive memory, lent as a NUMA node |
+| `{"op":"lease","kind":"memory","size":"512Mi","mode":"dax","readOnly":true}` | exclusive memory as a dax device, fd passed |
 | `{"op":"lease","kind":"shared","serial":"0xc1ae0001","wait":"120s"}` | shared device, fd passed |
+| `{"op":"lease","kind":"shared","serial":"0xc1ae0001","exclusive":true}` | shared device, nobody else meanwhile, fd passed |
+| `{"op":"lease","kind":"shared","serial":"0xc1ae0001","readOnly":true}` | shared device, read-only fd passed |
 | `{"op":"release","lease":"<id>","wait":"120s"}` | release one lease of the pod |
 | `{"op":"release","all":true}` | release all leases of the pod |
 | `{"op":"list"}` | leases of the pod |
-| `{"op":"fd","lease":"<id>"}` | re-send the fd of a Ready shared lease |
+| `{"op":"fd","lease":"<id>"}` | re-send the fd of a Ready dax lease |
 
-Response: `{"lease":"<8 hex>","state":"...","kind":"memory|shared","node":N,"size":<bytes>,"serial":"0x..","dax":"/dev/daxX.Y","error":"..."}`;
+Response: `{"lease":"<8 hex>","state":"...","kind":"memory|shared","mode":"numa|dax","exclusive":true,"readOnly":true,"node":N,"size":<bytes>,"serial":"0x..","dax":"/dev/daxX.Y","error":"..."}`;
 `list` and `release all` answer `{"leases":[...]}`. States: Creating,
 Pending, Lending, Ready, Releasing, Failed, and Released (in responses
-only: the lease is gone). The response of a Ready shared lease to `lease`
-and `fd` carries the dax fd as SCM_RIGHTS on the same write.
+only: the lease is gone). The response of a Ready dax lease (shared, or
+memory in mode `dax`) to `lease` and `fd` carries the dax fd as
+SCM_RIGHTS on the same write.
+- `mode` (memory leases): `numa` (default) or `dax`. `exclusive` (shared
+  leases) and `readOnly` (dax leases): see the table above; other
+  combinations are refused.
 
 - `wait` (default `--lease-wait-default`, 120s) blocks until Ready or
   Failed. At the timeout the lease is released and reported Failed
@@ -450,15 +534,17 @@ it uses `$CXL_LEASE_SOCKET` and prints the JSON response line.
 
 ```
 cxl-request memory <size> [--wait D] [--request-id ID]
-cxl-request shared <serial> [--wait D] [--exec CMD ARGS...]
+cxl-request memory <size> --dax [--read-only] [--wait D] [--exec CMD ARGS...]
+cxl-request shared <serial> [--exclusive] [--read-only] [--wait D] [--exec CMD ARGS...]
 cxl-request fd <lease> --exec CMD ARGS...
 cxl-release <lease>|--all [--wait D]     (also: cxl-request release ...)
 cxl-request list
 ```
 
 With `--exec`, CMD runs with the dax fd as fd 3 and `CXL_LEASE_FD=3`,
-`CXL_LEASE`, `CXL_LEASE_DAX` (the host path, informational) and
-`CXL_LEASE_SIZE`; the exit code of CMD is passed through, signals are
+`CXL_LEASE`, `CXL_LEASE_DAX` (the host path, informational),
+`CXL_LEASE_SIZE` and `CXL_LEASE_READONLY` (1 or 0: map the fd with
+`PROT_READ` only if 1); the exit code of CMD is passed through, signals are
 forwarded. Without `--exec` the received fd is closed. Exit codes: 0 ok,
 1 error, 2 usage, 3 lease Failed or not Ready in time (or not Released).
 

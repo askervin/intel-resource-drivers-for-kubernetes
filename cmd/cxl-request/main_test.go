@@ -47,6 +47,14 @@ func TestParseArgs(t *testing.T) {
 		{"/usr/local/bin/cxl-release", []string{"abcd0123"}, request{Op: "release", Lease: "abcd0123"}, nil, ""},
 		{"cxl-release", []string{"--all", "--wait", "1m"}, request{Op: "release", All: true, Wait: "1m"}, nil, ""},
 		{"cxl-request", []string{"list"}, request{Op: "list"}, nil, ""},
+		{"cxl-request", []string{"memory", "512Mi", "--dax", "--read-only", "--exec", "cat"}, request{Op: "lease", Kind: "memory", Size: "512Mi", Mode: "dax", ReadOnly: true}, []string{"cat"}, ""},
+		{"cxl-request", []string{"shared", "0x1", "--exclusive", "--read-only"}, request{Op: "lease", Kind: "shared", Serial: "0x1", Exclusive: true, ReadOnly: true}, nil, ""},
+		{"cxl-request", []string{"shared", "0x1", "--dax"}, request{}, nil, "--dax is for memory"},
+		{"cxl-request", []string{"memory", "1Gi", "--exclusive"}, request{}, nil, "--exclusive is for shared"},
+		{"cxl-request", []string{"memory", "1Gi", "--read-only"}, request{}, nil, "--read-only is for shared and memory --dax"},
+		{"cxl-request", []string{"fd", "abc", "--read-only", "--exec", "cat"}, request{}, nil, "--read-only is for shared"},
+		{"cxl-request", []string{"list", "--exclusive"}, request{}, nil, "--exclusive is for shared"},
+		{"cxl-request", []string{"release", "--all", "--exec", "cat"}, request{}, nil, "--exec is for shared, memory --dax and fd"},
 		{"cxl-request", nil, request{}, nil, "no command"},
 		{"cxl-request", []string{"memory"}, request{}, nil, "expected one size"},
 		{"cxl-request", []string{"memory", "1Gi", "--exec", "x"}, request{}, nil, "--exec is for shared"},
@@ -168,16 +176,19 @@ func TestRunExecWithFd(t *testing.T) {
 	if err := os.WriteFile(dax, []byte("TAG-1234"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	resp := `{"lease":"000000a2","state":"Ready","kind":"shared","size":268435456,"serial":"0xc1ae0001","dax":"/dev/dax0.0"}`
-	sock, _ := fakeServer(t, resp, dax)
+	resp := `{"lease":"000000a2","state":"Ready","kind":"shared","mode":"dax","readOnly":true,"size":268435456,"serial":"0xc1ae0001","dax":"/dev/dax0.0"}`
+	sock, reqs := fakeServer(t, resp, dax)
 	t.Setenv(socketEnv, sock)
 	var out, errb bytes.Buffer
-	script := `echo "$CXL_LEASE_FD $CXL_LEASE $CXL_LEASE_DAX $CXL_LEASE_SIZE"; head -c 8 <&3; exit 7`
-	code := run([]string{"cxl-request", "shared", "0xc1ae0001", "--exec", "/bin/sh", "-c", script}, &out, &errb)
+	script := `echo "$CXL_LEASE_FD $CXL_LEASE $CXL_LEASE_DAX $CXL_LEASE_SIZE $CXL_LEASE_READONLY"; head -c 8 <&3; exit 7`
+	code := run([]string{"cxl-request", "shared", "0xc1ae0001", "--read-only", "--exec", "/bin/sh", "-c", script}, &out, &errb)
 	if code != 7 {
 		t.Fatalf("exit %d (stderr %s)", code, errb.String())
 	}
-	want := "3 000000a2 /dev/dax0.0 268435456\nTAG-1234"
+	if r := <-reqs; r != (request{Op: "lease", Kind: "shared", Serial: "0xc1ae0001", ReadOnly: true}) {
+		t.Fatalf("request %+v", r)
+	}
+	want := "3 000000a2 /dev/dax0.0 268435456 1\nTAG-1234"
 	if out.String() != want {
 		t.Fatalf("output %q, want %q", out.String(), want)
 	}

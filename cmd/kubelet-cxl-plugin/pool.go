@@ -17,12 +17,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -117,21 +119,60 @@ type poolDriver struct {
 }
 
 type preparedPoolDevice struct {
-	Request     string `json:"request"`
-	Device      string `json:"device"`
-	Pool        string `json:"pool"`
-	Serial      uint64 `json:"serial"`
-	SerialHex   string `json:"serialHex"`
-	Shared      bool   `json:"shared"`
-	Size        uint64 `json:"size"`
+	Request   string `json:"request"`
+	Device    string `json:"device"`
+	Pool      string `json:"pool"`
+	Serial    uint64 `json:"serial"`
+	SerialHex string `json:"serialHex"`
+	Shared    bool   `json:"shared"`
+	Size      uint64 `json:"size"`
+	// Mode is poolModeNUMA or poolModeDax ("" in state files written
+	// before modes existed: dax if DaxDevice is set).
+	Mode        string `json:"mode,omitempty"`
+	ReadOnly    bool   `json:"readOnly,omitempty"` // dax: the CDI device node allows reads only
 	Memdev      string `json:"memdev"`
 	Region      string `json:"region"`
 	Dax         string `json:"dax"`
-	DaxDevice   string `json:"daxDevice,omitempty"` // /dev/daxX.Y (shared)
+	DaxDevice   string `json:"daxDevice,omitempty"` // /dev/daxX.Y (dax mode)
 	DaxMajor    int    `json:"daxMajor,omitempty"`
 	DaxMinor    int    `json:"daxMinor,omitempty"`
-	Node        int    `json:"node"` // NUMA node of the memory (exclusive), -1 if none
+	Node        int    `json:"node"` // NUMA node of the memory (numa mode), -1 if none
 	CDIDeviceID string `json:"cdiDeviceID"`
+}
+
+// Modes of a prepared pool device (PoolDeviceConfig mode).
+const (
+	// poolModeNUMA onlines the memory as a new NUMA node (exclusive
+	// devices only, their default).
+	poolModeNUMA = "numa"
+	// poolModeDax binds the memory to device_dax: a /dev/daxX.Y that
+	// containers mmap (the only mode of shared devices).
+	poolModeDax = "dax"
+)
+
+// mode returns the mode of a prepared device, also for state files
+// written before modes existed.
+func (d *preparedPoolDevice) mode() string {
+	switch {
+	case d.Mode != "":
+		return d.Mode
+	case d.DaxDevice != "":
+		return poolModeDax
+	}
+	return poolModeNUMA
+}
+
+// poolDeviceConfig is the opaque configuration (kind PoolDeviceConfig)
+// of a pool claim, from the claim or its DeviceClass. It applies to the
+// requests it names, or to all requests of the driver.
+type poolDeviceConfig struct {
+	APIVersion string `json:"apiVersion"`
+	Kind       string `json:"kind"`
+	// Mode is "numa" or "dax"; "" is numa for exclusive devices and dax
+	// for shared devices.
+	Mode string `json:"mode,omitempty"`
+	// ReadOnly makes the dax device node of the container read-only.
+	ReadOnly bool `json:"readOnly,omitempty"`
 }
 
 type preparedPoolClaim struct {
@@ -149,11 +190,14 @@ type poolDeviceData struct {
 	Size   *uint64 `json:"size"`
 }
 
-// poolDevice is the parsed poolDeviceData of an allocation result.
+// poolDevice is the parsed poolDeviceData of an allocation result, with
+// the mode and read-only setting of its PoolDeviceConfig.
 type poolDevice struct {
-	Serial uint64
-	Shared bool
-	Size   uint64
+	Serial   uint64
+	Shared   bool
+	Size     uint64
+	Mode     string
+	ReadOnly bool
 }
 
 // newPoolDriver returns a pool helper whose prepared claims are loaded
@@ -310,9 +354,16 @@ func (p *poolDriver) prepareClaim(ctx context.Context, claim *resourceapi.Resour
 		if err != nil {
 			return fail(err)
 		}
-		if other := p.preparedDevice(data.Serial, uid); other != nil && other.Shared != data.Shared {
-			return fail(fmt.Errorf("device %s serial 0x%x: shared=%v, but another claim prepared it with shared=%v",
-				r.Device, data.Serial, data.Shared, other.Shared))
+		cfg, err := parsePoolDeviceConfig(claim, p.name, r.Request)
+		if err != nil {
+			return fail(fmt.Errorf("request %s: %w", r.Request, err))
+		}
+		if data.Mode, err = cfg.modeFor(data.Shared); err != nil {
+			return fail(fmt.Errorf("device %s serial 0x%x: %w", r.Device, data.Serial, err))
+		}
+		data.ReadOnly = cfg.ReadOnly
+		if err := p.checkSamePreparation(data, uid); err != nil {
+			return fail(fmt.Errorf("device %s serial 0x%x: %w", r.Device, data.Serial, err))
 		}
 		touched = append(touched, data.Serial)
 		p.inflight[data.Serial]++
@@ -337,8 +388,8 @@ func (p *poolDriver) prepareClaim(ctx context.Context, claim *resourceapi.Resour
 			CDIDeviceIDs: []string{dev.CDIDeviceID},
 			ShareID:      r.ShareID,
 		})
-		klog.Infof("%s: claim %s: prepared %s (serial 0x%x, shared %v) as %s %s dax %s node %d",
-			p.name, claimName, r.Device, data.Serial, data.Shared, dev.Memdev, dev.Region, dev.Dax, dev.Node)
+		klog.Infof("%s: claim %s: prepared %s (serial 0x%x, shared %v, mode %s, read-only %v) as %s %s dax %s node %d",
+			p.name, claimName, r.Device, data.Serial, data.Shared, dev.Mode, dev.ReadOnly, dev.Memdev, dev.Region, dev.Dax, dev.Node)
 	}
 	if lend != nil {
 		pl, err := p.lend(ctx, lend, pc.Devices)
@@ -401,6 +452,69 @@ func parseLendConfig(claim *resourceapi.ResourceClaim, driver string) (*lendConf
 	return found, nil
 }
 
+// parsePoolDeviceConfig returns the PoolDeviceConfig of the driver that
+// applies to an allocation result's request: class configs first, then
+// claim configs; a later one replaces an earlier one. A config applies to
+// the requests it lists (a request "r" also covers its subrequests "r/s"),
+// or to all requests if it lists none. Without one it returns the zero
+// config.
+func parsePoolDeviceConfig(claim *resourceapi.ResourceClaim, driver, request string) (*poolDeviceConfig, error) {
+	parent, _, _ := strings.Cut(request, "/")
+	found := &poolDeviceConfig{}
+	for _, source := range []resourceapi.AllocationConfigSource{resourceapi.AllocationConfigSourceClass, resourceapi.AllocationConfigSourceClaim} {
+		for _, c := range claim.Status.Allocation.Devices.Config {
+			if c.Source != source || c.Opaque == nil || c.Opaque.Driver != driver {
+				continue
+			}
+			if len(c.Requests) > 0 && !slices.Contains(c.Requests, request) && !slices.Contains(c.Requests, parent) {
+				continue
+			}
+			var head struct {
+				Kind string `json:"kind"`
+			}
+			if err := json.Unmarshal(c.Opaque.Parameters.Raw, &head); err != nil {
+				return nil, fmt.Errorf("invalid opaque config for %s: %w", driver, err)
+			}
+			if head.Kind != device.PoolDeviceConfigKind {
+				continue
+			}
+			cfg := &poolDeviceConfig{}
+			dec := json.NewDecoder(bytes.NewReader(c.Opaque.Parameters.Raw))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(cfg); err != nil {
+				return nil, fmt.Errorf("invalid %s from %s config: %w", device.PoolDeviceConfigKind, source, err)
+			}
+			if cfg.APIVersion != driver+"/v1alpha1" {
+				return nil, fmt.Errorf("%s: apiVersion %q, expected %q", device.PoolDeviceConfigKind, cfg.APIVersion, driver+"/v1alpha1")
+			}
+			found = cfg
+		}
+	}
+	return found, nil
+}
+
+// modeFor returns the mode of a device with the config: shared devices are
+// dax only (two kernels must never online the same memory), and read-only
+// is a property of a dax device node.
+func (cfg *poolDeviceConfig) modeFor(shared bool) (string, error) {
+	mode := cfg.Mode
+	switch {
+	case mode == "" && shared:
+		mode = poolModeDax
+	case mode == "":
+		mode = poolModeNUMA
+	case mode != poolModeNUMA && mode != poolModeDax:
+		return "", fmt.Errorf("%s: invalid mode %q (%s or %s)", device.PoolDeviceConfigKind, cfg.Mode, poolModeNUMA, poolModeDax)
+	}
+	switch {
+	case shared && mode != poolModeDax:
+		return "", fmt.Errorf("%s: mode %s: a shared device is used as %s only", device.PoolDeviceConfigKind, mode, poolModeDax)
+	case cfg.ReadOnly && mode != poolModeDax:
+		return "", fmt.Errorf("%s: readOnly needs mode %s", device.PoolDeviceConfigKind, poolModeDax)
+	}
+	return mode, nil
+}
+
 // config returns the LendConfig of a stored lend.
 func (l *poolLend) config() *lendConfig {
 	return &lendConfig{Kind: device.LendConfigKind, Lease: l.Lease, Pod: l.Pod, Container: l.Container}
@@ -418,13 +532,13 @@ func (p *poolDriver) checkLend(cfg *lendConfig) error {
 	return p.leases.OnLending(cfg)
 }
 
-// lend lends the exclusive devices of a companion claim to the
-// requesting container. Shared devices are passed as an fd by the broker.
+// lend lends the NUMA nodes of a companion claim to the requesting
+// container. Dax devices are passed as an fd by the broker.
 // The returned lend lists the nodes lent so far, also on error.
 func (p *poolDriver) lend(ctx context.Context, cfg *lendConfig, devs []preparedPoolDevice) (*poolLend, error) {
 	pl := &poolLend{Lease: cfg.Lease, Pod: cfg.Pod, Container: cfg.Container}
 	for _, d := range devs {
-		if d.Shared || d.Node < 0 {
+		if d.mode() != poolModeNUMA || d.Node < 0 {
 			continue
 		}
 		pl.Nodes = append(pl.Nodes, d.Node)
@@ -475,6 +589,22 @@ func (p *poolDriver) preparedDevice(serial uint64, exceptUID string) *preparedPo
 				return &pc.Devices[i]
 			}
 		}
+	}
+	return nil
+}
+
+// checkSamePreparation refuses a device that another claim prepared
+// differently: as shared or exclusive, or in another mode. Read-only may
+// differ: it is a property of the CDI device node, not of the region.
+func (p *poolDriver) checkSamePreparation(data *poolDevice, exceptUID string) error {
+	other := p.preparedDevice(data.Serial, exceptUID)
+	switch {
+	case other == nil:
+		return nil
+	case other.Shared != data.Shared:
+		return fmt.Errorf("shared=%v, but another claim prepared it with shared=%v", data.Shared, other.Shared)
+	case other.mode() != data.Mode:
+		return fmt.Errorf("mode %s, but another claim prepared it in mode %s", data.Mode, other.mode())
 	}
 	return nil
 }
@@ -553,12 +683,14 @@ func (p *poolDriver) prepareDevice(ctx context.Context, r *resourceapi.DeviceReq
 		SerialHex:   fmt.Sprintf("%x", data.Serial),
 		Shared:      data.Shared,
 		Size:        data.Size,
+		Mode:        data.Mode,
+		ReadOnly:    data.ReadOnly,
 		Memdev:      memdev,
 		Node:        -1,
-		CDIDeviceID: poolCDIDeviceID(data.Serial),
+		CDIDeviceID: poolCDIDeviceID(data.Serial, data.ReadOnly),
 	}
-	if data.Shared {
-		// device_dax only: never online shared memory as RAM.
+	if data.Mode == poolModeDax {
+		// device_dax: never onlined as RAM (shared memory must never be).
 		ri, err := p.mem.CreateRegion(ctx, memdev, memctl.ModeDevDax, "")
 		if err != nil {
 			return nil, err
@@ -676,32 +808,49 @@ func (p *poolDriver) sync() error {
 	return errors.Join(p.writeCDISpec(), p.save())
 }
 
-// poolCDIDeviceName is the CDI device name of a pool device.
-func poolCDIDeviceName(serial uint64) string {
+// poolCDIDeviceName is the CDI device name of a pool device: one per
+// serial, and a second one with a read-only device node ("-ro").
+func poolCDIDeviceName(serial uint64, readOnly bool) string {
+	if readOnly {
+		return fmt.Sprintf("pool-%x-ro", serial)
+	}
 	return fmt.Sprintf("pool-%x", serial)
 }
 
-func poolCDIDeviceID(serial uint64) string {
-	return cdiparser.QualifiedName(device.CDIVendor, device.CDIClass, poolCDIDeviceName(serial))
+func poolCDIDeviceID(serial uint64, readOnly bool) string {
+	return cdiparser.QualifiedName(device.CDIVendor, device.CDIClass, poolCDIDeviceName(serial, readOnly))
 }
 
-// poolCDIDevice returns the CDI device of a prepared pool device.
+// poolCDIDevice returns the CDI device of a prepared pool device. A dax
+// device of a shared device sets CXL_SHARED_*, of an exclusive device
+// CXL_POOL_*. A read-only one gets the device node with permissions "r":
+// the runtime turns that into a device cgroup rule that refuses opens for
+// writing, whatever the container's capabilities.
 func poolCDIDevice(d *preparedPoolDevice) cdiSpecs.Device {
 	x := strings.ToUpper(d.SerialHex)
 	serial := "0x" + d.SerialHex
 	edits := cdiSpecs.ContainerEdits{}
-	if d.Shared {
-		edits.Env = []string{
-			"CXL_SHARED_DAX_" + x + "=" + d.DaxDevice,
-			"CXL_SHARED_SIZE_" + x + "=" + strconv.FormatUint(d.Size, 10),
-			"CXL_SHARED_SERIAL_" + x + "=" + serial,
+	if d.mode() == poolModeDax {
+		prefix := "CXL_POOL_"
+		if d.Shared {
+			prefix = "CXL_SHARED_"
 		}
-		edits.DeviceNodes = []*cdiSpecs.DeviceNode{{
+		edits.Env = []string{
+			prefix + "DAX_" + x + "=" + d.DaxDevice,
+			prefix + "SIZE_" + x + "=" + strconv.FormatUint(d.Size, 10),
+			prefix + "SERIAL_" + x + "=" + serial,
+		}
+		node := &cdiSpecs.DeviceNode{
 			Path:  d.DaxDevice,
 			Type:  "c",
 			Major: int64(d.DaxMajor),
 			Minor: int64(d.DaxMinor),
-		}}
+		}
+		if d.ReadOnly {
+			edits.Env = append(edits.Env, prefix+"READONLY_"+x+"=1")
+			node.Permissions = "r"
+		}
+		edits.DeviceNodes = []*cdiSpecs.DeviceNode{node}
 	} else {
 		edits.Env = []string{
 			"CXL_POOL_NODE_" + x + "=" + strconv.Itoa(d.Node),
@@ -709,11 +858,11 @@ func poolCDIDevice(d *preparedPoolDevice) cdiSpecs.Device {
 			"CXL_POOL_SERIAL_" + x + "=" + serial,
 		}
 	}
-	return cdiSpecs.Device{Name: poolCDIDeviceName(d.Serial), ContainerEdits: edits}
+	return cdiSpecs.Device{Name: poolCDIDeviceName(d.Serial, d.ReadOnly), ContainerEdits: edits}
 }
 
 // buildCDISpec builds the CDI spec of all prepared pool devices, one CDI
-// device per serial.
+// device per serial and access (read-only or not).
 func (p *poolDriver) buildCDISpec() *cdiSpecs.Spec {
 	spec := &cdiSpecs.Spec{Kind: device.CDIKind}
 	uids := make([]string, 0, len(p.prepared))
@@ -721,14 +870,15 @@ func (p *poolDriver) buildCDISpec() *cdiSpecs.Spec {
 		uids = append(uids, uid)
 	}
 	sort.Strings(uids)
-	seen := map[uint64]bool{}
+	seen := map[string]bool{}
 	for _, uid := range uids {
 		for i := range p.prepared[uid].Devices {
 			d := &p.prepared[uid].Devices[i]
-			if seen[d.Serial] {
+			name := poolCDIDeviceName(d.Serial, d.ReadOnly)
+			if seen[name] {
 				continue
 			}
-			seen[d.Serial] = true
+			seen[name] = true
 			spec.Devices = append(spec.Devices, poolCDIDevice(d))
 		}
 	}

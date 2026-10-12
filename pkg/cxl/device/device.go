@@ -67,6 +67,11 @@ const (
 	// that names the lease and the borrowing container of a companion
 	// claim (apiVersion <pool driver name>/v1alpha1).
 	LendConfigKind = "LendConfig"
+	// PoolDeviceConfigKind is the kind of the opaque pool claim
+	// configuration that selects how a pool device is prepared: as a
+	// NUMA node or as a devdax device, and read-only (apiVersion <pool
+	// driver name>/v1alpha1).
+	PoolDeviceConfigKind = "PoolDeviceConfig"
 
 	// CapacityMemory is the capacity key used in ResourceSlice device
 	// capacity and in ConsumedCapacity. Matches v1.ResourceMemory.

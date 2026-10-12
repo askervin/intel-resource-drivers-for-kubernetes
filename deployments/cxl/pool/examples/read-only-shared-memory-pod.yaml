@@ -1,0 +1,110 @@
+# Single-writer data sharing with a shared CXL memory device of a pool: a
+# writer has the device exclusively and writes, readers map it read-only.
+#
+# The writer's claim requests all "hosts" of the device (4 in the
+# ResourceSlice of the reference controller): while it exists, the
+# scheduler gives the device to no other claim. Readers created meanwhile
+# stay pending until the writer's claim is gone. Delete the writer pod and
+# its claim when it is done.
+#
+# The readers' claims have PoolDeviceConfig readOnly: true: the device
+# node allows reads only (CDI permissions "r", enforced by the device
+# cgroup), so a reader can open the device O_RDONLY and map it PROT_READ,
+# and nothing else. CXL_SHARED_READONLY_<SERIAL>=1 tells the program.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: shared-writer
+spec:
+  devices:
+    requests:
+    - name: mem
+      exactly:
+        deviceClassName: cxl-shared-memory
+        selectors:
+        - cel:
+            expression: 'device.attributes["cxl-pool.generic"].serial == "0xc1ae0001"'
+        capacity:
+          requests:
+            hosts: "4"     # all of them: exclusive
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shared-writer
+spec:
+  restartPolicy: Never
+  containers:
+  - name: writer
+    image: docker.io/library/python:3-alpine
+    command:
+    - python3
+    - -u
+    - -c
+    - |
+      import mmap, os
+      dax = [v for k, v in os.environ.items() if k.startswith("CXL_SHARED_DAX_")][0]
+      size = int([v for k, v in os.environ.items() if k.startswith("CXL_SHARED_SIZE_")][0])
+      fd = os.open(dax, os.O_RDWR)
+      m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+      m[0:6] = b"hello\0"
+      print("wrote: hello")
+    resources:
+      claims:
+      - name: mem
+  resourceClaims:
+  - name: mem
+    resourceClaimName: shared-writer
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: shared-reader
+spec:
+  spec:
+    devices:
+      requests:
+      - name: mem
+        exactly:
+          deviceClassName: cxl-shared-memory
+          selectors:
+          - cel:
+              expression: 'device.attributes["cxl-pool.generic"].serial == "0xc1ae0001"'
+      config:
+      - opaque:
+          driver: cxl-pool.generic
+          parameters:
+            apiVersion: cxl-pool.generic/v1alpha1
+            kind: PoolDeviceConfig
+            readOnly: true
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: shared-reader
+spec:
+  containers:
+  - name: reader
+    image: docker.io/library/python:3-alpine
+    command:
+    - python3
+    - -u
+    - -c
+    - |
+      import mmap, os, time
+      dax = [v for k, v in os.environ.items() if k.startswith("CXL_SHARED_DAX_")][0]
+      size = int([v for k, v in os.environ.items() if k.startswith("CXL_SHARED_SIZE_")][0])
+      fd = os.open(dax, os.O_RDONLY)
+      m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
+      print("read:", bytes(m[0:4096]).split(b"\0", 1)[0].decode(errors="replace"))
+      try:
+          os.open(dax, os.O_RDWR)
+      except PermissionError as e:
+          print("open for writing refused:", e)
+      time.sleep(1e9)
+    resources:
+      claims:
+      - name: mem
+  resourceClaims:
+  - name: mem
+    resourceClaimTemplateName: shared-reader

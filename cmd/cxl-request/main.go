@@ -19,15 +19,22 @@
 // which the plugin mounts into containers that claim the token device
 // "dynamic" (DeviceClass cxl-dynamic). See doc/cxl/POOL.md.
 //
-//	cxl-request memory <size> [--wait D]
-//	cxl-request shared <serial> [--wait D] [--exec CMD ARGS...]
+//	cxl-request memory <size> [--wait D] [--request-id ID]
+//	cxl-request memory <size> --dax [--read-only] [--wait D] [--exec CMD ARGS...]
+//	cxl-request shared <serial> [--exclusive] [--read-only] [--wait D] [--exec CMD ARGS...]
 //	cxl-request fd <lease> --exec CMD ARGS...
 //	cxl-request release <lease>|--all [--wait D]    (or: cxl-release ...)
 //	cxl-request list
 //
+// A memory lease is lent as a NUMA node, or with --dax passed as a devdax
+// fd; a shared lease is passed as a devdax fd. --exclusive takes all of a
+// shared device's "hosts" capacity, so that no other claim can have the
+// device while the lease lives. --read-only opens the fd read-only.
+//
 // It prints the plugin's JSON response line. With --exec the dax device
-// fd of a shared lease is passed to CMD as fd 3, with CXL_LEASE_FD=3,
-// CXL_LEASE, CXL_LEASE_DAX and CXL_LEASE_SIZE in its environment.
+// fd of a dax lease is passed to CMD as fd 3, with CXL_LEASE_FD=3,
+// CXL_LEASE, CXL_LEASE_DAX, CXL_LEASE_SIZE and CXL_LEASE_READONLY (1 or
+// 0) in its environment.
 // Exit codes: 0 ok, 1 error, 2 usage, 3 lease failed or not Ready in time.
 // Without --exec the command's exit code is passed through.
 package main
@@ -68,27 +75,38 @@ type request struct {
 	RequestID string `json:"requestId,omitempty"`
 	Lease     string `json:"lease,omitempty"`
 	All       bool   `json:"all,omitempty"`
+	Mode      string `json:"mode,omitempty"`
+	Exclusive bool   `json:"exclusive,omitempty"`
+	ReadOnly  bool   `json:"readOnly,omitempty"`
 }
 
 type response struct {
-	Lease  string      `json:"lease,omitempty"`
-	State  string      `json:"state,omitempty"`
-	Kind   string      `json:"kind,omitempty"`
-	Node   *int        `json:"node,omitempty"`
-	Size   uint64      `json:"size,omitempty"`
-	Serial string      `json:"serial,omitempty"`
-	Dax    string      `json:"dax,omitempty"`
-	Error  string      `json:"error,omitempty"`
-	Leases *[]response `json:"leases,omitempty"`
+	Lease     string      `json:"lease,omitempty"`
+	State     string      `json:"state,omitempty"`
+	Kind      string      `json:"kind,omitempty"`
+	Mode      string      `json:"mode,omitempty"`
+	Exclusive bool        `json:"exclusive,omitempty"`
+	ReadOnly  bool        `json:"readOnly,omitempty"`
+	Node      *int        `json:"node,omitempty"`
+	Size      uint64      `json:"size,omitempty"`
+	Serial    string      `json:"serial,omitempty"`
+	Dax       string      `json:"dax,omitempty"`
+	Error     string      `json:"error,omitempty"`
+	Leases    *[]response `json:"leases,omitempty"`
 }
 
 const usage = `usage:
-  cxl-request memory <size> [--wait DURATION]
-  cxl-request shared <serial> [--wait DURATION] [--exec CMD ARGS...]
+  cxl-request memory <size> [--wait DURATION] [--request-id ID]
+  cxl-request memory <size> --dax [--read-only] [--wait DURATION] [--exec CMD ARGS...]
+  cxl-request shared <serial> [--exclusive] [--read-only] [--wait DURATION] [--exec CMD ARGS...]
   cxl-request fd <lease> --exec CMD ARGS...
   cxl-request release <lease>|--all [--wait DURATION]   (also: cxl-release ...)
   cxl-request list
 The socket is $CXL_LEASE_SOCKET. --wait 0s returns at once.
+memory: exclusive pool memory, lent as a NUMA node, or with --dax passed
+as a devdax fd. shared: a shared device, passed as a devdax fd;
+--exclusive keeps everybody else off it while the lease lives.
+--read-only: the fd is opened read-only.
 `
 
 func main() {
@@ -116,62 +134,79 @@ func parseArgs(prog string, args []string) (*command, error) {
 	if len(args) == 0 {
 		return nil, errors.New("no command")
 	}
+	cmd, pos, err := parseOptions(args[1:])
+	if err != nil {
+		return nil, err
+	}
+	if err := setCommand(cmd, args[0], pos); err != nil {
+		return nil, err
+	}
+	if err := checkCommand(cmd); err != nil {
+		return nil, err
+	}
+	return cmd, nil
+}
+
+// parseOptions returns a command with the options of args, and the
+// positional arguments. --exec ends the options: the rest is the command
+// to run.
+func parseOptions(args []string) (*command, []string, error) {
 	cmd := &command{}
+	values := map[string]*string{"--wait": &cmd.req.Wait, "--request-id": &cmd.req.RequestID}
+	flags := map[string]*bool{"--all": &cmd.req.All, "--exclusive": &cmd.req.Exclusive, "--read-only": &cmd.req.ReadOnly}
 	var pos []string
-	for i := 1; i < len(args); i++ {
+	for i := 0; i < len(args); i++ {
 		a := args[i]
+		name, val, inline := strings.Cut(a, "=")
+		dst, isValue := values[name]
 		switch {
 		case a == "--exec":
 			cmd.exec = args[i+1:]
 			if len(cmd.exec) == 0 {
-				return nil, errors.New("--exec needs a command")
+				return nil, nil, errors.New("--exec needs a command")
 			}
-			i = len(args)
-		case a == "--wait":
+			return cmd, pos, nil
+		case isValue && inline:
+			*dst = val
+		case isValue:
 			if i+1 >= len(args) {
-				return nil, errors.New("--wait needs a duration")
+				return nil, nil, fmt.Errorf("%s needs a value", name)
 			}
 			i++
-			cmd.req.Wait = args[i]
-		case strings.HasPrefix(a, "--wait="):
-			cmd.req.Wait = strings.TrimPrefix(a, "--wait=")
-		case a == "--request-id":
-			if i+1 >= len(args) {
-				return nil, errors.New("--request-id needs a value")
-			}
-			i++
-			cmd.req.RequestID = args[i]
-		case a == "--all":
-			cmd.req.All = true
+			*dst = args[i]
+		case flags[a] != nil:
+			*flags[a] = true
+		case a == "--dax":
+			cmd.req.Mode = "dax"
 		case strings.HasPrefix(a, "-"):
-			return nil, fmt.Errorf("unknown option %s", a)
+			return nil, nil, fmt.Errorf("unknown option %s", a)
 		default:
 			pos = append(pos, a)
 		}
 	}
-	one := func(what string) (string, error) {
+	return cmd, pos, nil
+}
+
+// setCommand sets the request of the command name with its positional
+// arguments.
+func setCommand(cmd *command, name string, pos []string) error {
+	one := func(what string, dst *string) error {
 		if len(pos) != 1 {
-			return "", fmt.Errorf("%s: expected one %s", args[0], what)
+			return fmt.Errorf("%s: expected one %s", name, what)
 		}
-		return pos[0], nil
+		*dst = pos[0]
+		return nil
 	}
-	var err error
-	switch args[0] {
+	switch name {
 	case "memory":
 		cmd.req.Op, cmd.req.Kind = "lease", "memory"
-		cmd.req.Size, err = one("size")
-		if err == nil && cmd.exec != nil {
-			err = errors.New("--exec is for shared leases")
-		}
+		return one("size", &cmd.req.Size)
 	case "shared":
 		cmd.req.Op, cmd.req.Kind = "lease", "shared"
-		cmd.req.Serial, err = one("serial")
+		return one("serial", &cmd.req.Serial)
 	case "fd":
 		cmd.req.Op = "fd"
-		cmd.req.Lease, err = one("lease")
-		if err == nil && cmd.exec == nil {
-			err = errors.New("fd needs --exec")
-		}
+		return one("lease", &cmd.req.Lease)
 	case "release":
 		cmd.req.Op = "release"
 		switch {
@@ -179,23 +214,47 @@ func parseArgs(prog string, args []string) (*command, error) {
 		case !cmd.req.All && len(pos) == 1:
 			cmd.req.Lease = pos[0]
 		default:
-			err = errors.New("release: expected one lease or --all")
+			return errors.New("release: expected one lease or --all")
 		}
 	case "list":
 		cmd.req.Op = "list"
 		if len(pos) != 0 {
-			err = errors.New("list takes no arguments")
+			return errors.New("list takes no arguments")
 		}
 	default:
-		err = fmt.Errorf("unknown command %q", args[0])
+		return fmt.Errorf("unknown command %q", name)
 	}
-	if err != nil {
-		return nil, err
+	return nil
+}
+
+// checkCommand returns an error if the options do not fit the command.
+func checkCommand(cmd *command) error {
+	dax := cmd.req.Kind == "shared" || cmd.req.Mode == "dax"
+	switch {
+	case cmd.req.Mode != "" && cmd.req.Kind != "memory":
+		return errors.New("--dax is for memory (shared leases are always dax)")
+	case cmd.req.Exclusive && cmd.req.Kind != "shared":
+		return errors.New("--exclusive is for shared (memory leases are exclusive)")
+	case cmd.req.ReadOnly && !dax:
+		return errors.New("--read-only is for shared and memory --dax")
 	}
-	if cmd.exec != nil && cmd.req.Op != "lease" && cmd.req.Op != "fd" {
-		return nil, errors.New("--exec is for shared and fd")
+	return checkExec(cmd, dax)
+}
+
+// checkExec returns an error if --exec does not fit the command: it needs
+// an fd, which only a dax lease and "fd" give.
+func checkExec(cmd *command, dax bool) error {
+	switch {
+	case cmd.exec == nil && cmd.req.Op == "fd":
+		return errors.New("fd needs --exec")
+	case cmd.exec == nil:
+		return nil
+	case cmd.req.Op == "lease" && !dax:
+		return errors.New("--exec is for shared and memory --dax")
+	case cmd.req.Op != "lease" && cmd.req.Op != "fd":
+		return errors.New("--exec is for shared, memory --dax and fd")
 	}
-	return cmd, nil
+	return nil
 }
 
 func run(argv []string, stdout, stderr io.Writer) int {
@@ -356,6 +415,7 @@ func execWithFd(argv []string, fd int, resp *response, stdout, stderr io.Writer)
 		"CXL_LEASE="+resp.Lease,
 		"CXL_LEASE_DAX="+resp.Dax,
 		"CXL_LEASE_SIZE="+strconv.FormatUint(resp.Size, 10),
+		"CXL_LEASE_READONLY="+map[bool]string{false: "0", true: "1"}[resp.ReadOnly],
 	)
 	sigs := make(chan os.Signal, 4)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGQUIT)

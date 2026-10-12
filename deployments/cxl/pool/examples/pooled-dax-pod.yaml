@@ -1,0 +1,54 @@
+# An exclusive CXL memory device of a pool as a devdax device instead of a
+# NUMA node: PoolDeviceConfig mode: dax. kubelet-cxl-plugin gives the
+# container the device node and its path in CXL_POOL_DAX_<SERIAL>; the
+# memory is never onlined. Useful for data that should outlive the pod:
+# the device keeps its bytes until it is written again, also when the
+# next claim gets it on another node.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: pooled-dax
+spec:
+  devices:
+    requests:
+    - name: mem
+      exactly:
+        deviceClassName: cxl-pool-memory
+        capacity:
+          requests:
+            memory: 512Mi
+    config:
+    - opaque:
+        driver: cxl-pool.generic
+        parameters:
+          apiVersion: cxl-pool.generic/v1alpha1
+          kind: PoolDeviceConfig
+          mode: dax
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pooled-dax-consumer
+spec:
+  containers:
+  - name: consumer
+    image: docker.io/library/python:3-alpine
+    command:
+    - python3
+    - -u
+    - -c
+    - |
+      import mmap, os, time
+      dax = [v for k, v in os.environ.items() if k.startswith("CXL_POOL_DAX_")][0]
+      size = int([v for k, v in os.environ.items() if k.startswith("CXL_POOL_SIZE_")][0])
+      fd = os.open(dax, os.O_RDWR)
+      m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+      print("found:", bytes(m[0:4096]).split(b"\0", 1)[0].decode(errors="replace"))
+      m[0:6] = b"hello\0"
+      time.sleep(1e9)
+    resources:
+      claims:
+      - name: mem
+  resourceClaims:
+  - name: mem
+    resourceClaimName: pooled-dax

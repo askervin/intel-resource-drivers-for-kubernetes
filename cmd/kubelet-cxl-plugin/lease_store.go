@@ -43,7 +43,7 @@ const (
 
 // Lease kinds (request "kind").
 const (
-	leaseKindMemory = "memory" // exclusive pool memory, lent as a NUMA node
+	leaseKindMemory = "memory" // exclusive pool memory, lent as a NUMA node or passed as a devdax fd
 	leaseKindShared = "shared" // shared pool device, passed as a devdax fd
 )
 
@@ -74,20 +74,26 @@ func (c *tokenClaim) hasPod(uid string) bool {
 
 // lease is one request of a container.
 type lease struct {
-	ID         string    `json:"id"`
-	TokenClaim string    `json:"tokenClaim"` // uid of the token claim whose socket received it
-	RequestID  string    `json:"requestId,omitempty"`
-	Kind       string    `json:"kind"`
-	Size       string    `json:"size,omitempty"`   // requested quantity (memory)
-	Serial     string    `json:"serial,omitempty"` // 0x<lower-case hex> (shared, or the device of a Ready memory lease)
-	Pod        podRef    `json:"pod"`
-	Container  string    `json:"container"`
-	State      string    `json:"state"`
-	Error      string    `json:"error,omitempty"`
-	Node       int       `json:"node"` // lent NUMA node, -1 if none
-	Bytes      uint64    `json:"bytes,omitempty"`
-	Dax        string    `json:"dax,omitempty"` // /dev/daxX.Y (shared)
-	Created    time.Time `json:"created"`
+	ID         string `json:"id"`
+	TokenClaim string `json:"tokenClaim"` // uid of the token claim whose socket received it
+	RequestID  string `json:"requestId,omitempty"`
+	Kind       string `json:"kind"`
+	Size       string `json:"size,omitempty"`   // requested quantity (memory)
+	Serial     string `json:"serial,omitempty"` // 0x<lower-case hex> (shared, or the device of a Ready memory lease)
+	// Mode is numa or dax ("" in stores written before modes existed:
+	// numa for memory, dax for shared leases).
+	Mode      string    `json:"mode,omitempty"`
+	Exclusive bool      `json:"exclusive,omitempty"` // shared: all of the device's hosts capacity
+	Hosts     string    `json:"hosts,omitempty"`     // exclusive: the hosts capacity requested
+	ReadOnly  bool      `json:"readOnly,omitempty"`  // dax: the fd is opened read-only
+	Pod       podRef    `json:"pod"`
+	Container string    `json:"container"`
+	State     string    `json:"state"`
+	Error     string    `json:"error,omitempty"`
+	Node      int       `json:"node"` // lent NUMA node, -1 if none
+	Bytes     uint64    `json:"bytes,omitempty"`
+	Dax       string    `json:"dax,omitempty"` // /dev/daxX.Y (dax mode)
+	Created   time.Time `json:"created"`
 }
 
 // companionName is the name of the companion claim and pod of a lease.
