@@ -17,14 +17,11 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,30 +66,6 @@ const (
 	defaultRegionRetryDelay = 3 * time.Second
 )
 
-// poolLeaseHooks is what the pool helper tells the lease broker about
-// companion claims (claims with a LendConfig). The hooks are called with
-// the pool helper's lock held and must not call back into it.
-type poolLeaseHooks interface {
-	// OnLending validates the LendConfig against the broker's lease and
-	// marks the lease Lending. An error fails the Prepare.
-	OnLending(cfg *lendConfig) error
-	// OnPrepared marks the lease Ready with the prepared devices.
-	OnPrepared(cfg *lendConfig, devs []preparedPoolDevice)
-	// OnLendFailed records a lend error (kubelet retries the Prepare).
-	OnLendFailed(cfg *lendConfig, err error)
-	// OnReleasing is called when the companion claim is unprepared.
-	OnReleasing(lease string)
-}
-
-// poolLend is the lend of a prepared companion claim, persisted with the
-// claim so that Unprepare can revoke it after a plugin restart.
-type poolLend struct {
-	Lease     string `json:"lease"`
-	Pod       podRef `json:"pod"`
-	Container string `json:"container"`
-	Nodes     []int  `json:"nodes,omitempty"` // lent NUMA nodes (exclusive devices)
-}
-
 type poolDriver struct {
 	name       string // cxl-pool.generic
 	helper     *kubeletplugin.Helper
@@ -104,11 +77,7 @@ type poolDriver struct {
 	mu         sync.Mutex
 	prepared   map[string]*preparedPoolClaim // claim uid -> ...
 	inflight   map[uint64]int                // serials being prepared -> count
-	// lender lends exclusive devices of companion claims to the
-	// requesting container, nil when NRI is not connected.
-	lender Lender
-	// leases is the lease broker, nil when lending is disabled.
-	leases     poolLeaseHooks
+	lender     *claimLender                  // lends companion claims
 	retryDelay time.Duration
 
 	// serials is a snapshot of the serials of prepared and inflight
@@ -126,8 +95,8 @@ type preparedPoolDevice struct {
 	SerialHex string `json:"serialHex"`
 	Shared    bool   `json:"shared"`
 	Size      uint64 `json:"size"`
-	// Mode is poolModeNUMA or poolModeDax ("" in state files written
-	// before modes existed: dax if DaxDevice is set).
+	// Mode is device.ModeNUMA or device.ModeDax ("" in state files
+	// written before modes existed: dax if DaxDevice is set).
 	Mode        string `json:"mode,omitempty"`
 	ReadOnly    bool   `json:"readOnly,omitempty"` // dax: the CDI device node allows reads only
 	Memdev      string `json:"memdev"`
@@ -140,16 +109,6 @@ type preparedPoolDevice struct {
 	CDIDeviceID string `json:"cdiDeviceID"`
 }
 
-// Modes of a prepared pool device (PoolDeviceConfig mode).
-const (
-	// poolModeNUMA onlines the memory as a new NUMA node (exclusive
-	// devices only, their default).
-	poolModeNUMA = "numa"
-	// poolModeDax binds the memory to device_dax: a /dev/daxX.Y that
-	// containers mmap (the only mode of shared devices).
-	poolModeDax = "dax"
-)
-
 // mode returns the mode of a prepared device, also for state files
 // written before modes existed.
 func (d *preparedPoolDevice) mode() string {
@@ -157,29 +116,45 @@ func (d *preparedPoolDevice) mode() string {
 	case d.Mode != "":
 		return d.Mode
 	case d.DaxDevice != "":
-		return poolModeDax
+		return device.ModeDax
 	}
-	return poolModeNUMA
+	return device.ModeNUMA
 }
 
-// poolDeviceConfig is the opaque configuration (kind PoolDeviceConfig)
-// of a pool claim, from the claim or its DeviceClass. It applies to the
-// requests it names, or to all requests of the driver.
-type poolDeviceConfig struct {
-	APIVersion string `json:"apiVersion"`
-	Kind       string `json:"kind"`
-	// Mode is "numa" or "dax"; "" is numa for exclusive devices and dax
-	// for shared devices.
-	Mode string `json:"mode,omitempty"`
-	// ReadOnly makes the dax device node of the container read-only.
-	ReadOnly bool `json:"readOnly,omitempty"`
+// lent returns the device as the lease broker sees it.
+func (d *preparedPoolDevice) lent(driver string) lentDevice {
+	return lentDevice{
+		Driver:    driver,
+		Source:    device.SourcePool,
+		Request:   d.Request,
+		Device:    d.Device,
+		Pool:      d.Pool,
+		Serial:    d.Serial,
+		SerialHex: d.SerialHex,
+		Shared:    d.Shared,
+		Size:      d.Size,
+		Mode:      d.mode(),
+		ReadOnly:  d.ReadOnly,
+		Node:      d.Node,
+		DaxDevice: d.DaxDevice,
+	}
+}
+
+// lentDevices returns the devices of a prepared claim as the lease
+// broker sees them.
+func (p *poolDriver) lentDevices(devs []preparedPoolDevice) []lentDevice {
+	out := make([]lentDevice, 0, len(devs))
+	for i := range devs {
+		out = append(out, devs[i].lent(p.name))
+	}
+	return out
 }
 
 type preparedPoolClaim struct {
 	ClaimName string                      `json:"claimName"` // namespace/name
 	Devices   []preparedPoolDevice        `json:"devices"`
 	Result    kubeletplugin.PrepareResult `json:"result"` // what Prepare returned
-	Lend      *poolLend                   `json:"lend,omitempty"`
+	Lend      *lendRecord                 `json:"lend,omitempty"`
 }
 
 // poolDeviceData is claim.status.devices[].data written by the pool
@@ -213,6 +188,7 @@ func newPoolDriver(name string, mem *memctl.Manager, stateFile string, timeout t
 		timeout:    timeout,
 		probeGrace: defaultMemdevProbeGrace,
 		retryDelay: defaultRegionRetryDelay,
+		lender:     newClaimLender(name),
 		prepared:   map[string]*preparedPoolClaim{},
 		inflight:   map[uint64]int{},
 	}
@@ -242,16 +218,22 @@ func (p *poolDriver) start(ctx context.Context, cdi *cdiapi.Cache, opts ...kubel
 	return nil
 }
 
-// setLending enables lending of companion claims: lender is nil when NRI
-// is not connected (their Prepare then fails), leases is the broker.
-func (p *poolDriver) setLending(lender Lender, leases poolLeaseHooks) {
+// driverName returns the DRA driver name of the pool helper, "" for a
+// nil (disabled) pool helper.
+func (p *poolDriver) driverName() string {
 	if p == nil {
-		return
+		return ""
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.lender = lender
-	p.leases = leases
+	return p.name
+}
+
+// lending returns the lender of the pool helper's companion claims, nil
+// for a nil (disabled) pool helper.
+func (p *poolDriver) lending() *claimLender {
+	if p == nil {
+		return nil
+	}
+	return p.lender
 }
 
 func (p *poolDriver) stop() {
@@ -305,11 +287,8 @@ func (p *poolDriver) prepareClaim(ctx context.Context, claim *resourceapi.Resour
 	uid := string(claim.UID)
 	if pc, ok := p.prepared[uid]; ok {
 		klog.V(3).Infof("%s: claim %s (%s) was already prepared", p.name, pc.ClaimName, uid)
-		if pc.Lend != nil && p.leases != nil {
-			cfg := pc.Lend.config()
-			if err := p.leases.OnLending(cfg); err == nil {
-				p.leases.OnPrepared(cfg, pc.Devices)
-			}
+		if pc.Lend != nil {
+			p.lender.reprepared(pc.Lend, p.lentDevices(pc.Devices))
 		}
 		return pc.Result
 	}
@@ -317,12 +296,12 @@ func (p *poolDriver) prepareClaim(ctx context.Context, claim *resourceapi.Resour
 	if claim.Status.Allocation == nil {
 		return kubeletplugin.PrepareResult{Err: fmt.Errorf("claim %s has no allocation", claimName)}
 	}
-	lend, err := parseLendConfig(claim, p.name)
+	lend, err := p.lender.parse(claim)
 	if err != nil {
 		return kubeletplugin.PrepareResult{Err: fmt.Errorf("%s: preparing claim %s: %w", p.name, claimName, err)}
 	}
 	if lend != nil {
-		if err := p.checkLend(lend); err != nil {
+		if err := p.lender.check(lend); err != nil {
 			err = fmt.Errorf("%s: preparing claim %s: %w", p.name, claimName, err)
 			klog.Error(err)
 			return kubeletplugin.PrepareResult{Err: err}
@@ -354,7 +333,7 @@ func (p *poolDriver) prepareClaim(ctx context.Context, claim *resourceapi.Resour
 		if err != nil {
 			return fail(err)
 		}
-		cfg, err := parsePoolDeviceConfig(claim, p.name, r.Request)
+		cfg, err := parseDeviceConfig(claim, p.name, device.PoolDeviceConfigKind, r.Request)
 		if err != nil {
 			return fail(fmt.Errorf("request %s: %w", r.Request, err))
 		}
@@ -391,22 +370,25 @@ func (p *poolDriver) prepareClaim(ctx context.Context, claim *resourceapi.Resour
 		klog.Infof("%s: claim %s: prepared %s (serial 0x%x, shared %v, mode %s, read-only %v) as %s %s dax %s node %d",
 			p.name, claimName, r.Device, data.Serial, data.Shared, dev.Mode, dev.ReadOnly, dev.Memdev, dev.Region, dev.Dax, dev.Node)
 	}
+	devs := p.lentDevices(pc.Devices)
 	if lend != nil {
-		pl, err := p.lend(ctx, lend, pc.Devices)
+		rec, err := p.lender.lend(ctx, lend, devs)
 		if err != nil {
-			p.revoke(ctx, pl, claimName)
-			if p.leases != nil {
-				p.leases.OnLendFailed(lend, err)
+			if rerr := p.lender.revoke(ctx, rec, claimName); rerr != nil {
+				klog.Errorf("%s: claim %s: %v", p.name, claimName, rerr)
 			}
+			p.lender.failed(lend, err)
 			return fail(err)
 		}
-		pc.Lend = pl
+		pc.Lend = rec
 	}
 	p.prepared[uid] = pc
 	if err := p.sync(); err != nil {
 		delete(p.prepared, uid)
 		if pc.Lend != nil {
-			p.revoke(ctx, pc.Lend, claimName)
+			if rerr := p.lender.revoke(ctx, pc.Lend, claimName); rerr != nil {
+				klog.Errorf("%s: claim %s: %v", p.name, claimName, rerr)
+			}
 		}
 		res := fail(err)
 		if err := p.sync(); err != nil {
@@ -414,161 +396,10 @@ func (p *poolDriver) prepareClaim(ctx context.Context, claim *resourceapi.Resour
 		}
 		return res
 	}
-	if lend != nil && p.leases != nil {
-		p.leases.OnPrepared(lend, pc.Devices)
+	if lend != nil {
+		p.lender.prepared(lend, devs)
 	}
 	return pc.Result
-}
-
-// parseLendConfig returns the LendConfig of a companion claim, nil if the
-// claim has none. Only claim-level config counts: a class must not lend.
-func parseLendConfig(claim *resourceapi.ResourceClaim, driver string) (*lendConfig, error) {
-	var found *lendConfig
-	for _, c := range claim.Status.Allocation.Devices.Config {
-		if c.Opaque == nil || c.Opaque.Driver != driver {
-			continue
-		}
-		var cfg lendConfig
-		if err := json.Unmarshal(c.Opaque.Parameters.Raw, &cfg); err != nil {
-			return nil, fmt.Errorf("invalid opaque config for %s: %w", driver, err)
-		}
-		if cfg.Kind != device.LendConfigKind {
-			continue
-		}
-		switch {
-		case c.Source != resourceapi.AllocationConfigSourceClaim:
-			return nil, fmt.Errorf("%s from %s config is not allowed, only from the claim", device.LendConfigKind, c.Source)
-		case cfg.APIVersion != driver+"/v1alpha1":
-			return nil, fmt.Errorf("%s: apiVersion %q, expected %q", device.LendConfigKind, cfg.APIVersion, driver+"/v1alpha1")
-		case cfg.Lease == "" || cfg.Container == "" || cfg.Pod.UID == "" || cfg.Pod.Name == "":
-			return nil, fmt.Errorf("%s: lease, pod.name, pod.uid and container are required", device.LendConfigKind)
-		case cfg.Pod.Namespace != claim.Namespace:
-			return nil, fmt.Errorf("%s: pod namespace %q is not the claim's namespace %q", device.LendConfigKind, cfg.Pod.Namespace, claim.Namespace)
-		case found != nil:
-			return nil, fmt.Errorf("more than one %s", device.LendConfigKind)
-		}
-		found = &cfg
-	}
-	return found, nil
-}
-
-// parsePoolDeviceConfig returns the PoolDeviceConfig of the driver that
-// applies to an allocation result's request: class configs first, then
-// claim configs; a later one replaces an earlier one. A config applies to
-// the requests it lists (a request "r" also covers its subrequests "r/s"),
-// or to all requests if it lists none. Without one it returns the zero
-// config.
-func parsePoolDeviceConfig(claim *resourceapi.ResourceClaim, driver, request string) (*poolDeviceConfig, error) {
-	parent, _, _ := strings.Cut(request, "/")
-	found := &poolDeviceConfig{}
-	for _, source := range []resourceapi.AllocationConfigSource{resourceapi.AllocationConfigSourceClass, resourceapi.AllocationConfigSourceClaim} {
-		for _, c := range claim.Status.Allocation.Devices.Config {
-			if c.Source != source || c.Opaque == nil || c.Opaque.Driver != driver {
-				continue
-			}
-			if len(c.Requests) > 0 && !slices.Contains(c.Requests, request) && !slices.Contains(c.Requests, parent) {
-				continue
-			}
-			var head struct {
-				Kind string `json:"kind"`
-			}
-			if err := json.Unmarshal(c.Opaque.Parameters.Raw, &head); err != nil {
-				return nil, fmt.Errorf("invalid opaque config for %s: %w", driver, err)
-			}
-			if head.Kind != device.PoolDeviceConfigKind {
-				continue
-			}
-			cfg := &poolDeviceConfig{}
-			dec := json.NewDecoder(bytes.NewReader(c.Opaque.Parameters.Raw))
-			dec.DisallowUnknownFields()
-			if err := dec.Decode(cfg); err != nil {
-				return nil, fmt.Errorf("invalid %s from %s config: %w", device.PoolDeviceConfigKind, source, err)
-			}
-			if cfg.APIVersion != driver+"/v1alpha1" {
-				return nil, fmt.Errorf("%s: apiVersion %q, expected %q", device.PoolDeviceConfigKind, cfg.APIVersion, driver+"/v1alpha1")
-			}
-			found = cfg
-		}
-	}
-	return found, nil
-}
-
-// modeFor returns the mode of a device with the config: shared devices are
-// dax only (two kernels must never online the same memory), and read-only
-// is a property of a dax device node.
-func (cfg *poolDeviceConfig) modeFor(shared bool) (string, error) {
-	mode := cfg.Mode
-	switch {
-	case mode == "" && shared:
-		mode = poolModeDax
-	case mode == "":
-		mode = poolModeNUMA
-	case mode != poolModeNUMA && mode != poolModeDax:
-		return "", fmt.Errorf("%s: invalid mode %q (%s or %s)", device.PoolDeviceConfigKind, cfg.Mode, poolModeNUMA, poolModeDax)
-	}
-	switch {
-	case shared && mode != poolModeDax:
-		return "", fmt.Errorf("%s: mode %s: a shared device is used as %s only", device.PoolDeviceConfigKind, mode, poolModeDax)
-	case cfg.ReadOnly && mode != poolModeDax:
-		return "", fmt.Errorf("%s: readOnly needs mode %s", device.PoolDeviceConfigKind, poolModeDax)
-	}
-	return mode, nil
-}
-
-// config returns the LendConfig of a stored lend.
-func (l *poolLend) config() *lendConfig {
-	return &lendConfig{Kind: device.LendConfigKind, Lease: l.Lease, Pod: l.Pod, Container: l.Container}
-}
-
-// checkLend checks that a companion claim can be lent before any device
-// is touched.
-func (p *poolDriver) checkLend(cfg *lendConfig) error {
-	if p.leases == nil {
-		return fmt.Errorf("lease %s: lending to running containers is disabled", cfg.Lease)
-	}
-	if p.lender == nil {
-		return fmt.Errorf("lease %s: %w", cfg.Lease, errLendingUnavailable)
-	}
-	return p.leases.OnLending(cfg)
-}
-
-// lend lends the NUMA nodes of a companion claim to the requesting
-// container. Dax devices are passed as an fd by the broker.
-// The returned lend lists the nodes lent so far, also on error.
-func (p *poolDriver) lend(ctx context.Context, cfg *lendConfig, devs []preparedPoolDevice) (*poolLend, error) {
-	pl := &poolLend{Lease: cfg.Lease, Pod: cfg.Pod, Container: cfg.Container}
-	for _, d := range devs {
-		if d.mode() != poolModeNUMA || d.Node < 0 {
-			continue
-		}
-		pl.Nodes = append(pl.Nodes, d.Node)
-		if err := p.lender.LendNode(ctx, cfg.Pod.UID, cfg.Container, d.Node); err != nil {
-			return pl, fmt.Errorf("lease %s: lending node %d to %s/%s/%s: %w", cfg.Lease, d.Node, cfg.Pod.Namespace, cfg.Pod.Name, cfg.Container, err)
-		}
-		klog.Infof("%s: lease %s: lent node %d to %s/%s/%s", p.name, cfg.Lease, d.Node, cfg.Pod.Namespace, cfg.Pod.Name, cfg.Container)
-	}
-	return pl, nil
-}
-
-// revoke revokes the lent nodes of a lend. Without NRI the nodes cannot
-// be revoked: the release then migrates the pages anyway, but the stale
-// node stays in the container's cpuset.mems.
-func (p *poolDriver) revoke(ctx context.Context, pl *poolLend, claimName string) error {
-	if pl == nil || len(pl.Nodes) == 0 {
-		return nil
-	}
-	if p.lender == nil {
-		klog.Warningf("%s: claim %s: lease %s: %v, cannot revoke nodes %v from %s/%s/%s",
-			p.name, claimName, pl.Lease, errLendingUnavailable, pl.Nodes, pl.Pod.Namespace, pl.Pod.Name, pl.Container)
-		return nil
-	}
-	var errs []error
-	for _, n := range pl.Nodes {
-		if err := p.lender.RevokeNode(ctx, pl.Pod.UID, pl.Container, n); err != nil {
-			errs = append(errs, fmt.Errorf("lease %s: revoking node %d from %s/%s/%s: %w", pl.Lease, n, pl.Pod.Namespace, pl.Pod.Name, pl.Container, err))
-		}
-	}
-	return errors.Join(errs...)
 }
 
 // isAddDevError matches the transient region creation failure right
@@ -689,7 +520,7 @@ func (p *poolDriver) prepareDevice(ctx context.Context, r *resourceapi.DeviceReq
 		Node:        -1,
 		CDIDeviceID: poolCDIDeviceID(data.Serial, data.ReadOnly),
 	}
-	if data.Mode == poolModeDax {
+	if data.Mode == device.ModeDax {
 		// device_dax: never onlined as RAM (shared memory must never be).
 		ri, err := p.mem.CreateRegion(ctx, memdev, memctl.ModeDevDax, "")
 		if err != nil {
@@ -714,26 +545,12 @@ func (p *poolDriver) prepareDevice(ctx context.Context, r *resourceapi.DeviceReq
 	}
 	dev.Region, dev.Dax, dev.Node = ri.Region, ri.Dax, ri.Node
 	if dev.Node < 0 {
-		dev.Node = p.blocksNode(ri.Blocks)
+		dev.Node = p.mem.BlocksNode(ri.Blocks)
 	}
 	if dev.Node < 0 {
 		return nil, fmt.Errorf("%s: cannot find the NUMA node of %s", memdev, ri.Region)
 	}
 	return dev, nil
-}
-
-// blocksNode returns the NUMA node of online memory blocks
-// (/sys/devices/system/memory/memoryN/nodeM), -1 if not found.
-func (p *poolDriver) blocksNode(blocks []int) int {
-	for _, b := range blocks {
-		m, _ := filepath.Glob(filepath.Join(p.mem.SysRoot, "devices", "system", "memory", "memory"+strconv.Itoa(b), "node*"))
-		for _, path := range m {
-			if n, err := strconv.Atoi(strings.TrimPrefix(filepath.Base(path), "node")); err == nil {
-				return n
-			}
-		}
-	}
-	return -1
 }
 
 // release makes the memdev with the serial removable. A memdev that is
@@ -770,12 +587,10 @@ func (p *poolDriver) unprepareClaim(ctx context.Context, uid string) error {
 		return nil
 	}
 	if pc.Lend != nil {
-		if p.leases != nil {
-			p.leases.OnReleasing(pc.Lend.Lease)
-		}
+		p.lender.releasing(pc.Lend.Lease)
 		// Revoke before the release: offlining memory that the
 		// container still has in cpuset.mems leaves a stale node there.
-		if err := p.revoke(ctx, pc.Lend, pc.ClaimName); err != nil {
+		if err := p.lender.revoke(ctx, pc.Lend, pc.ClaimName); err != nil {
 			err = fmt.Errorf("%s: unpreparing claim %s: %w", p.name, pc.ClaimName, err)
 			klog.Error(err)
 			return err
@@ -823,42 +638,25 @@ func poolCDIDeviceID(serial uint64, readOnly bool) string {
 
 // poolCDIDevice returns the CDI device of a prepared pool device. A dax
 // device of a shared device sets CXL_SHARED_*, of an exclusive device
-// CXL_POOL_*. A read-only one gets the device node with permissions "r":
-// the runtime turns that into a device cgroup rule that refuses opens for
-// writing, whatever the container's capabilities.
+// CXL_POOL_* (daxCDIDevice).
 func poolCDIDevice(d *preparedPoolDevice) cdiSpecs.Device {
-	x := strings.ToUpper(d.SerialHex)
-	serial := "0x" + d.SerialHex
-	edits := cdiSpecs.ContainerEdits{}
-	if d.mode() == poolModeDax {
+	name := poolCDIDeviceName(d.Serial, d.ReadOnly)
+	if d.mode() == device.ModeDax {
 		prefix := "CXL_POOL_"
 		if d.Shared {
 			prefix = "CXL_SHARED_"
 		}
-		edits.Env = []string{
-			prefix + "DAX_" + x + "=" + d.DaxDevice,
-			prefix + "SIZE_" + x + "=" + strconv.FormatUint(d.Size, 10),
-			prefix + "SERIAL_" + x + "=" + serial,
-		}
-		node := &cdiSpecs.DeviceNode{
-			Path:  d.DaxDevice,
-			Type:  "c",
-			Major: int64(d.DaxMajor),
-			Minor: int64(d.DaxMinor),
-		}
-		if d.ReadOnly {
-			edits.Env = append(edits.Env, prefix+"READONLY_"+x+"=1")
-			node.Permissions = "r"
-		}
-		edits.DeviceNodes = []*cdiSpecs.DeviceNode{node}
-	} else {
-		edits.Env = []string{
+		return daxCDIDevice(name, prefix, d.SerialHex, d.DaxDevice, d.DaxMajor, d.DaxMinor, d.Size, d.ReadOnly)
+	}
+	x := strings.ToUpper(d.SerialHex)
+	edits := cdiSpecs.ContainerEdits{
+		Env: []string{
 			"CXL_POOL_NODE_" + x + "=" + strconv.Itoa(d.Node),
 			"CXL_POOL_SIZE_" + x + "=" + strconv.FormatUint(d.Size, 10),
-			"CXL_POOL_SERIAL_" + x + "=" + serial,
-		}
+			"CXL_POOL_SERIAL_" + x + "=0x" + d.SerialHex,
+		},
 	}
-	return cdiSpecs.Device{Name: poolCDIDeviceName(d.Serial, d.ReadOnly), ContainerEdits: edits}
+	return cdiSpecs.Device{Name: name, ContainerEdits: edits}
 }
 
 // buildCDISpec builds the CDI spec of all prepared pool devices, one CDI
@@ -912,18 +710,7 @@ func (p *poolDriver) writeCDISpec() error {
 }
 
 func (p *poolDriver) save() error {
-	data, err := json.MarshalIndent(p.prepared, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encoding prepared pool claims: %w", err)
-	}
-	tmp := p.stateFile + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return fmt.Errorf("writing %s: %w", tmp, err)
-	}
-	if err := os.Rename(tmp, p.stateFile); err != nil {
-		return fmt.Errorf("renaming %s: %w", tmp, err)
-	}
-	return nil
+	return writeJSONFile(p.stateFile, p.prepared)
 }
 
 func (p *poolDriver) load() error {

@@ -51,10 +51,11 @@ import (
 // The lease broker serves the lease sockets of token claims. A request
 // from a container creates, in the container's namespace, a ResourceClaim
 // and a companion pause pod "cxl-lease-<id>" pinned to this node. The
-// scheduler allocates a pool device to the claim, the pool controller
-// attaches it, and kubelet prepares the claim through the pool helper,
-// which lends the device to the requesting container (pool.go hooks).
-// Deleting the companion releases it again. See doc/cxl/POOL.md.
+// scheduler allocates a local memdev (cxl.generic) or a pool device to the
+// claim, the pool controller attaches a pool device, and kubelet prepares
+// the claim through the driver of the device, which lends the memory to
+// the requesting container (leaseHooks, lending.go). Deleting the
+// companion releases it again. See doc/cxl/POOL.md and doc/cxl/LOCAL.md.
 
 const (
 	// Labels of the companion claim and pod.
@@ -64,11 +65,17 @@ const (
 	// requesterAnnotation is <namespace>/<pod>/<container> for humans.
 	requesterAnnotation = "cxl-pool.generic/requester"
 
-	companionClaimRef   = "lease" // pod.spec.resourceClaims[0].name and request name
-	companionContainer  = "pause"
-	poolMemoryClass     = "cxl-pool-memory"
-	poolSharedClass     = "cxl-shared-memory"
-	leaseCloseTimeout   = 30 * time.Second
+	companionClaimRef  = "lease" // pod.spec.resourceClaims[0].name and request name
+	companionContainer = "pause"
+	poolMemoryClass    = "cxl-pool-memory"
+	poolSharedClass    = "cxl-shared-memory"
+	localMemoryClass   = "cxl-local-memory"
+	localDaxClass      = "cxl-local-dax"
+	// leaseCloseTimeout bounds how long the Unprepare of a token claim
+	// waits for its leases to be revoked and their companions to be
+	// deleted (not gone: a companion of a local lease is unprepared by
+	// cxl.generic, whose calls the kubelet plugin helper serializes).
+	leaseCloseTimeout   = 5 * time.Second
 	leaseReconcileEvery = 60 * time.Second
 	// leaseCreatingGrace is how long a lease may stay Creating before the
 	// reconcile treats it as left over by a crash.
@@ -87,14 +94,21 @@ const poolHostsCapacity resourceapi.QualifiedName = "hosts"
 var (
 	errLendingUnavailable = errors.New("lending unavailable: NRI not connected")
 	errNotOurPod          = errors.New("not a container of the claim's pod")
+	errPoolDisabled       = errors.New("pool helper disabled (--pool-driver-name)")
 )
 
 // leaseRequest is one request line on a lease socket.
 type leaseRequest struct {
-	Op        string `json:"op"`             // lease | release | list | fd
-	Kind      string `json:"kind,omitempty"` // memory | shared
-	Size      string `json:"size,omitempty"` // memory: quantity
-	Serial    string `json:"serial,omitempty"`
+	Op   string `json:"op"`             // lease | release | list | fd
+	Kind string `json:"kind,omitempty"` // memory | shared
+	Size string `json:"size,omitempty"` // memory: quantity
+	// Serial is the device of a shared lease, and optionally selects
+	// the device of a memory lease.
+	Serial string `json:"serial,omitempty"`
+	// Source of a memory lease: pool ("", pool devices), local (memdevs
+	// of this node) or any (local if one fits, else pool). Shared leases
+	// are pool leases.
+	Source    string `json:"source,omitempty"`
 	Wait      string `json:"wait,omitempty"` // Go duration, "" = broker default
 	RequestID string `json:"requestId,omitempty"`
 	Lease     string `json:"lease,omitempty"`
@@ -115,6 +129,7 @@ type leaseResponse struct {
 	Lease     string           `json:"lease,omitempty"`
 	State     string           `json:"state,omitempty"`
 	Kind      string           `json:"kind,omitempty"`
+	Source    string           `json:"source,omitempty"` // requested, or allocated once Ready
 	Mode      string           `json:"mode,omitempty"`
 	Exclusive bool             `json:"exclusive,omitempty"`
 	ReadOnly  bool             `json:"readOnly,omitempty"`
@@ -134,7 +149,8 @@ type daxFd struct {
 }
 
 // lendConfig is the opaque configuration (kind LendConfig) of a
-// companion claim, for the pool driver.
+// companion claim, for the driver that prepares it (apiVersion
+// <driver>/v1alpha1).
 type lendConfig struct {
 	APIVersion string `json:"apiVersion"`
 	Kind       string `json:"kind"`
@@ -151,7 +167,7 @@ type brokerConfig struct {
 	RequestBin  string        // host path of cxl-request
 	Image       string        // companion image
 	WaitDefault time.Duration
-	PoolDriver  string // cxl-pool.generic
+	PoolDriver  string // cxl-pool.generic, "" when the pool helper is disabled
 }
 
 type broker struct {
@@ -161,6 +177,7 @@ type broker struct {
 	lender    Lender
 	listeners map[string]*net.UnixListener // token claim uid -> socket
 	releasing map[string]bool              // lease id -> release goroutine runs
+	deleting  map[string]bool              // lease id -> revoked, companion deletion requested
 	changed   chan struct{}                // closed and replaced on every lease change
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -185,9 +202,6 @@ func newBroker(cfg brokerConfig) (*broker, error) {
 	if cfg.Image == "" {
 		cfg.Image = defaultCompanionImage
 	}
-	if cfg.PoolDriver == "" {
-		return nil, errors.New("lease broker: no pool driver name")
-	}
 	if err := os.MkdirAll(filepath.Join(cfg.DataDir, leaseDirName), 0755); err != nil {
 		return nil, fmt.Errorf("lease broker: %w", err)
 	}
@@ -201,6 +215,7 @@ func newBroker(cfg brokerConfig) (*broker, error) {
 		store:           store,
 		listeners:       map[string]*net.UnixListener{},
 		releasing:       map[string]bool{},
+		deleting:        map[string]bool{},
 		changed:         make(chan struct{}),
 		ctx:             ctx,
 		cancel:          cancel,
@@ -503,13 +518,14 @@ func (b *broker) parseWait(s string) (time.Duration, error) {
 }
 
 // leaseOptions checks the kind and options of a request and sets them on
-// the lease: a memory lease is numa (lent as a NUMA node) or dax, a shared
-// lease is dax and may be exclusive, and read-only is for dax leases.
+// the lease: a memory lease comes from a source and is numa (lent as a
+// NUMA node) or dax, a shared lease is a dax pool lease and may be
+// exclusive, and read-only is for dax leases.
 func (b *broker) leaseOptions(l *lease, req *leaseRequest) error {
 	var err error
 	switch req.Kind {
 	case leaseKindMemory:
-		err = memoryLeaseOptions(l, req)
+		err = b.memoryLeaseOptions(l, req)
 	case leaseKindShared:
 		err = b.sharedLeaseOptions(l, req)
 	default:
@@ -518,30 +534,47 @@ func (b *broker) leaseOptions(l *lease, req *leaseRequest) error {
 	if err != nil {
 		return err
 	}
-	if req.ReadOnly && l.Mode != poolModeDax {
-		return fmt.Errorf("readOnly needs a dax lease (shared, or memory with mode %s)", poolModeDax)
+	if req.ReadOnly && l.Mode != device.ModeDax {
+		return fmt.Errorf("readOnly needs a dax lease (shared, or memory with mode %s)", device.ModeDax)
 	}
 	l.ReadOnly = req.ReadOnly
 	return nil
 }
 
-// memoryLeaseOptions sets the size and the mode of a memory lease.
-func memoryLeaseOptions(l *lease, req *leaseRequest) error {
+// memoryLeaseOptions sets the source, size, mode and the optional serial
+// of a memory lease.
+func (b *broker) memoryLeaseOptions(l *lease, req *leaseRequest) error {
+	switch req.Source {
+	case "", device.SourcePool:
+		if b.cfg.PoolDriver == "" {
+			return errPoolDisabled
+		}
+		l.Source = device.SourcePool
+	case device.SourceLocal, leaseSourceAny:
+		l.Source = req.Source
+	default:
+		return fmt.Errorf("invalid source %q (%s, %s or %s)", req.Source, device.SourceLocal, device.SourcePool, leaseSourceAny)
+	}
 	q, err := resource.ParseQuantity(req.Size)
 	if err != nil || q.Sign() <= 0 {
 		return fmt.Errorf("invalid size %q", req.Size)
 	}
 	l.Size = q.String()
 	switch req.Mode {
-	case "", poolModeNUMA:
-		l.Mode = poolModeNUMA
-	case poolModeDax:
-		l.Mode = poolModeDax
+	case "", device.ModeNUMA:
+		l.Mode = device.ModeNUMA
+	case device.ModeDax:
+		l.Mode = device.ModeDax
 	default:
-		return fmt.Errorf("invalid mode %q (%s or %s)", req.Mode, poolModeNUMA, poolModeDax)
+		return fmt.Errorf("invalid mode %q (%s or %s)", req.Mode, device.ModeNUMA, device.ModeDax)
 	}
 	if req.Exclusive {
 		return errors.New("exclusive is for shared leases (a memory lease is exclusive)")
+	}
+	if req.Serial != "" {
+		if l.Serial, err = normalizeSerial(req.Serial); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -549,15 +582,22 @@ func memoryLeaseOptions(l *lease, req *leaseRequest) error {
 // sharedLeaseOptions sets the serial of a shared lease, and the hosts
 // capacity to request if it is exclusive.
 func (b *broker) sharedLeaseOptions(l *lease, req *leaseRequest) error {
+	if req.Source != "" && req.Source != device.SourcePool {
+		return fmt.Errorf("source %s: a shared lease is a %s lease (a local slice is shared through a ResourceClaim)", req.Source, device.SourcePool)
+	}
+	if b.cfg.PoolDriver == "" {
+		return errPoolDisabled
+	}
+	l.Source = device.SourcePool
 	serial, err := normalizeSerial(req.Serial)
 	if err != nil {
 		return err
 	}
 	l.Serial = serial
-	if req.Mode != "" && req.Mode != poolModeDax {
-		return fmt.Errorf("mode %s: a shared lease is %s only", req.Mode, poolModeDax)
+	if req.Mode != "" && req.Mode != device.ModeDax {
+		return fmt.Errorf("mode %s: a shared lease is %s only", req.Mode, device.ModeDax)
 	}
-	l.Mode = poolModeDax
+	l.Mode = device.ModeDax
 	if req.Exclusive {
 		hosts, err := b.sharedHosts(serial)
 		if err != nil {
@@ -626,7 +666,7 @@ func normalizeSerial(s string) (string, error) {
 
 // leaseInfo is the response of a lease. Called with b.mu held.
 func leaseInfo(l *lease) *leaseResponse {
-	r := &leaseResponse{Lease: l.ID, State: l.State, Kind: l.Kind, Mode: l.Mode, Exclusive: l.Exclusive, ReadOnly: l.ReadOnly,
+	r := &leaseResponse{Lease: l.ID, State: l.State, Kind: l.Kind, Source: l.source(), Mode: l.Mode, Exclusive: l.Exclusive, ReadOnly: l.ReadOnly,
 		Serial: l.Serial, Dax: l.Dax, Error: l.Error, Size: l.Bytes}
 	if l.Node >= 0 {
 		n := l.Node
@@ -689,8 +729,8 @@ func (b *broker) requestLease(claimUID string, ref containerRef, req *leaseReque
 	}
 	b.notify()
 	b.mu.Unlock()
-	klog.Infof("lease broker: lease %s: %s/%s/%s requests %s %s%s (mode %s, exclusive %v, read-only %v)",
-		l.ID, l.Pod.Namespace, l.Pod.Name, l.Container, l.Kind, l.Size, l.Serial, l.Mode, l.Exclusive, l.ReadOnly)
+	klog.Infof("lease broker: lease %s: %s/%s/%s requests %s %s%s (source %s, mode %s, exclusive %v, read-only %v)",
+		l.ID, l.Pod.Namespace, l.Pod.Name, l.Container, l.Kind, l.Size, l.Serial, l.Source, l.Mode, l.Exclusive, l.ReadOnly)
 
 	if err := b.createCompanion(l); err != nil {
 		klog.Errorf("lease broker: lease %s: %v", l.ID, err)
@@ -866,41 +906,9 @@ func (b *broker) companionObjects(l *lease) (*resourceapi.ResourceClaim, *corev1
 	claimOwner := owner
 	claimOwner.Controller = ptr(true)
 
-	configs, err := b.companionConfigs(l)
+	req, configs, err := b.companionRequest(l)
 	if err != nil {
 		return nil, nil, err
-	}
-	req := resourceapi.DeviceRequest{Name: companionClaimRef}
-	switch l.Kind {
-	case leaseKindMemory:
-		q, err := resource.ParseQuantity(l.Size)
-		if err != nil {
-			return nil, nil, err
-		}
-		req.Exactly = &resourceapi.ExactDeviceRequest{
-			DeviceClassName: poolMemoryClass,
-			Capacity: &resourceapi.CapacityRequirements{
-				Requests: map[resourceapi.QualifiedName]resource.Quantity{"memory": q},
-			},
-		}
-	case leaseKindShared:
-		req.Exactly = &resourceapi.ExactDeviceRequest{
-			DeviceClassName: poolSharedClass,
-			Selectors: []resourceapi.DeviceSelector{{
-				CEL: &resourceapi.CELDeviceSelector{
-					Expression: fmt.Sprintf(`device.attributes[%q].serial == %q`, b.cfg.PoolDriver, l.Serial),
-				},
-			}},
-		}
-		if l.Exclusive {
-			hosts, err := resource.ParseQuantity(l.Hosts)
-			if err != nil {
-				return nil, nil, fmt.Errorf("hosts %q: %w", l.Hosts, err)
-			}
-			req.Exactly.Capacity = &resourceapi.CapacityRequirements{
-				Requests: map[resourceapi.QualifiedName]resource.Quantity{poolHostsCapacity: hosts},
-			}
-		}
 	}
 	claim := &resourceapi.ResourceClaim{
 		ObjectMeta: metav1.ObjectMeta{
@@ -912,7 +920,7 @@ func (b *broker) companionObjects(l *lease) (*resourceapi.ResourceClaim, *corev1
 		},
 		Spec: resourceapi.ResourceClaimSpec{
 			Devices: resourceapi.DeviceClaim{
-				Requests: []resourceapi.DeviceRequest{req},
+				Requests: []resourceapi.DeviceRequest{*req},
 				Config:   configs,
 			},
 		},
@@ -922,9 +930,11 @@ func (b *broker) companionObjects(l *lease) (*resourceapi.ResourceClaim, *corev1
 	// reach Running on the e2e VMs (CFS throttling of the container start),
 	// which delays the release of a lease whose companion has not started
 	// yet; with 100m it takes ~2 s (plan-3-cxl-live-attach, W2 finding 3).
+	// The memory limit leaves room for runc init, which needs about 9 MiB
+	// in the container's cgroup.
 	res := corev1.ResourceList{
 		corev1.ResourceCPU:    resource.MustParse("100m"),
-		corev1.ResourceMemory: resource.MustParse("8Mi"),
+		corev1.ResourceMemory: resource.MustParse("16Mi"),
 	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -960,41 +970,130 @@ func (b *broker) companionObjects(l *lease) (*resourceapi.ResourceClaim, *corev1
 	return claim, pod, nil
 }
 
-// companionConfigs returns the opaque configs of a companion claim: the
-// LendConfig, and for a dax lease the PoolDeviceConfig with its mode and
-// read-only setting.
-func (b *broker) companionConfigs(l *lease) ([]resourceapi.DeviceClaimConfiguration, error) {
+// companionSources returns the sources of the devices that the companion
+// claim of a lease accepts, the preferred one first.
+func (b *broker) companionSources(l *lease) []string {
+	switch l.Source {
+	case device.SourceLocal:
+		return []string{device.SourceLocal}
+	case leaseSourceAny:
+		if b.cfg.PoolDriver == "" {
+			return []string{device.SourceLocal}
+		}
+		return []string{device.SourceLocal, device.SourcePool}
+	}
+	return []string{device.SourcePool}
+}
+
+// companionRequest returns the device request and the opaque configs of
+// the companion claim of a lease. A lease with one source gets an exact
+// request; with more, a request with one subrequest per source in order
+// of preference (firstAvailable), and configs that apply to the
+// subrequest of their driver only.
+func (b *broker) companionRequest(l *lease) (*resourceapi.DeviceRequest, []resourceapi.DeviceClaimConfiguration, error) {
+	sources := b.companionSources(l)
+	req := &resourceapi.DeviceRequest{Name: companionClaimRef}
+	var configs []resourceapi.DeviceClaimConfiguration
+	for _, source := range sources {
+		exact, driver, objs, err := b.companionDevices(l, source)
+		if err != nil {
+			return nil, nil, err
+		}
+		var requests []string
+		if len(sources) == 1 {
+			req.Exactly = exact
+		} else {
+			req.FirstAvailable = append(req.FirstAvailable, resourceapi.DeviceSubRequest{
+				Name:            source,
+				DeviceClassName: exact.DeviceClassName,
+				Selectors:       exact.Selectors,
+				Capacity:        exact.Capacity,
+			})
+			requests = []string{companionClaimRef + "/" + source}
+		}
+		for _, obj := range objs {
+			params, err := json.Marshal(obj)
+			if err != nil {
+				return nil, nil, err
+			}
+			configs = append(configs, resourceapi.DeviceClaimConfiguration{
+				Requests: requests,
+				DeviceConfiguration: resourceapi.DeviceConfiguration{
+					Opaque: &resourceapi.OpaqueDeviceConfiguration{
+						Driver:     driver,
+						Parameters: runtime.RawExtension{Raw: params},
+					},
+				},
+			})
+		}
+	}
+	return req, configs, nil
+}
+
+// companionDevices returns what the companion claim of a lease requests
+// from one source: the device class, selectors and capacity, the driver
+// of the devices, and its opaque configs: the LendConfig, and for a dax
+// lease the device config with the mode and read-only setting.
+func (b *broker) companionDevices(l *lease, source string) (*resourceapi.ExactDeviceRequest, string, []any, error) {
+	driver, configKind := b.cfg.PoolDriver, device.PoolDeviceConfigKind
+	exact := &resourceapi.ExactDeviceRequest{}
+	switch {
+	case source == device.SourceLocal:
+		driver, configKind = device.DriverName, device.LocalDeviceConfigKind
+		exact.DeviceClassName = localMemoryClass
+		if l.Mode == device.ModeDax {
+			exact.DeviceClassName = localDaxClass
+		}
+	case b.cfg.PoolDriver == "":
+		return nil, "", nil, errPoolDisabled
+	case l.Kind == leaseKindShared:
+		exact.DeviceClassName = poolSharedClass
+	default:
+		exact.DeviceClassName = poolMemoryClass
+	}
+	switch l.Kind {
+	case leaseKindMemory:
+		q, err := resource.ParseQuantity(l.Size)
+		if err != nil {
+			return nil, "", nil, err
+		}
+		exact.Capacity = &resourceapi.CapacityRequirements{
+			Requests: map[resourceapi.QualifiedName]resource.Quantity{device.CapacityMemory: q},
+		}
+	case leaseKindShared:
+		if l.Exclusive {
+			hosts, err := resource.ParseQuantity(l.Hosts)
+			if err != nil {
+				return nil, "", nil, fmt.Errorf("hosts %q: %w", l.Hosts, err)
+			}
+			exact.Capacity = &resourceapi.CapacityRequirements{
+				Requests: map[resourceapi.QualifiedName]resource.Quantity{poolHostsCapacity: hosts},
+			}
+		}
+	}
+	if l.Serial != "" {
+		exact.Selectors = []resourceapi.DeviceSelector{{
+			CEL: &resourceapi.CELDeviceSelector{
+				Expression: fmt.Sprintf(`device.attributes[%q].serial == %q`, driver, l.Serial),
+			},
+		}}
+	}
 	objs := []any{&lendConfig{
-		APIVersion: b.cfg.PoolDriver + "/v1alpha1",
+		APIVersion: driver + "/v1alpha1",
 		Kind:       device.LendConfigKind,
 		Lease:      l.ID,
 		Pod:        l.Pod,
 		Container:  l.Container,
 	}}
-	if l.Mode == poolModeDax {
-		objs = append(objs, &poolDeviceConfig{
-			APIVersion: b.cfg.PoolDriver + "/v1alpha1",
-			Kind:       device.PoolDeviceConfigKind,
-			Mode:       poolModeDax,
+	if l.Mode == device.ModeDax {
+		objs = append(objs, &deviceConfig{
+			APIVersion: driver + "/v1alpha1",
+			Kind:       configKind,
+			Mode:       device.ModeDax,
 			ReadOnly:   l.ReadOnly,
 		})
 	}
-	configs := make([]resourceapi.DeviceClaimConfiguration, 0, len(objs))
-	for _, obj := range objs {
-		params, err := json.Marshal(obj)
-		if err != nil {
-			return nil, err
-		}
-		configs = append(configs, resourceapi.DeviceClaimConfiguration{
-			DeviceConfiguration: resourceapi.DeviceConfiguration{
-				Opaque: &resourceapi.OpaqueDeviceConfiguration{
-					Driver:     b.cfg.PoolDriver,
-					Parameters: runtime.RawExtension{Raw: params},
-				},
-			},
-		})
-	}
-	return configs, nil
+	return exact, driver, objs, nil
 }
 
 // createCompanion creates the claim, then the pod of a lease.
@@ -1042,7 +1141,8 @@ func (b *broker) startRelease(id, reason string) *leaseResponse {
 
 // release revokes the lend, deletes the companion pod and claim, waits
 // until both are gone and drops the lease. Kubelet unprepares the
-// companion's claim in between (the pool helper releases the device).
+// companion's claim in between (its driver releases the device). The
+// lease is marked deleting once the deletion of both is requested.
 func (b *broker) release(l *lease) {
 	defer b.wg.Done()
 	b.mu.Lock()
@@ -1050,9 +1150,9 @@ func (b *broker) release(l *lease) {
 	b.mu.Unlock()
 	if l.Kind == leaseKindMemory && l.Node >= 0 && lender != nil {
 		ctx, cancel := context.WithTimeout(b.ctx, apiTimeout)
-		if err := lender.RevokeNode(ctx, l.Pod.UID, l.Container, l.Node); err != nil {
-			// The pool helper revokes again before it releases the
-			// device, and fails (kubelet retries) while it cannot.
+		if err := lender.RevokeNode(ctx, l.Pod.UID, l.Container, l.Node, l.ID); err != nil {
+			// The driver of the device revokes again before it
+			// releases it, and fails (kubelet retries) while it cannot.
 			klog.Errorf("lease broker: lease %s: revoking node %d: %v", l.ID, l.Node, err)
 		}
 		cancel()
@@ -1064,6 +1164,13 @@ func (b *broker) release(l *lease) {
 		gone, err := b.deleteCompanion(ns, name)
 		if err != nil {
 			klog.Warningf("lease broker: lease %s: %v", l.ID, err)
+		} else {
+			b.mu.Lock()
+			if !b.deleting[l.ID] {
+				b.deleting[l.ID] = true
+				b.notify()
+			}
+			b.mu.Unlock()
 		}
 		if gone {
 			break
@@ -1080,6 +1187,7 @@ func (b *broker) release(l *lease) {
 	b.mu.Lock()
 	delete(b.store.Leases, l.ID)
 	delete(b.releasing, l.ID)
+	delete(b.deleting, l.ID)
 	b.saveLocked()
 	b.mu.Unlock()
 	klog.Infof("lease broker: lease %s: released", l.ID)
@@ -1206,7 +1314,7 @@ func (b *broker) relendContainer(podUID, name string) {
 	}
 	for i, node := range nodes {
 		ctx, cancel := context.WithTimeout(b.ctx, apiTimeout)
-		if err := lender.LendNode(ctx, podUID, name, node); err != nil {
+		if err := lender.LendNode(ctx, podUID, name, node, ids[i]); err != nil {
 			klog.Errorf("lease broker: lease %s: re-applying node %d: %v", ids[i], node, err)
 		}
 		cancel()
@@ -1338,8 +1446,10 @@ func (b *broker) deleteOrphans() {
 	}
 }
 
-// Pool helper hooks (poolLeaseHooks), called by the pool helper with its
-// lock held: they only touch the lease table.
+// Lease hooks (leaseHooks), called by the drivers that prepare companion
+// claims with their locks held: they only touch the lease table.
+
+var _ leaseHooks = (*broker)(nil)
 
 // OnLending checks that a LendConfig names a lease of this broker for the
 // same container, and marks it Lending.
@@ -1366,7 +1476,7 @@ func (b *broker) OnLending(cfg *lendConfig) error {
 }
 
 // OnPrepared marks a lease Ready with the prepared device.
-func (b *broker) OnPrepared(cfg *lendConfig, devs []preparedPoolDevice) {
+func (b *broker) OnPrepared(cfg *lendConfig, devs []lentDevice) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	l := b.store.Leases[cfg.Lease]
@@ -1376,14 +1486,17 @@ func (b *broker) OnPrepared(cfg *lendConfig, devs []preparedPoolDevice) {
 	d := devs[0]
 	l.Serial = "0x" + d.SerialHex
 	l.Bytes = d.Size
-	if d.mode() == poolModeDax {
+	if d.Source != "" {
+		l.Source = d.Source
+	}
+	if d.Mode == device.ModeDax {
 		l.Node, l.Dax = -1, d.DaxDevice
 	} else {
 		l.Node, l.Dax = d.Node, ""
 	}
 	l.State, l.Error = leaseReady, ""
 	b.saveLocked()
-	klog.Infof("lease broker: lease %s: Ready (serial %s, node %d, dax %q, %d bytes)", l.ID, l.Serial, l.Node, l.Dax, l.Bytes)
+	klog.Infof("lease broker: lease %s: Ready (source %s, serial %s, node %d, dax %q, %d bytes)", l.ID, l.Source, l.Serial, l.Node, l.Dax, l.Bytes)
 }
 
 // OnLendFailed fails the lease with the lend error (for example a

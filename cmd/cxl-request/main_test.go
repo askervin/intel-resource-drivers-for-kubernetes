@@ -49,6 +49,18 @@ func TestParseArgs(t *testing.T) {
 		{"cxl-request", []string{"list"}, request{Op: "list"}, nil, ""},
 		{"cxl-request", []string{"memory", "512Mi", "--dax", "--read-only", "--exec", "cat"}, request{Op: "lease", Kind: "memory", Size: "512Mi", Mode: "dax", ReadOnly: true}, []string{"cat"}, ""},
 		{"cxl-request", []string{"shared", "0x1", "--exclusive", "--read-only"}, request{Op: "lease", Kind: "shared", Serial: "0x1", Exclusive: true, ReadOnly: true}, nil, ""},
+		{"cxl-request", []string{"memory", "64Mi", "--local", "--dax", "--exec", "cat"}, request{Op: "lease", Kind: "memory", Size: "64Mi", Source: "local", Mode: "dax"}, []string{"cat"}, ""},
+		{"cxl-request", []string{"memory", "64Mi", "--source", "local", "--local"}, request{Op: "lease", Kind: "memory", Size: "64Mi", Source: "local"}, nil, ""},
+		{"cxl-request", []string{"memory", "64Mi", "--source=any", "--serial", "0xc100e2e1"}, request{Op: "lease", Kind: "memory", Size: "64Mi", Source: "any", Serial: "0xc100e2e1"}, nil, ""},
+		{"cxl-request", []string{"memory", "64Mi", "--source", "pool"}, request{Op: "lease", Kind: "memory", Size: "64Mi", Source: "pool"}, nil, ""},
+		{"cxl-request", []string{"memory", "64Mi", "--serial=0x1"}, request{Op: "lease", Kind: "memory", Size: "64Mi", Serial: "0x1"}, nil, ""},
+		{"cxl-request", []string{"memory", "64Mi", "--source", "remote"}, request{}, nil, `invalid --source "remote" (local, pool or any)`},
+		{"cxl-request", []string{"memory", "64Mi", "--source", "pool", "--local"}, request{}, nil, "--local conflicts with --source pool"},
+		{"cxl-request", []string{"memory", "64Mi", "--source"}, request{}, nil, "--source needs a value"},
+		{"cxl-request", []string{"shared", "0x1", "--source", "pool"}, request{}, nil, "--source and --local are for memory"},
+		{"cxl-request", []string{"shared", "0x1", "--local"}, request{}, nil, "--source and --local are for memory"},
+		{"cxl-request", []string{"shared", "0x1", "--serial", "0x2"}, request{}, nil, "--serial is for memory"},
+		{"cxl-request", []string{"list", "--local"}, request{}, nil, "--source and --local are for memory"},
 		{"cxl-request", []string{"shared", "0x1", "--dax"}, request{}, nil, "--dax is for memory"},
 		{"cxl-request", []string{"memory", "1Gi", "--exclusive"}, request{}, nil, "--exclusive is for shared"},
 		{"cxl-request", []string{"memory", "1Gi", "--read-only"}, request{}, nil, "--read-only is for shared and memory --dax"},
@@ -147,18 +159,22 @@ func fakeServer(t *testing.T, resp string, fdFile string) (string, chan request)
 }
 
 func TestRunPrintsResponse(t *testing.T) {
-	resp := `{"lease":"000000a1","state":"Ready","kind":"memory","node":2,"size":268435456,"serial":"0xc1ee0001"}`
+	resp := `{"lease":"000000a1","state":"Ready","kind":"memory","source":"local","node":2,"size":268435456,"serial":"0xc100e2e1"}`
 	sock, reqs := fakeServer(t, resp, "")
 	t.Setenv(socketEnv, sock)
 	var out, errb bytes.Buffer
-	if code := run([]string{"cxl-request", "memory", "256Mi", "--wait", "30s"}, &out, &errb); code != exitOK {
+	if code := run([]string{"cxl-request", "memory", "256Mi", "--source", "any", "--wait", "30s"}, &out, &errb); code != exitOK {
 		t.Fatalf("exit %d: %s", code, errb.String())
 	}
 	if strings.TrimSpace(out.String()) != resp {
 		t.Fatalf("output %q", out.String())
 	}
-	if r := <-reqs; r != (request{Op: "lease", Kind: "memory", Size: "256Mi", Wait: "30s"}) {
+	if r := <-reqs; r != (request{Op: "lease", Kind: "memory", Size: "256Mi", Source: "any", Wait: "30s"}) {
 		t.Fatalf("request %+v", r)
+	}
+	var parsed response
+	if err := json.Unmarshal([]byte(resp), &parsed); err != nil || parsed.Source != "local" {
+		t.Fatalf("response source %+v %v", parsed, err)
 	}
 
 	t.Setenv(socketEnv, "")

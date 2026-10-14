@@ -1,0 +1,46 @@
+# A pod that gets 128Mi of the memory of a CXL memory device attached to
+# its node (DeviceClass cxl-local-memory, device-classes.yaml).
+# kubelet-cxl-plugin creates a region on the device, onlines a 128Mi slice
+# of it as movable memory of the device's NUMA node and adds the node to
+# the container's cpuset.mems. The container prints its allowed NUMA nodes
+# and the MemTotal of every node.
+#
+# Add a selector to get a specific device:
+#   selectors:
+#   - cel:
+#       expression: 'device.attributes["cxl.generic"].serial == "0xc100e2e1"'
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: local-memory
+spec:
+  devices:
+    requests:
+    - name: mem
+      exactly:
+        deviceClassName: cxl-local-memory
+        capacity:
+          requests:
+            memory: 128Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: local-memory-consumer
+spec:
+  containers:
+  - name: consumer
+    image: registry.k8s.io/e2e-test-images/busybox:1.29-2
+    command:
+    - sh
+    - -c
+    - |
+      echo "cpuset.mems: $(cat /sys/fs/cgroup/cpuset.mems.effective)"
+      grep -H MemTotal /sys/devices/system/node/node*/meminfo
+      sleep infinity
+    resources:
+      claims:
+      - name: mem
+  resourceClaims:
+  - name: mem
+    resourceClaimName: local-memory

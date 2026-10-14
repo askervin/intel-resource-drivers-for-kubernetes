@@ -1,0 +1,48 @@
+# A pod that may borrow memory of a CXL memory device attached to its
+# node later, while it runs. It claims the token device (DeviceClass
+# cxl-dynamic, ../pool/device-class-dynamic.yaml) through a template, so
+# the claim follows the pod; the container "app" lists the claim and gets
+# the lease socket and the cxl-request CLI. Borrowing needs no pool:
+# --local (or --source local) takes the memory from a local memdev,
+# --source any from a local memdev if one fits, else from the pool.
+#
+#   kubectl exec local-borrower -c app -- cxl-request memory 64Mi --local --dax \
+#       --exec python3 -c 'import mmap,os; e=os.environ; m=mmap.mmap(int(e["CXL_LEASE_FD"]), int(e["CXL_LEASE_SIZE"])); m[0:5]=b"hello"; print(m[:5])'
+#     (a slice of its own, passed as fd 3; the lease stays after the
+#     command exits, until cxl-release)
+#   kubectl exec local-borrower -c app -- cxl-request memory 128Mi --local
+#     -> {"lease":"1a2b3c4d","state":"Ready","kind":"memory","source":"local","node":2,...}
+#        numactl --membind/--preferred=2, or mbind(), uses the lent node
+#   kubectl exec local-borrower -c app -- cxl-request memory 128Mi --source any
+#   kubectl exec local-borrower -c app -- cxl-request list
+#   kubectl exec local-borrower -c app -- cxl-release --all
+#
+# Lent memory counts against the container's memory limit; this example
+# sets none.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: cxl-dynamic-local
+spec:
+  spec:
+    devices:
+      requests:
+      - name: dyn
+        exactly:
+          deviceClassName: cxl-dynamic
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: local-borrower
+spec:
+  resourceClaims:
+  - name: dyn
+    resourceClaimTemplateName: cxl-dynamic-local
+  containers:
+  - name: app
+    image: docker.io/library/python:3-alpine
+    command: ["sleep", "infinity"]
+    resources:
+      claims:
+      - name: dyn

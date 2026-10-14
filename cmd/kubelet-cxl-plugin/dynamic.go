@@ -72,9 +72,11 @@ const (
 type tokenClaims interface {
 	// OpenClaim records the claim and starts its socket. Idempotent.
 	OpenClaim(claim *resourceapi.ResourceClaim) error
-	// CloseClaim releases all leases of the claim, then stops the
-	// socket and removes the directory. Returns an error while leases
-	// are still being released (kubelet retries Unprepare). Unknown
+	// CloseClaim starts releasing all leases of the claim, waits until
+	// their nodes are revoked and the deletion of their companions is
+	// requested, then stops the socket and removes the directory. The
+	// leases are dropped when their companions are gone. Returns an
+	// error if that wait times out (kubelet retries Unprepare). Unknown
 	// claims are not an error.
 	CloseClaim(ctx context.Context, uid string) error
 }
@@ -211,7 +213,13 @@ func (b *broker) CloseClaim(ctx context.Context, uid string) error {
 	remaining := func() int {
 		b.mu.Lock()
 		defer b.mu.Unlock()
-		return len(b.store.leasesOf(uid))
+		n := 0
+		for _, l := range b.store.leasesOf(uid) {
+			if !b.deleting[l.ID] {
+				n++
+			}
+		}
+		return n
 	}
 	if err := b.waitFor(ctx, func() bool { return remaining() == 0 }); err != nil {
 		return fmt.Errorf("claim %s/%s: still releasing %d leases, retry", tc.Namespace, tc.Name, remaining())

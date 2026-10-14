@@ -16,9 +16,12 @@
 
 package main
 
-// Lend primitives: lending NUMA nodes of pooled CXL memory to running
+// Lend primitives: lending NUMA nodes of CXL memory to running
 // containers by growing and shrinking their cpuset.mems through NRI
-// UpdateContainers.
+// UpdateContainers. A node is lent on behalf of holders (leases): devices
+// under one CXL host bridge share a NUMA node, so two leases of a
+// container can hold the same node, and the node stays lent until its
+// last holder revokes it.
 //
 // Locking: p.mu (nri.go) protects the container table and is taken by
 // the NRI event handlers. It is never held across UpdateContainers:
@@ -59,12 +62,15 @@ type Lender interface {
 	ContainerByPid(pid int) (*containerRef, bool)
 	// Container by pod UID and container name.
 	Container(podUID, name string) (*containerRef, bool)
-	// LendNode adds NUMA node to the container's cpuset.mems through NRI
-	// UpdateContainers (mems = BaseMems + all lent nodes). Idempotent.
-	LendNode(ctx context.Context, podUID, name string, node int) error
-	// RevokeNode removes the node (pages migrate back). Idempotent; a
-	// container that is gone is not an error.
-	RevokeNode(ctx context.Context, podUID, name string, node int) error
+	// LendNode lends NUMA node to the container on behalf of holder: the
+	// node is in the container's cpuset.mems, set through NRI
+	// UpdateContainers (mems = BaseMems + all nodes that have a
+	// holder). Idempotent per node and holder.
+	LendNode(ctx context.Context, podUID, name string, node int, holder string) error
+	// RevokeNode drops holder of the node; the node leaves cpuset.mems
+	// (pages migrate back) when it has no holder left. Idempotent per
+	// node and holder; a container that is gone is not an error.
+	RevokeNode(ctx context.Context, podUID, name string, node int, holder string) error
 	// LentNodes returns the nodes currently lent to the container.
 	LentNodes(podUID, name string) []int
 	// OnContainerGone registers a callback for StopContainer/RemoveContainer
@@ -102,7 +108,57 @@ type trackedContainer struct {
 	synced  bool          // learned from Synchronize, not from Create/Start
 	steered bool          // has DRAM/CXL claims steered by cgmpolmgr
 	base    cpuset.CPUSet // BaseMems parsed
-	lent    cpuset.CPUSet // nodes lent to this container id
+	lent    lentNodes     // nodes lent to this container id
+}
+
+// lentNodes maps the nodes lent to a container to their holders.
+type lentNodes map[int]map[string]bool
+
+// nodes returns the lent nodes that have a holder.
+func (l lentNodes) nodes() cpuset.CPUSet {
+	nodes := make([]int, 0, len(l))
+	for n, holders := range l {
+		if len(holders) > 0 {
+			nodes = append(nodes, n)
+		}
+	}
+	return cpuset.New(nodes...)
+}
+
+// with returns the holders of node after holder lends (lend) or revokes
+// (!lend) it.
+func (l lentNodes) with(node int, holder string, lend bool) map[string]bool {
+	holders := make(map[string]bool, len(l[node])+1)
+	for h := range l[node] {
+		holders[h] = true
+	}
+	if lend {
+		holders[holder] = true
+	} else {
+		delete(holders, holder)
+	}
+	return holders
+}
+
+// after returns the lent nodes that have a holder when node has holders.
+func (l lentNodes) after(node int, holders map[string]bool) cpuset.CPUSet {
+	if len(holders) > 0 {
+		return l.nodes().Union(cpuset.New(node))
+	}
+	return l.nodes().Difference(cpuset.New(node))
+}
+
+// set records the holders of node.
+func (l lentNodes) set(node int, holders map[string]bool) lentNodes {
+	if l == nil {
+		l = lentNodes{}
+	}
+	if len(holders) == 0 {
+		delete(l, node)
+	} else {
+		l[node] = holders
+	}
+	return l
 }
 
 // initLendState initializes the container table of the plugin.
@@ -201,7 +257,7 @@ func (p *nriPlugin) baseMems(tc *trackedContainer, ctr *api.Container) cpuset.CP
 func (p *nriPlugin) allLentNodes() cpuset.CPUSet {
 	all := cpuset.New()
 	for _, tc := range p.ctrs {
-		all = all.Union(tc.lent)
+		all = all.Union(tc.lent.nodes())
 	}
 	return all
 }
@@ -234,8 +290,8 @@ func (p *nriPlugin) fireGone(tc *trackedContainer) {
 	if tc == nil {
 		return
 	}
-	if !tc.lent.IsEmpty() {
-		klog.V(3).Infof("NRI lend: ctr=%s id=%s gone with lent nodes %s", tc.name(), tc.ref.ID, tc.lent)
+	if lent := tc.lent.nodes(); !lent.IsEmpty() {
+		klog.V(3).Infof("NRI lend: ctr=%s id=%s gone with lent nodes %s", tc.name(), tc.ref.ID, lent)
 	}
 	ref := tc.snapshot()
 	for _, fn := range p.goneFns {
@@ -412,7 +468,7 @@ func (p *nriPlugin) LentNodes(podUID, name string) []int {
 	if tc == nil {
 		return nil
 	}
-	return tc.lent.List()
+	return tc.lent.nodes().List()
 }
 
 // OnContainerGone implements Lender.
@@ -430,26 +486,27 @@ func (p *nriPlugin) OnContainerStarted(fn func(ref containerRef)) {
 }
 
 // LendNode implements Lender.
-func (p *nriPlugin) LendNode(ctx context.Context, podUID, name string, node int) error {
+func (p *nriPlugin) LendNode(ctx context.Context, podUID, name string, node int, holder string) error {
 	if node < 0 {
 		return fmt.Errorf("invalid NUMA node %d", node)
 	}
-	return p.changeLend(ctx, podUID, name, node, true)
+	return p.changeLend(ctx, podUID, name, node, holder, true)
 }
 
 // RevokeNode implements Lender.
-func (p *nriPlugin) RevokeNode(ctx context.Context, podUID, name string, node int) error {
+func (p *nriPlugin) RevokeNode(ctx context.Context, podUID, name string, node int, holder string) error {
 	if node < 0 {
 		return fmt.Errorf("invalid NUMA node %d", node)
 	}
-	return p.changeLend(ctx, podUID, name, node, false)
+	return p.changeLend(ctx, podUID, name, node, holder, false)
 }
 
-// changeLend adds (lend) or removes (!lend) node in the lent set of a
-// container and applies cpuset.mems = base + lent through NRI. The
-// node is a pool node, so it is also dropped from the base set (it is
-// there after a plugin restart, see Synchronize).
-func (p *nriPlugin) changeLend(ctx context.Context, podUID, name string, node int, lend bool) error {
+// changeLend adds (lend) or removes (!lend) holder of node in the lent
+// nodes of a container and applies cpuset.mems = base + the nodes that
+// have a holder through NRI. The node is a CXL node, so it is also
+// dropped from the base set (it is there after a plugin restart, see
+// Synchronize).
+func (p *nriPlugin) changeLend(ctx context.Context, podUID, name string, node int, holder string, lend bool) error {
 	op := "revoke"
 	if lend {
 		op = "lend"
@@ -490,21 +547,19 @@ func (p *nriPlugin) changeLend(ctx context.Context, podUID, name string, node in
 
 	nodeSet := cpuset.New(node)
 	base := tc.base.Difference(nodeSet)
-	var lent cpuset.CPUSet
-	if lend {
-		lent = tc.lent.Union(nodeSet)
-	} else {
-		lent = tc.lent.Difference(nodeSet)
-	}
-	needed := !sameSet(lent, tc.lent) || !sameSet(base, tc.base)
-	if !lend && !needed {
+	holders := tc.lent.with(node, holder, lend)
+	lent := tc.lent.after(node, holders)
+	needed := !sameSet(lent, tc.lent.nodes()) || !sameSet(base, tc.base)
+	if !lend && !needed && len(holders) == 0 {
 		// Not lent as far as we know, but a lend from before a plugin
 		// restart that is not re-applied still shows in cpuset.mems.
 		needed = cgroupMemsContain(tc.ref.CgroupPath, node)
 	}
 	if !needed {
+		tc.lent = tc.lent.set(node, holders)
 		p.mu.Unlock()
-		klog.V(4).Infof("NRI lend: %s node %d: ctr=%s: nothing to do (base=%s lent=%s)", op, node, ctrName, base, lent)
+		klog.V(4).Infof("NRI lend: %s node %d for %s: ctr=%s: cpuset.mems unchanged (base=%s lent=%s, node holders %d)",
+			op, node, holder, ctrName, base, lent, len(holders))
 		return nil
 	}
 	if base.IsEmpty() {
@@ -516,7 +571,7 @@ func (p *nriPlugin) changeLend(ctx context.Context, podUID, name string, node in
 	s := p.stub
 	p.mu.Unlock()
 
-	klog.V(3).Infof("NRI lend: %s node %d: ctr=%s id=%s cpuset.mems=%s (base=%s lent=%s)", op, node, ctrName, id, mems, base, lent)
+	klog.V(3).Infof("NRI lend: %s node %d for %s: ctr=%s id=%s cpuset.mems=%s (base=%s lent=%s)", op, node, holder, ctrName, id, mems, base, lent)
 	if err := updateMems(s, id, mems); err != nil {
 		return fmt.Errorf("%s node %d: ctr=%s: %w", op, node, ctrName, err)
 	}
@@ -526,7 +581,7 @@ func (p *nriPlugin) changeLend(ctx context.Context, podUID, name string, node in
 	if cur, ok := p.ctrs[id]; ok && cur == tc {
 		tc.base = base
 		tc.ref.BaseMems = base.String()
-		tc.lent = lent
+		tc.lent = tc.lent.set(node, holders)
 	}
 	return nil
 }

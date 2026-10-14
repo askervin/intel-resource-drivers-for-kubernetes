@@ -556,7 +556,7 @@ func TestBuildDevInfosSkipsPoolDevices(t *testing.T) {
 	}
 	devices.RegionDevices = []*nricxl.RegionDevice{region("region0", 2, 0xc100e2e0), region("region1", 3, 0xc1ee0001)}
 	devices.MemoryNodes = []*nricxl.MemoryNode{{ID: 0, Size: 1 << 30}, {ID: 2, Size: 1 << 30}, {ID: 3, Size: 1 << 30}}
-	devInfos, err := buildDevInfos(&DriverConfig{}, devices, map[uint64]bool{0xc1ee0001: true})
+	devInfos, err := buildDevInfos(&DriverConfig{}, devices, map[uint64]bool{0xc1ee0001: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -570,7 +570,7 @@ func TestBuildDevInfosSkipsPoolDevices(t *testing.T) {
 	if !ok || !slices.Equal(dram.Nodes, []int{0}) {
 		t.Fatalf("pool node counted as DRAM: %+v", devInfos["dram"])
 	}
-	if devInfos, _ := buildDevInfos(&DriverConfig{}, devices, nil); devInfos["region1"] == nil {
+	if devInfos, _ := buildDevInfos(&DriverConfig{}, devices, nil, nil); devInfos["region1"] == nil {
 		t.Fatal("region1 skipped without the pool helper")
 	}
 }
@@ -612,7 +612,7 @@ func TestPoolPrepareExclusiveDax(t *testing.T) {
 	if !reflect.DeepEqual(cd.ContainerEdits.DeviceNodes, wantNodes) {
 		t.Fatalf("unexpected device nodes %+v", cd.ContainerEdits.DeviceNodes)
 	}
-	if d := p.prepared["u1"].Devices[0]; d.Mode != poolModeDax || d.Node != -1 || d.DaxDevice != "/dev/dax0.0" {
+	if d := p.prepared["u1"].Devices[0]; d.Mode != device.ModeDax || d.Node != -1 || d.DaxDevice != "/dev/dax0.0" {
 		t.Fatalf("prepared device %+v", d)
 	}
 
@@ -689,72 +689,13 @@ func TestPoolConfigErrors(t *testing.T) {
 	}
 }
 
-func TestParsePoolDeviceConfig(t *testing.T) {
-	const (
-		class = resourceapi.AllocationConfigSourceClass
-		claim = resourceapi.AllocationConfigSourceClaim
-	)
-	lend := `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"LendConfig","lease":"l1"}`
-	for _, tc := range []struct {
-		name    string
-		request string
-		configs func(c *resourceapi.ResourceClaim)
-		want    poolDeviceConfig
-	}{
-		{name: "none", request: "mem", configs: func(c *resourceapi.ResourceClaim) {}},
-		{name: "claim wins over class", request: "mem", configs: func(c *resourceapi.ResourceClaim) {
-			withConfig(c, claim, nil, daxConfig)
-			withConfig(c, class, nil, roConfig)
-		}, want: poolDeviceConfig{APIVersion: "cxl-pool.generic/v1alpha1", Kind: "PoolDeviceConfig", Mode: "dax"}},
-		{name: "class only", request: "mem", configs: func(c *resourceapi.ResourceClaim) {
-			withConfig(c, class, nil, roConfig)
-		}, want: poolDeviceConfig{APIVersion: "cxl-pool.generic/v1alpha1", Kind: "PoolDeviceConfig", ReadOnly: true}},
-		{name: "another request", request: "mem", configs: func(c *resourceapi.ResourceClaim) {
-			withConfig(c, claim, []string{"other"}, daxConfig)
-		}},
-		{name: "subrequest", request: "mem/a", configs: func(c *resourceapi.ResourceClaim) {
-			withConfig(c, claim, []string{"mem"}, daxConfig)
-		}, want: poolDeviceConfig{APIVersion: "cxl-pool.generic/v1alpha1", Kind: "PoolDeviceConfig", Mode: "dax"}},
-		{name: "other kinds and drivers", request: "mem", configs: func(c *resourceapi.ResourceClaim) {
-			withConfig(c, claim, nil, lend)
-			withConfig(c, claim, nil, daxConfig)
-			c.Status.Allocation.Devices.Config[1].Opaque.Driver = device.DriverName
-		}},
-	} {
-		c := poolClaim("u1", "c1", "shared0", sharedData)
-		tc.configs(c)
-		got, err := parsePoolDeviceConfig(c, device.PoolDriverName, tc.request)
-		if err != nil || *got != tc.want {
-			t.Errorf("%s: got %+v %v, expected %+v", tc.name, got, err, tc.want)
-		}
-	}
-}
-
+// TestPoolDeviceMode checks the mode of devices of state files written
+// before modes existed.
 func TestPoolDeviceMode(t *testing.T) {
-	for _, tc := range []struct {
-		cfg    poolDeviceConfig
-		shared bool
-		want   string
-		err    string
-	}{
-		{shared: true, want: poolModeDax},
-		{want: poolModeNUMA},
-		{cfg: poolDeviceConfig{Mode: "dax", ReadOnly: true}, want: poolModeDax},
-		{cfg: poolDeviceConfig{Mode: "dax", ReadOnly: true}, shared: true, want: poolModeDax},
-		{cfg: poolDeviceConfig{Mode: "numa"}, shared: true, err: "shared device"},
-		{cfg: poolDeviceConfig{ReadOnly: true}, err: "readOnly needs mode dax"},
-		{cfg: poolDeviceConfig{Mode: "kmem"}, err: "invalid mode"},
-	} {
-		got, err := tc.cfg.modeFor(tc.shared)
-		if (tc.err == "" && (err != nil || got != tc.want)) || (tc.err != "" && (err == nil || !strings.Contains(err.Error(), tc.err))) {
-			t.Errorf("%+v shared %v: got %q %v, expected %q %q", tc.cfg, tc.shared, got, err, tc.want, tc.err)
-		}
-	}
-	// state files written before modes existed
-	if m := (&preparedPoolDevice{DaxDevice: "/dev/dax0.0"}).mode(); m != poolModeDax {
+	if m := (&preparedPoolDevice{DaxDevice: "/dev/dax0.0"}).mode(); m != device.ModeDax {
 		t.Errorf("old shared device: mode %q", m)
 	}
-	if m := (&preparedPoolDevice{Node: 2}).mode(); m != poolModeNUMA {
+	if m := (&preparedPoolDevice{Node: 2}).mode(); m != device.ModeNUMA {
 		t.Errorf("old exclusive device: mode %q", m)
 	}
 }

@@ -42,9 +42,10 @@ type CXLFlags struct {
 	// memdev to appear.
 	PoolPrepareTimeout time.Duration
 
-	// PoolLend enables lending pool memory to running containers: the
-	// token device "dynamic", lease sockets and companion pods.
-	PoolLend bool
+	// Lend enables lending local and pool memory to running
+	// containers: the token device "dynamic", lease sockets and
+	// companion pods.
+	Lend bool
 	// CXLRequestBin is the host path of the static cxl-request CLI
 	// that is bind-mounted into containers with a token claim.
 	CXLRequestBin string
@@ -65,7 +66,7 @@ func main() {
 		PoolDriverName:     cxl.PoolDriverName,
 		PoolPrepareTimeout: defaultPoolPrepareTimeout,
 
-		PoolLend:         true,
+		Lend:             true,
 		CXLRequestBin:    defaultCXLRequestBin,
 		LeaseWaitDefault: defaultLeaseWait,
 		CompanionImage:   defaultCompanionImage,
@@ -129,11 +130,12 @@ func main() {
 			EnvVars:     []string{"POOL_PREPARE_TIMEOUT"},
 		},
 		&cli.BoolFlag{
-			Name:        "pool-lend",
-			Usage:       "lend pool memory to running containers that claim the token device \"dynamic\" (needs the pool helper and NRI)",
-			Value:       cxlFlags.PoolLend,
-			Destination: &cxlFlags.PoolLend,
-			EnvVars:     []string{"POOL_LEND"},
+			Name:        "lend",
+			Aliases:     []string{"pool-lend"},
+			Usage:       "lend local and pool memory to running containers that claim the token device \"dynamic\" (needs NRI; pool memory needs the pool helper)",
+			Value:       cxlFlags.Lend,
+			Destination: &cxlFlags.Lend,
+			EnvVars:     []string{"LEND", "POOL_LEND"},
 		},
 		&cli.StringFlag{
 			Name:        "cxl-request-bin",

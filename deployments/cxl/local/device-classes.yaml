@@ -1,0 +1,42 @@
+# DeviceClasses for the CXL memory devices (memdevs) attached to a node,
+# which kubelet-cxl-plugin publishes in the node's cxl.generic
+# ResourceSlice as devices of type cxl-memdev (source local, capacity
+# memory). The plugin creates a region on a device for its first claim
+# and destroys it after its last one. Every claim gets a slice of the
+# region, a multiple of the memory block size (attribute memoryBlockSize,
+# the step of the capacity requests); slices of both classes share a
+# device. The attribute mode (none, numa, dax or numa+dax) tells what a
+# device holds, the classes do not select on it. See doc/cxl/LOCAL.md.
+#
+# cxl-local-memory: a slice of a local memdev onlined as system RAM in
+# movable memory blocks of the device's NUMA node. All numa slices of a
+# device are on its node; the node has the memory of the slices that are
+# prepared.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: cxl-local-memory
+spec:
+  selectors:
+  - cel:
+      expression: 'device.driver == "cxl.generic" && device.attributes["cxl.generic"].type == "cxl-memdev"'
+---
+# cxl-local-dax: a devdax slice of a local memdev for every claim, a
+# character device /dev/daxX.Y of its own (the size of the claim's
+# capacity request, rounded up to the memory block size). Pods that
+# reference the same ResourceClaim share its slice.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: cxl-local-dax
+spec:
+  selectors:
+  - cel:
+      expression: 'device.driver == "cxl.generic" && device.attributes["cxl.generic"].type == "cxl-memdev"'
+  config:
+  - opaque:
+      driver: cxl.generic
+      parameters:
+        apiVersion: cxl.generic/v1alpha1
+        kind: LocalDeviceConfig
+        mode: dax

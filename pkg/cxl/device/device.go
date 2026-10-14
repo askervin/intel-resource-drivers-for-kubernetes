@@ -56,22 +56,50 @@ const (
 	// DeviceTypeDynamic is the device type of the token device
 	// "dynamic" in the cxl.generic slice. A claim on it gives the
 	// containers that reference it a lease socket through which they
-	// can borrow pool memory while running. See doc/cxl/POOL.md.
+	// can borrow local or pool memory while running. See
+	// doc/cxl/POOL.md.
 	DeviceTypeDynamic = "dynamic"
 	// DynamicDeviceName is the name of the token device.
 	DynamicDeviceName = "dynamic"
 	// LeaseCDISpecName is the name of the CDI spec file of the lease
 	// devices (socket directory and CLI mounts of token claims).
 	LeaseCDISpecName = "cxl-leases"
-	// LendConfigKind is the kind of the opaque pool claim configuration
-	// that names the lease and the borrowing container of a companion
-	// claim (apiVersion <pool driver name>/v1alpha1).
+	// LendConfigKind is the kind of the opaque claim configuration that
+	// names the lease and the borrowing container of a companion claim
+	// (apiVersion <driver name>/v1alpha1, for the pool driver or
+	// cxl.generic).
 	LendConfigKind = "LendConfig"
 	// PoolDeviceConfigKind is the kind of the opaque pool claim
 	// configuration that selects how a pool device is prepared: as a
 	// NUMA node or as a devdax device, and read-only (apiVersion <pool
 	// driver name>/v1alpha1).
 	PoolDeviceConfigKind = "PoolDeviceConfig"
+
+	// DeviceTypeCXLMemdev is the device type of a node-local CXL
+	// memory device (memdev) that the plugin creates regions on. See
+	// doc/cxl/LOCAL.md.
+	DeviceTypeCXLMemdev = "cxl-memdev"
+	// DeviceTypeCXLDax is the PreparedDeviceInfo type of a devdax
+	// slice of a local memdev. NRI steering ignores it.
+	DeviceTypeCXLDax = "cxl-dax"
+	// SourceLocal is the source attribute of local memdevs, and the
+	// lease source of memory from them.
+	SourceLocal = "local"
+	// SourcePool is the source attribute of pool devices, and the lease
+	// source of memory from the pool.
+	SourcePool = "pool"
+	// LocalDeviceConfigKind is the kind of the opaque cxl.generic claim
+	// configuration that selects how a local memdev is prepared: as a
+	// NUMA node or as a devdax slice, and read-only (apiVersion
+	// cxl.generic/v1alpha1).
+	LocalDeviceConfigKind = "LocalDeviceConfig"
+	// LocalCDISpecName is the name of the CDI spec file of the dax
+	// slices of local memdevs.
+	LocalCDISpecName = "cxl-local"
+	// ModeNUMA onlines device memory as a NUMA node.
+	ModeNUMA = "numa"
+	// ModeDax gives device memory to containers as a devdax device.
+	ModeDax = "dax"
 
 	// CapacityMemory is the capacity key used in ResourceSlice device
 	// capacity and in ConsumedCapacity. Matches v1.ResourceMemory.
@@ -104,6 +132,18 @@ type SystemDRAM struct {
 	Name  string
 	Nodes []int
 	Size  uint64
+}
+
+// CXLMemdev is the Dev of a local memdev device (DeviceTypeCXLMemdev).
+type CXLMemdev struct {
+	Name         string // memN
+	Serial       uint64
+	Size         uint64 // RAM capacity, bytes
+	NodeAffinity int    // CPU NUMA node of the memdev, -1 if unknown
+	BlockSize    uint64 // memory block size, bytes: slices are multiples of it
+	// Mode is what the plugin had on the memdev at scan time: "none",
+	// ModeNUMA, ModeDax or "numa+dax" (slices of both modes).
+	Mode string
 }
 
 // DynamicToken is the Dev of the token device: it has no hardware, no

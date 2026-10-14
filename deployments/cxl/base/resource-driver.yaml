@@ -91,9 +91,9 @@ rules:
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 - apiGroups: ["resource.k8s.io"]
   resources: ["resourceclaims"]
-  # get: Prepare; the rest: companion claims of leases (--pool-lend)
+  # get: Prepare; the rest: companion claims of leases (--lend)
   verbs: ["get", "list", "watch", "create", "delete"]
-# companion pods of leases (--pool-lend), in the requester's namespace
+# companion pods of leases (--lend), in the requester's namespace
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["get", "list", "watch", "create", "delete"]

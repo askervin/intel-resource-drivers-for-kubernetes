@@ -1,0 +1,60 @@
+# A pod with a read-only devdax slice of a CXL memory device attached to
+# its node: DeviceClass cxl-local-dax with a claim LocalDeviceConfig
+# readOnly: true. The 64Mi request gets a slice of one memory block (128Mi
+# with 128 MiB blocks). The device node allows reads only (CDI permissions
+# "r", enforced by the device cgroup): the container can open it O_RDONLY
+# and map it PROT_READ, and nothing else. CXL_LOCAL_READONLY_<SERIAL>=1
+# tells the program. Every claim has a slice of its own, zeroed before the
+# claim gets it: a read-only one reads zeros.
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaim
+metadata:
+  name: local-dax-readonly
+spec:
+  devices:
+    requests:
+    - name: mem
+      exactly:
+        deviceClassName: cxl-local-dax
+        capacity:
+          requests:
+            memory: 64Mi
+    config:
+    - opaque:
+        driver: cxl.generic
+        parameters:
+          apiVersion: cxl.generic/v1alpha1
+          kind: LocalDeviceConfig
+          mode: dax
+          readOnly: true
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: local-dax-reader-ro
+spec:
+  containers:
+  - name: reader
+    image: docker.io/library/python:3-alpine
+    command:
+    - python3
+    - -u
+    - -c
+    - |
+      import mmap, os, time
+      dax = [v for k, v in os.environ.items() if k.startswith("CXL_LOCAL_DAX_")][0]
+      size = int([v for k, v in os.environ.items() if k.startswith("CXL_LOCAL_SIZE_")][0])
+      fd = os.open(dax, os.O_RDONLY)
+      m = mmap.mmap(fd, size, mmap.MAP_SHARED, mmap.PROT_READ)
+      print("read:", bytes(m[0:16]).hex())
+      try:
+          os.open(dax, os.O_RDWR)
+      except PermissionError as e:
+          print("open for writing refused:", e)
+      time.sleep(1e9)
+    resources:
+      claims:
+      - name: mem
+  resourceClaims:
+  - name: mem
+    resourceClaimName: local-dax-readonly

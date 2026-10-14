@@ -23,6 +23,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	resourceapi "k8s.io/api/resource/v1"
@@ -52,6 +53,11 @@ type driver struct {
 	sysfsRoot   string
 	pool        *poolDriver // nil when the pool helper is disabled
 	broker      *broker     // nil when lending is disabled
+	// started is set when the kubelet plugin runs and resources can be
+	// published.
+	started atomic.Bool
+	// poolSlices has the serials of the devices of pool controllers.
+	poolSlices *poolSlices
 }
 
 // TestabilityConfig holds configuration for injecting fake CXL
@@ -106,9 +112,20 @@ type DriverConfig struct {
 	// testing without real hardware.
 	Testability *TestabilityConfig `json:"testability,omitempty"`
 
+	// ManageMemdevs publishes the local CXL memory devices that have
+	// no regions as cxl-memdev devices, and creates and destroys their
+	// regions for claims. Default: true.
+	ManageMemdevs *bool `json:"manageMemdevs,omitempty"`
+
 	// PublishDynamicToken publishes the token device "dynamic" (set
-	// from --pool-lend, not part of the configuration file).
+	// from --lend, not part of the configuration file).
 	PublishDynamicToken bool `json:"-"`
+}
+
+// manageMemdevs tells whether local memdevs are published and get regions
+// for claims (ManageMemdevs, default true).
+func (c *DriverConfig) manageMemdevs() bool {
+	return c.ManageMemdevs == nil || *c.ManageMemdevs
 }
 
 func getCXLFlags(someFlags any) (*CXLFlags, error) {
@@ -214,8 +231,9 @@ func injectFakeDevices(tc *TestabilityConfig, devices *nricxl.Devices) {
 // DevicesInfo map. This is the single place where device scanning
 // happens, used both at startup and on udev-triggered rescans.
 // Regions on memdevs whose serial is in poolSerials belong to the pool
-// helper and are skipped.
-func scanDevices(sysfsRoot string, driverConfig *DriverConfig, poolSerials map[uint64]bool) (device.DevicesInfo, error) {
+// helper and are skipped; local has the memdevs that the local allocator
+// uses and the memory block size.
+func scanDevices(sysfsRoot string, driverConfig *DriverConfig, poolSerials map[uint64]bool, local *localSnapshot) (device.DevicesInfo, error) {
 	detectedDevices, err := nricxl.DevicesFromSysfs(sysfsRoot)
 	if err != nil {
 		return nil, fmt.Errorf("failed to detect devices: %v", err)
@@ -229,7 +247,7 @@ func scanDevices(sysfsRoot string, driverConfig *DriverConfig, poolSerials map[u
 		klog.Info("No region devices detected")
 	}
 
-	devInfos, err := buildDevInfos(driverConfig, detectedDevices, poolSerials)
+	devInfos, err := buildDevInfos(driverConfig, detectedDevices, poolSerials, local)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build device infos: %v", err)
 	}
@@ -271,26 +289,27 @@ func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, err
 		return nil, err
 	}
 
-	// The token device and the lease broker need the pool helper.
-	driverConfig.PublishDynamicToken = cxlFlags.PoolLend && pool != nil
+	// The token device and the lease broker lend local memdevs and,
+	// with the pool helper, pool devices.
+	driverConfig.PublishDynamicToken = cxlFlags.Lend
 
-	devInfos, err := scanDevices(sysfsRoot, driverConfig, pool.Serials())
+	poolSlices := newPoolSlices(config.Coreclient)
+	state, err := newDriverState(ctx, config, driverConfig, sysfsRoot, preparedClaimsFilePath, pool, poolSlices)
 	if err != nil {
 		return nil, err
 	}
 
-	klog.V(3).Info("Creating new NodeState")
-	state, err := newNodeState(devInfos, config.CommonFlags.CdiRoot, preparedClaimsFilePath, config.CommonFlags.NodeName, driverConfig)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create new NodeState: %v", err)
-	}
-
 	driver := &driver{
-		state:     *state,
-		client:    config.Coreclient,
-		config:    driverConfig,
-		sysfsRoot: sysfsRoot,
+		state:      *state,
+		client:     config.Coreclient,
+		config:     driverConfig,
+		sysfsRoot:  sysfsRoot,
+		poolSlices: poolSlices,
 	}
+	// Prepare and Unprepare of claims on local memdevs change their mode
+	// attribute.
+	driver.state.republish = func() { driver.rescanAndPublish(ctx) }
+	go driver.retryPoolList(ctx)
 
 	// The lease broker re-creates the sockets of prepared token claims
 	// before kubelet can call Prepare or Unprepare.
@@ -303,7 +322,7 @@ func newDriver(ctx context.Context, config *helpers.Config) (helpers.Driver, err
 			RequestBin:  cxlFlags.CXLRequestBin,
 			Image:       cxlFlags.CompanionImage,
 			WaitDefault: cxlFlags.LeaseWaitDefault,
-			PoolDriver:  pool.name,
+			PoolDriver:  pool.driverName(),
 		})
 		if err != nil {
 			return nil, err
@@ -332,6 +351,7 @@ PluginDataDirectoryPath: %v`,
 	}
 
 	driver.helper = helper
+	driver.started.Store(true)
 
 	if err := startPoolHelper(ctx, config, pool); err != nil {
 		helper.Stop()
@@ -362,7 +382,8 @@ PluginDataDirectoryPath: %v`,
 		if driver.nriPlugin != nil {
 			lender = driver.nriPlugin
 		}
-		pool.setLending(lender, driver.broker)
+		pool.lending().set(lender, driver.broker)
+		driver.state.lending.set(lender, driver.broker)
 		driver.broker.start(lender)
 	}
 
@@ -406,14 +427,68 @@ func newPoolHelper(config *helpers.Config, cxlFlags *CXLFlags, sysfsRoot string)
 	if err := os.MkdirAll(poolDataDir, 0750); err != nil {
 		return nil, fmt.Errorf("pool helper data directory: %w", err)
 	}
-	mem := memctl.New()
-	mem.SysRoot = sysfsRoot + "/sys"
-	mem.Logf = func(format string, args ...any) { klog.Infof("memctl: "+format, args...) }
-	pool, err := newPoolDriver(cxlFlags.PoolDriverName, mem, filepath.Join(poolDataDir, poolStateFileName), cxlFlags.PoolPrepareTimeout)
+	pool, err := newPoolDriver(cxlFlags.PoolDriverName, newMemctl(sysfsRoot), filepath.Join(poolDataDir, poolStateFileName), cxlFlags.PoolPrepareTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("pool helper: %w", err)
 	}
 	return pool, nil
+}
+
+// newDriverState returns the node state with the devices of the first scan
+// and the local allocator.
+func newDriverState(ctx context.Context, config *helpers.Config, driverConfig *DriverConfig, sysfsRoot, preparedClaimsFilePath string, pool *poolDriver, poolSlices *poolSlices) (*nodeState, error) {
+	// The local allocator's state is reconciled before the first scan,
+	// so that the regions it created are never published as cxl-node
+	// devices.
+	local, err := newLocalHelper(ctx, config, driverConfig, sysfsRoot)
+	if err != nil {
+		return nil, err
+	}
+
+	scanConfig, poolSerials := scanInput(ctx, driverConfig, pool, poolSlices)
+	devInfos, err := scanDevices(sysfsRoot, scanConfig, poolSerials, local.Snapshot())
+	if err != nil {
+		return nil, err
+	}
+
+	klog.V(3).Info("Creating new NodeState")
+	state, err := newNodeState(devInfos, config.CommonFlags.CdiRoot, preparedClaimsFilePath, config.CommonFlags.NodeName, driverConfig, local)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create new NodeState: %v", err)
+	}
+	return state, nil
+}
+
+// newMemctl returns a memctl manager for the sysfs under sysfsRoot.
+func newMemctl(sysfsRoot string) *memctl.Manager {
+	mem := memctl.New()
+	mem.SysRoot = sysfsRoot + "/sys"
+	mem.Logf = func(format string, args ...any) { klog.Infof("memctl: "+format, args...) }
+	return mem
+}
+
+// newLocalHelper returns the local allocator with its state loaded and
+// reconciled with the prepared claims, or nil if local memdevs are not
+// managed (manageMemdevs: false).
+func newLocalHelper(ctx context.Context, config *helpers.Config, driverConfig *DriverConfig, sysfsRoot string) (*localAllocator, error) {
+	if !driverConfig.manageMemdevs() {
+		return nil, nil
+	}
+	dataDir := config.CommonFlags.KubeletPluginDir
+	local, err := newLocalAllocator(newMemctl(sysfsRoot), filepath.Join(dataDir, localStateFileName), readBootID(sysfsRoot))
+	if err != nil {
+		return nil, fmt.Errorf("local allocator: %w", err)
+	}
+	claims, err := getOrCreatePreparedClaimsInfo(filepath.Join(dataDir, preparedClaimsInfoFileName))
+	if err != nil {
+		return nil, fmt.Errorf("local allocator: %w", err)
+	}
+	prepared := map[string]bool{}
+	for uid := range claims {
+		prepared[uid] = true
+	}
+	local.Reconcile(ctx, prepared)
+	return local, nil
 }
 
 // startPoolHelper registers the pool helper as a second kubelet plugin
@@ -447,17 +522,14 @@ func (d *driver) PrepareResourceClaims(ctx context.Context, claims []*resourceap
 func (d *driver) prepareResourceClaim(ctx context.Context, claim *resourceapi.ResourceClaim) kubeletplugin.PrepareResult {
 	klog.V(5).Infof("NodePrepareResource is called: request: %+v", claim)
 
-	if claimPreparation, found := d.state.Prepared[string(claim.UID)]; found {
-		klog.V(3).Infof("Claim %s was already prepared, nothing to do", claim.UID)
-		return claimPreparation
-	}
-
 	if err := d.state.Prepare(ctx, claim); err != nil {
 		return kubeletplugin.PrepareResult{
 			Err: err,
 		}
 	}
 
+	d.state.Lock()
+	defer d.state.Unlock()
 	return d.state.Prepared[string(claim.UID)]
 }
 
@@ -510,11 +582,13 @@ func (d *driver) udevRescanLoop(ctx context.Context) {
 }
 
 // rescanAndPublish re-discovers hardware resources and republishes
-// ResourceSlices if the set of allocatable devices has changed.
+// ResourceSlices if the set of allocatable devices has changed. Before the
+// kubelet plugin runs, it only re-discovers them.
 func (d *driver) rescanAndPublish(ctx context.Context) {
-	klog.Infof("rescanAndPublish: udev event triggered rescan")
+	klog.Infof("rescanAndPublish: rescanning devices")
 
-	newDevInfos, err := scanDevices(d.sysfsRoot, d.config, d.pool.Serials())
+	scanConfig, poolSerials := scanInput(ctx, d.config, d.pool, d.poolSlices)
+	newDevInfos, err := scanDevices(d.sysfsRoot, scanConfig, poolSerials, d.state.local.Snapshot())
 	if err != nil {
 		klog.Errorf("rescanAndPublish: %v", err)
 		return
@@ -524,6 +598,9 @@ func (d *driver) rescanAndPublish(ctx context.Context) {
 	d.state.Allocatable = newDevInfos
 	d.state.Unlock()
 
+	if !d.started.Load() {
+		return
+	}
 	if err := d.PublishResourceSlice(ctx); err != nil {
 		klog.Errorf("rescanAndPublish: failed to publish resources: %v", err)
 		return

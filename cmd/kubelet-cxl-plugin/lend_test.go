@@ -195,7 +195,7 @@ func TestLendContainerTable(t *testing.T) {
 	if !ok || ref.ID != "c1" || ref.PodNamespace != "ns" || ref.PodName != "pod-u1" || ref.Pid != 0 {
 		t.Fatalf("created: %+v %v", ref, ok)
 	}
-	if err := e.p.LendNode(ctx, "u1", "app", 2); err == nil || !strings.Contains(err.Error(), "not started") {
+	if err := e.p.LendNode(ctx, "u1", "app", 2, "l1"); err == nil || !strings.Contains(err.Error(), "not started") {
 		t.Fatalf("lend before start: %v", err)
 	}
 
@@ -275,9 +275,9 @@ func TestLendMemsArithmetic(t *testing.T) {
 	for i, s := range steps {
 		var err error
 		if s.lend {
-			err = e.p.LendNode(ctx, "u1", "app", s.node)
+			err = e.p.LendNode(ctx, "u1", "app", s.node, "l1")
 		} else {
-			err = e.p.RevokeNode(ctx, "u1", "app", s.node)
+			err = e.p.RevokeNode(ctx, "u1", "app", s.node, "l1")
 		}
 		if err != nil {
 			t.Fatalf("step %d: %v", i, err)
@@ -294,8 +294,89 @@ func TestLendMemsArithmetic(t *testing.T) {
 	if ref, _ := e.p.Container("u1", "app"); ref.BaseMems != "0-1" {
 		t.Fatalf("BaseMems changed: %q", ref.BaseMems)
 	}
-	if err := e.p.LendNode(ctx, "u1", "app", -1); err == nil {
+	if err := e.p.LendNode(ctx, "u1", "app", -1, "l1"); err == nil {
 		t.Fatal("negative node accepted")
+	}
+}
+
+// TestLendTwoHolders lends one node for two leases: the node stays in
+// cpuset.mems until both have revoked it.
+func TestLendTwoHolders(t *testing.T) {
+	e := newLtEnv(t)
+	ctx := context.Background()
+	e.run(ltPod("u1"), "c1", "app", 101, "0-1")
+	cg := filepath.Join(cgroupRoot, "kubepods/u1/c1")
+	setMems := func(mems string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(cg, "cpuset.mems"), []byte(mems+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	steps := []struct {
+		lend   bool
+		holder string
+		want   string // update, "" for none
+		lent   []int
+		mems   string // cpuset.mems of the cgroup after the step, "" unchanged
+	}{
+		{true, "a", "c1 mems=0-2", []int{2}, "0-2"},
+		{true, "b", "", []int{2}, ""},
+		{true, "a", "", []int{2}, ""}, // idempotent
+		// b holds the node: no shrink, although cpuset.mems has it
+		{false, "a", "", []int{2}, ""},
+		{false, "a", "", []int{2}, ""}, // idempotent
+		{false, "x", "", []int{2}, ""}, // not a holder
+		{false, "b", "c1 mems=0-1", []int{}, "0-1"},
+		{false, "b", "", []int{}, ""}, // idempotent
+	}
+	for i, s := range steps {
+		var err error
+		if s.lend {
+			err = e.p.LendNode(ctx, "u1", "app", 2, s.holder)
+		} else {
+			err = e.p.RevokeNode(ctx, "u1", "app", 2, s.holder)
+		}
+		if err != nil {
+			t.Fatalf("step %d: %v", i, err)
+		}
+		if s.want == "" {
+			e.expectUpdates()
+		} else {
+			e.expectUpdates(s.want)
+		}
+		if got := e.p.LentNodes("u1", "app"); !reflect.DeepEqual(got, s.lent) {
+			t.Fatalf("step %d: lent %v, expected %v", i, got, s.lent)
+		}
+		if s.mems != "" {
+			setMems(s.mems)
+		}
+	}
+
+	// two nodes, each with its own holders
+	for _, l := range []struct {
+		node   int
+		holder string
+		want   string
+	}{{2, "a", "c1 mems=0-2"}, {3, "a", "c1 mems=0-3"}, {3, "b", ""}} {
+		if err := e.p.LendNode(ctx, "u1", "app", l.node, l.holder); err != nil {
+			t.Fatal(err)
+		}
+		if l.want == "" {
+			e.expectUpdates()
+		} else {
+			e.expectUpdates(l.want)
+		}
+	}
+	if err := e.p.RevokeNode(ctx, "u1", "app", 3, "a"); err != nil {
+		t.Fatal(err)
+	}
+	e.expectUpdates()
+	if err := e.p.RevokeNode(ctx, "u1", "app", 2, "a"); err != nil {
+		t.Fatal(err)
+	}
+	e.expectUpdates("c1 mems=0-1,3")
+	if got := e.p.LentNodes("u1", "app"); !reflect.DeepEqual(got, []int{3}) {
+		t.Fatalf("lent %v", got)
 	}
 }
 
@@ -304,7 +385,7 @@ func TestLendGoneContainer(t *testing.T) {
 	ctx := context.Background()
 	pod := ltPod("u1")
 	ctr := e.run(pod, "c1", "app", 101, "0")
-	if err := e.p.LendNode(ctx, "u1", "app", 3); err != nil {
+	if err := e.p.LendNode(ctx, "u1", "app", 3, "l1"); err != nil {
 		t.Fatal(err)
 	}
 	e.expectUpdates("c1 mems=0,3")
@@ -313,11 +394,11 @@ func TestLendGoneContainer(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.wait(e.gone, "c1")
-	if err := e.p.RevokeNode(ctx, "u1", "app", 3); err != nil {
+	if err := e.p.RevokeNode(ctx, "u1", "app", 3, "l1"); err != nil {
 		t.Fatalf("revoke of a gone container: %v", err)
 	}
 	e.expectUpdates()
-	if err := e.p.LendNode(ctx, "u1", "app", 3); err == nil {
+	if err := e.p.LendNode(ctx, "u1", "app", 3, "l1"); err == nil {
 		t.Fatal("lend to a gone container succeeded")
 	}
 	if got := e.p.LentNodes("u1", "app"); len(got) != 0 {
@@ -329,7 +410,7 @@ func TestLendGoneContainer(t *testing.T) {
 	if got := e.p.LentNodes("u1", "app"); len(got) != 0 {
 		t.Fatalf("restarted container has lends: %v", got)
 	}
-	if err := e.p.LendNode(ctx, "u1", "app", 3); err != nil {
+	if err := e.p.LendNode(ctx, "u1", "app", 3, "l1"); err != nil {
 		t.Fatal(err)
 	}
 	e.expectUpdates("c1b mems=0,3")
@@ -348,14 +429,14 @@ func TestLendRefusedWhenSteered(t *testing.T) {
 	t.Cleanup(func() { delete(e.p.managers, "c1") })
 
 	for _, uid := range []string{"u1", "u2"} {
-		err := e.p.LendNode(ctx, uid, "app", 2)
+		err := e.p.LendNode(ctx, uid, "app", 2, "l1")
 		if !errors.Is(err, errSteered) {
 			t.Fatalf("pod %s: expected steering refusal, got %v", uid, err)
 		}
 		if !strings.Contains(err.Error(), "lending is not supported together with steering yet") {
 			t.Fatalf("unclear error: %v", err)
 		}
-		if err := e.p.RevokeNode(ctx, uid, "app", 2); err != nil {
+		if err := e.p.RevokeNode(ctx, uid, "app", 2, "l1"); err != nil {
 			t.Fatalf("revoke on a steered container: %v", err)
 		}
 	}
@@ -368,18 +449,18 @@ func TestLendUpdateFailures(t *testing.T) {
 	e.run(ltPod("u1"), "c1", "app", 101, "0")
 
 	e.stub.fail = true
-	if err := e.p.LendNode(ctx, "u1", "app", 2); err == nil || !strings.Contains(err.Error(), "failed") {
+	if err := e.p.LendNode(ctx, "u1", "app", 2, "l1"); err == nil || !strings.Contains(err.Error(), "failed") {
 		t.Fatalf("failed update not reported: %v", err)
 	}
 	e.stub.fail, e.stub.err = false, errors.New("ttrpc closed")
-	if err := e.p.LendNode(ctx, "u1", "app", 2); err == nil || !strings.Contains(err.Error(), "ttrpc closed") {
+	if err := e.p.LendNode(ctx, "u1", "app", 2, "l1"); err == nil || !strings.Contains(err.Error(), "ttrpc closed") {
 		t.Fatalf("update error not reported: %v", err)
 	}
 	if got := e.p.LentNodes("u1", "app"); len(got) != 0 {
 		t.Fatalf("failed lends recorded: %v", got)
 	}
 	e.stub.err = nil
-	if err := e.p.LendNode(ctx, "u1", "app", 2); err != nil {
+	if err := e.p.LendNode(ctx, "u1", "app", 2, "l1"); err != nil {
 		t.Fatal(err)
 	}
 	e.expectUpdates("c1 mems=0,2")
@@ -388,12 +469,12 @@ func TestLendUpdateFailures(t *testing.T) {
 	e.p.mu.Lock()
 	e.p.stub = nil
 	e.p.mu.Unlock()
-	if err := e.p.LendNode(ctx, "u1", "app", 3); err == nil || !strings.Contains(err.Error(), "NRI not connected") {
+	if err := e.p.LendNode(ctx, "u1", "app", 3, "l1"); err == nil || !strings.Contains(err.Error(), "NRI not connected") {
 		t.Fatalf("expected NRI not connected, got %v", err)
 	}
 	cctx, cancel := context.WithCancel(ctx)
 	cancel()
-	if err := e.p.LendNode(cctx, "u1", "app", 3); !errors.Is(err, context.Canceled) {
+	if err := e.p.LendNode(cctx, "u1", "app", 3, "l1"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context canceled, got %v", err)
 	}
 }
@@ -411,12 +492,12 @@ func TestLendNeverWithoutBaseMems(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.wait(e.start, "c1")
-	if err := e.p.LendNode(ctx, "u1", "app", 2); err == nil || !strings.Contains(err.Error(), "base memory nodes unknown") {
+	if err := e.p.LendNode(ctx, "u1", "app", 2, "l1"); err == nil || !strings.Contains(err.Error(), "base memory nodes unknown") {
 		t.Fatalf("lend without base: %v", err)
 	}
 	// The only own node is the node being lent.
 	e.run(ltPod("u2"), "c2", "app", 201, "2")
-	if err := e.p.LendNode(ctx, "u2", "app", 2); err == nil || !strings.Contains(err.Error(), "base memory nodes unknown") {
+	if err := e.p.LendNode(ctx, "u2", "app", 2, "l1"); err == nil || !strings.Contains(err.Error(), "base memory nodes unknown") {
 		t.Fatalf("lend of the only node: %v", err)
 	}
 	e.expectUpdates()
@@ -432,7 +513,7 @@ func TestLendNeverWithoutBaseMems(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.wait(e.start, "c3")
-	if err := e.p.LendNode(ctx, "u3", "app", 2); err != nil {
+	if err := e.p.LendNode(ctx, "u3", "app", 2, "l1"); err != nil {
 		t.Fatal(err)
 	}
 	e.expectUpdates("c3 mems=1-2")
@@ -442,7 +523,7 @@ func TestLendBaseExcludesNodesLentToOthers(t *testing.T) {
 	e := newLtEnv(t)
 	ctx := context.Background()
 	e.run(ltPod("u1"), "c1", "app", 101, "0-1")
-	if err := e.p.LendNode(ctx, "u1", "app", 2); err != nil {
+	if err := e.p.LendNode(ctx, "u1", "app", 2, "l1"); err != nil {
 		t.Fatal(err)
 	}
 	e.expectUpdates("c1 mems=0-2")
@@ -497,27 +578,27 @@ func TestLendSynchronize(t *testing.T) {
 	}
 
 	// Re-applying the lend drops node 2 from BaseMems.
-	if err := e.p.LendNode(ctx, "u1", "app", 2); err != nil {
+	if err := e.p.LendNode(ctx, "u1", "app", 2, "l1"); err != nil {
 		t.Fatal(err)
 	}
 	e.expectUpdates("c1 mems=0-2")
 	if ref, _ := e.p.Container("u1", "app"); ref.BaseMems != "0-1" {
 		t.Fatalf("BaseMems after re-lend %q", ref.BaseMems)
 	}
-	if err := e.p.RevokeNode(ctx, "u1", "app", 2); err != nil {
+	if err := e.p.RevokeNode(ctx, "u1", "app", 2, "l1"); err != nil {
 		t.Fatal(err)
 	}
 	e.expectUpdates("c1 mems=0-1")
 
 	// A revoke without a re-lend still shrinks cpuset.mems.
-	if err := e.p.RevokeNode(ctx, "u2", "app", 3); err != nil {
+	if err := e.p.RevokeNode(ctx, "u2", "app", 3, "l1"); err != nil {
 		t.Fatal(err)
 	}
 	e.expectUpdates("c2 mems=0")
 
 	// A later Synchronize (reconnect) keeps lends and reports
 	// containers that vanished.
-	if err := e.p.LendNode(ctx, "u1", "app", 5); err != nil {
+	if err := e.p.LendNode(ctx, "u1", "app", 5, "l1"); err != nil {
 		t.Fatal(err)
 	}
 	e.expectUpdates("c1 mems=0-1,5")
@@ -550,7 +631,7 @@ func TestLendConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(n int) {
 			defer wg.Done()
-			if err := e.p.LendNode(ctx, "u1", "app", n); err != nil {
+			if err := e.p.LendNode(ctx, "u1", "app", n, "l1"); err != nil {
 				t.Error(err)
 			}
 			_ = e.p.LentNodes("u1", "app")

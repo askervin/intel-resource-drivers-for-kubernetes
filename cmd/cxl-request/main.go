@@ -14,22 +14,27 @@
  * limitations under the License.
  */
 
-// Command cxl-request borrows CXL pool memory for the running container
-// from kubelet-cxl-plugin through the lease socket $CXL_LEASE_SOCKET,
-// which the plugin mounts into containers that claim the token device
-// "dynamic" (DeviceClass cxl-dynamic). See doc/cxl/POOL.md.
+// Command cxl-request borrows CXL memory, of the node's local memdevs or
+// of a memory pool, for the running container from kubelet-cxl-plugin
+// through the lease socket $CXL_LEASE_SOCKET, which the plugin mounts
+// into containers that claim the token device "dynamic" (DeviceClass
+// cxl-dynamic). See doc/cxl/POOL.md and doc/cxl/LOCAL.md.
 //
-//	cxl-request memory <size> [--wait D] [--request-id ID]
-//	cxl-request memory <size> --dax [--read-only] [--wait D] [--exec CMD ARGS...]
+//	cxl-request memory <size> [SOURCE] [--serial S] [--wait D] [--request-id ID]
+//	cxl-request memory <size> [SOURCE] [--serial S] --dax [--read-only] [--wait D] [--exec CMD ARGS...]
 //	cxl-request shared <serial> [--exclusive] [--read-only] [--wait D] [--exec CMD ARGS...]
 //	cxl-request fd <lease> --exec CMD ARGS...
 //	cxl-request release <lease>|--all [--wait D]    (or: cxl-release ...)
 //	cxl-request list
 //
+// SOURCE is --source local|pool|any or --local (= --source local): memory
+// of a local memdev, of the pool (the default), or local if a local
+// memdev fits, else pool. --serial selects the device by its serial.
 // A memory lease is lent as a NUMA node, or with --dax passed as a devdax
-// fd; a shared lease is passed as a devdax fd. --exclusive takes all of a
-// shared device's "hosts" capacity, so that no other claim can have the
-// device while the lease lives. --read-only opens the fd read-only.
+// fd; a shared lease is a pool device passed as a devdax fd. --exclusive
+// takes all of a shared device's "hosts" capacity, so that no other claim
+// can have the device while the lease lives. --read-only opens the fd
+// read-only.
 //
 // It prints the plugin's JSON response line. With --exec the dax device
 // fd of a dax lease is passed to CMD as fd 3, with CXL_LEASE_FD=3,
@@ -71,6 +76,7 @@ type request struct {
 	Kind      string `json:"kind,omitempty"`
 	Size      string `json:"size,omitempty"`
 	Serial    string `json:"serial,omitempty"`
+	Source    string `json:"source,omitempty"`
 	Wait      string `json:"wait,omitempty"`
 	RequestID string `json:"requestId,omitempty"`
 	Lease     string `json:"lease,omitempty"`
@@ -84,6 +90,7 @@ type response struct {
 	Lease     string      `json:"lease,omitempty"`
 	State     string      `json:"state,omitempty"`
 	Kind      string      `json:"kind,omitempty"`
+	Source    string      `json:"source,omitempty"`
 	Mode      string      `json:"mode,omitempty"`
 	Exclusive bool        `json:"exclusive,omitempty"`
 	ReadOnly  bool        `json:"readOnly,omitempty"`
@@ -96,16 +103,18 @@ type response struct {
 }
 
 const usage = `usage:
-  cxl-request memory <size> [--wait DURATION] [--request-id ID]
-  cxl-request memory <size> --dax [--read-only] [--wait DURATION] [--exec CMD ARGS...]
+  cxl-request memory <size> [SOURCE] [--serial SERIAL] [--wait DURATION] [--request-id ID]
+  cxl-request memory <size> [SOURCE] [--serial SERIAL] --dax [--read-only] [--wait DURATION] [--exec CMD ARGS...]
   cxl-request shared <serial> [--exclusive] [--read-only] [--wait DURATION] [--exec CMD ARGS...]
   cxl-request fd <lease> --exec CMD ARGS...
   cxl-request release <lease>|--all [--wait DURATION]   (also: cxl-release ...)
   cxl-request list
 The socket is $CXL_LEASE_SOCKET. --wait 0s returns at once.
-memory: exclusive pool memory, lent as a NUMA node, or with --dax passed
-as a devdax fd. shared: a shared device, passed as a devdax fd;
---exclusive keeps everybody else off it while the lease lives.
+memory: exclusive memory, lent as a NUMA node, or with --dax passed as a
+devdax fd. SOURCE: --source pool (the default), --source local or --local
+(a memdev of this node), --source any (local if one fits, else pool).
+--serial selects the device. shared: a shared pool device, passed as a
+devdax fd; --exclusive keeps everybody else off it while the lease lives.
 --read-only: the fd is opened read-only.
 `
 
@@ -115,8 +124,11 @@ func main() {
 
 // command is a parsed command line.
 type command struct {
-	req  request
-	exec []string
+	req    request
+	exec   []string
+	source string // --source
+	local  bool   // --local
+	serial string // --serial
 }
 
 func usageErr(stderr io.Writer, format string, args ...any) int {
@@ -152,8 +164,8 @@ func parseArgs(prog string, args []string) (*command, error) {
 // to run.
 func parseOptions(args []string) (*command, []string, error) {
 	cmd := &command{}
-	values := map[string]*string{"--wait": &cmd.req.Wait, "--request-id": &cmd.req.RequestID}
-	flags := map[string]*bool{"--all": &cmd.req.All, "--exclusive": &cmd.req.Exclusive, "--read-only": &cmd.req.ReadOnly}
+	values := map[string]*string{"--wait": &cmd.req.Wait, "--request-id": &cmd.req.RequestID, "--source": &cmd.source, "--serial": &cmd.serial}
+	flags := map[string]*bool{"--all": &cmd.req.All, "--exclusive": &cmd.req.Exclusive, "--read-only": &cmd.req.ReadOnly, "--local": &cmd.local}
 	var pos []string
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -227,9 +239,13 @@ func setCommand(cmd *command, name string, pos []string) error {
 	return nil
 }
 
-// checkCommand returns an error if the options do not fit the command.
+// checkCommand returns an error if the options do not fit the command,
+// and sets the source and serial of a memory request.
 func checkCommand(cmd *command) error {
 	dax := cmd.req.Kind == "shared" || cmd.req.Mode == "dax"
+	if err := checkSource(cmd); err != nil {
+		return err
+	}
 	switch {
 	case cmd.req.Mode != "" && cmd.req.Kind != "memory":
 		return errors.New("--dax is for memory (shared leases are always dax)")
@@ -239,6 +255,31 @@ func checkCommand(cmd *command) error {
 		return errors.New("--read-only is for shared and memory --dax")
 	}
 	return checkExec(cmd, dax)
+}
+
+// checkSource returns an error if the source options do not fit the
+// command, and sets them on a memory request.
+func checkSource(cmd *command) error {
+	source := cmd.source
+	switch {
+	case cmd.local && source != "" && source != "local":
+		return fmt.Errorf("--local conflicts with --source %s", source)
+	case cmd.local:
+		source = "local"
+	}
+	switch {
+	case source != "" && cmd.req.Kind != "memory":
+		return errors.New("--source and --local are for memory (shared leases are pool leases)")
+	case cmd.serial != "" && cmd.req.Kind != "memory":
+		return errors.New("--serial is for memory (shared takes the serial as its argument)")
+	case source != "" && source != "local" && source != "pool" && source != "any":
+		return fmt.Errorf("invalid --source %q (local, pool or any)", source)
+	}
+	cmd.req.Source = source
+	if cmd.serial != "" {
+		cmd.req.Serial = cmd.serial
+	}
+	return nil
 }
 
 // checkExec returns an error if --exec does not fit the command: it needs

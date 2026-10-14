@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
 )
 
 // leasesFileName is the lease store in the cxl.generic plugin data
@@ -43,9 +45,13 @@ const (
 
 // Lease kinds (request "kind").
 const (
-	leaseKindMemory = "memory" // exclusive pool memory, lent as a NUMA node or passed as a devdax fd
+	leaseKindMemory = "memory" // exclusive memory, lent as a NUMA node or passed as a devdax fd
 	leaseKindShared = "shared" // shared pool device, passed as a devdax fd
 )
+
+// leaseSourceAny is the source of a memory lease that takes a local memdev
+// if one fits, else pool memory (device.SourceLocal, device.SourcePool).
+const leaseSourceAny = "any"
 
 // podRef identifies a pod.
 type podRef struct {
@@ -78,8 +84,14 @@ type lease struct {
 	TokenClaim string `json:"tokenClaim"` // uid of the token claim whose socket received it
 	RequestID  string `json:"requestId,omitempty"`
 	Kind       string `json:"kind"`
-	Size       string `json:"size,omitempty"`   // requested quantity (memory)
-	Serial     string `json:"serial,omitempty"` // 0x<lower-case hex> (shared, or the device of a Ready memory lease)
+	// Source is the requested source (local, pool or any), and the
+	// source of the device once Ready ("" in stores written before
+	// sources existed: pool).
+	Source string `json:"source,omitempty"`
+	Size   string `json:"size,omitempty"` // requested quantity (memory)
+	// Serial is 0x<lower-case hex>: the device of a shared lease, the
+	// requested device of a memory lease, or the device of a Ready lease.
+	Serial string `json:"serial,omitempty"`
 	// Mode is numa or dax ("" in stores written before modes existed:
 	// numa for memory, dax for shared leases).
 	Mode      string    `json:"mode,omitempty"`
@@ -94,6 +106,15 @@ type lease struct {
 	Bytes     uint64    `json:"bytes,omitempty"`
 	Dax       string    `json:"dax,omitempty"` // /dev/daxX.Y (dax mode)
 	Created   time.Time `json:"created"`
+}
+
+// source returns the source of a lease, also for stores written before
+// sources existed.
+func (l *lease) source() string {
+	if l.Source == "" {
+		return device.SourcePool
+	}
+	return l.Source
 }
 
 // companionName is the name of the companion claim and pod of a lease.

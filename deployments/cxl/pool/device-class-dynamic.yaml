@@ -1,10 +1,11 @@
 # DeviceClass of the token device "dynamic" that kubelet-cxl-plugin
-# publishes in every node's cxl.generic ResourceSlice (--pool-lend, on by
+# publishes in every node's cxl.generic ResourceSlice (--lend, on by
 # default). The device has no capacity and can be allocated any number of
 # times. A container that references a claim on it gets a lease socket at
 # /run/cxl/cxl.sock (env CXL_LEASE_SOCKET) and the cxl-request CLI, with
-# which it can borrow pool memory while it runs. See doc/cxl/POOL.md,
-# "Lending to running containers".
+# which it can borrow memory while it runs: of the CXL memory devices
+# attached to its node (doc/cxl/LOCAL.md) and of a memory pool. See
+# doc/cxl/POOL.md, "Lending to running containers".
 apiVersion: resource.k8s.io/v1
 kind: DeviceClass
 metadata:

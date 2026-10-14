@@ -17,6 +17,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -24,6 +25,9 @@ import (
 	"testing"
 
 	nricxl "github.com/containers/nri-plugins/pkg/cxl"
+
+	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
+	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/helpers"
 )
 
 func TestNewDriverConfigFromString_WithTestability(t *testing.T) {
@@ -331,7 +335,7 @@ func TestBuildDevInfos_WithFakeDevices(t *testing.T) {
 	}
 
 	driverConfig := &DriverConfig{IgnoreDRAMNodes: true}
-	devInfos, err := buildDevInfos(driverConfig, devices, nil)
+	devInfos, err := buildDevInfos(driverConfig, devices, nil, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -560,5 +564,72 @@ func TestResolveConfigStr_YAMLFile(t *testing.T) {
 	}
 	if !cfg.IgnoreDRAMNodes {
 		t.Error("expected IgnoreDRAMNodes=true")
+	}
+}
+
+func TestDriverConfigManageMemdevs(t *testing.T) {
+	for _, tc := range []struct {
+		config string
+		want   bool
+	}{
+		{"{}", true},
+		{"manageMemdevs: true", true},
+		{"manageMemdevs: false", false},
+		{`{"manageMemdevs": false, "IgnoreDevices": ["mem0"]}`, false},
+	} {
+		cfg, err := newDriverConfigFromString(tc.config)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.config, err)
+		}
+		if got := cfg.manageMemdevs(); got != tc.want {
+			t.Errorf("%s: manageMemdevs %v, expected %v", tc.config, got, tc.want)
+		}
+	}
+}
+
+func TestNewLocalHelper(t *testing.T) {
+	dir := t.TempDir()
+	config := &helpers.Config{CommonFlags: &helpers.Flags{KubeletPluginDir: dir}}
+	off := &DriverConfig{ManageMemdevs: ptr(false)}
+	if local, err := newLocalHelper(context.Background(), config, off, dir); err != nil || local != nil {
+		t.Fatalf("unmanaged memdevs: %v %v", local, err)
+	}
+	// the state of a memdev that is gone is dropped at start
+	state := `[{"serial":3238060769,"serialHex":"c100e2e1","memdev":"mem0","region":"region0","mode":"numa","node":2,"claims":{"u1":[{"request":"mem","region":"region0","size":2097152}]}}]`
+	if err := os.WriteFile(filepath.Join(dir, localStateFileName), []byte(state), 0600); err != nil {
+		t.Fatal(err)
+	}
+	local, err := newLocalHelper(context.Background(), config, &DriverConfig{}, dir)
+	if err != nil || local == nil {
+		t.Fatalf("local helper: %v %v", local, err)
+	}
+	if m := local.Modes(); len(m) != 0 {
+		t.Fatalf("modes %v of a gone memdev", m)
+	}
+	if local.mem.SysRoot != dir+"/sys" || local.stateFile != filepath.Join(dir, localStateFileName) {
+		t.Fatalf("local helper %+v", local)
+	}
+	if _, err := os.Stat(filepath.Join(dir, preparedClaimsInfoFileName)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Before the kubelet plugin runs, a rescan updates the devices but does not
+// publish them (there is no helper yet).
+func TestRescanBeforeStart(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"sys/bus/cxl/devices", "sys/devices/system/node"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d := &driver{
+		sysfsRoot: root,
+		config:    &DriverConfig{IgnoreDRAMNodes: true, PublishDynamicToken: true},
+		state:     nodeState{NodeState: &helpers.NodeState{NodeName: "n1"}},
+	}
+	d.rescanAndPublish(context.Background())
+	if devs, ok := d.state.Allocatable.(device.DevicesInfo); !ok || devs[device.DynamicDeviceName] == nil {
+		t.Fatalf("devices after the rescan: %+v", d.state.Allocatable)
 	}
 }
