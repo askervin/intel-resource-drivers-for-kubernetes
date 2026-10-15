@@ -332,7 +332,7 @@ metadata:
 spec:
   selectors:
   - cel:
-      expression: \"device.driver == 'cxl.generic' && device.attributes['cxl.generic'].type == 'cxl-node'\"
+      expression: \"device.driver == 'cxl.generic' && device.attributes['cxl.generic'].type == 'region'\"
 ---
 apiVersion: resource.k8s.io/v1
 kind: DeviceClass
@@ -395,22 +395,22 @@ section "check that the driver publishes CXL and DRAM devices"
     # The driver publishes one device per enabled CXL region plus one
     # aggregate "dram" device for all DRAM NUMA nodes.
     vmsh "" 'kubectl get resourceslices -o json |
-             jq -e ".items[].spec.devices | map(select(.attributes.type.string == \"cxl-node\")) | length > 0"' ||
-        error "no cxl-node devices in published resource slices"
+             jq -e ".items[].spec.devices | map(select(.attributes.type.string == \"region\")) | length > 0"' ||
+        error "no region devices in published resource slices"
 
     vmsh "" 'kubectl get resourceslices -o json |
              jq -e ".items[].spec.devices | map(select(.attributes.type.string == \"dram\")) | length > 0"' ||
         error "no dram devices in published resource slices"
 
     vmsh "kubectl get resourceslices -o json |
-          jq -r '.items[].spec.devices[] | select(.attributes.type.string == \"cxl-node\") |
+          jq -r '.items[].spec.devices[] | select(.attributes.type.string == \"region\") |
                  \"CXL device \\(.name) on NUMA node \\(.attributes.node.int): \\(.capacity.memory.value)\"'"
 
     # All claims below request CXL memory from a single CXL device, so
     # the largest device must have room for all of them together.
     cxl_needed=$(( $(numfmt --from=iec "${CXL_MEM_SMALL%i}") + 3 * $(numfmt --from=iec "${CXL_MEM_MEDIUM%i}") ))
     vmsh "kubectl get resourceslices -o json |
-          jq -r '.items[].spec.devices[] | select(.attributes.type.string == \"cxl-node\") | .capacity.memory.value'"
+          jq -r '.items[].spec.devices[] | select(.attributes.type.string == \"region\") | .capacity.memory.value'"
     cxl_largest=0
     for capacity in $COMMAND_OUTPUT; do
         # capacity is a k8s quantity, e.g. "256Mi" or "262144Ki"

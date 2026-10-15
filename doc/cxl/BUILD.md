@@ -35,3 +35,19 @@ or
 ```bash
 CXL_IMAGE_TAG=registry.local/intel-cxl-resource-driver:latest make cxl-container-push
 ```
+
+## Host binaries
+
+Local memdevs, pool devices, steering and leases need `kubelet-cxl-plugin` as a host process
+(see [USAGE.md](USAGE.md#as-a-host-process)), and leases need the lease CLI `cxl-request` on the
+host, from where the plugin mounts it into containers. Both are static binaries; from the root
+of this Git repository:
+
+```bash
+go mod vendor
+CGO_ENABLED=0 go build -mod vendor -o bin/kubelet-cxl-plugin ./cmd/kubelet-cxl-plugin
+CGO_ENABLED=0 go build -mod vendor -o bin/cxl-request ./cmd/cxl-request
+```
+
+Install them on the node as `/usr/local/bin/kubelet-cxl-plugin` and `/usr/local/bin/cxl-request`
+(the default of `--lease-cli`).

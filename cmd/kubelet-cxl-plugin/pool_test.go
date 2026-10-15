@@ -37,6 +37,7 @@ import (
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 	cdiSpecs "tags.cncf.io/container-device-interface/specs-go"
 
+	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/api"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
 
 	nricxl "github.com/containers/nri-plugins/pkg/cxl"
@@ -189,7 +190,7 @@ func newPoolTestEnv(t *testing.T) *poolTestEnv {
 	}
 }
 
-// driver returns a new pool helper on the env's state file, as after a
+// driver returns a new pool driver on the env's state file, as after a
 // restart, without a kubelet plugin.
 func (e *poolTestEnv) driver(t *testing.T) *poolDriver {
 	t.Helper()
@@ -332,7 +333,7 @@ func (e *poolTestEnv) wantClean(t *testing.T, p *poolDriver) {
 	}
 }
 
-// wantCDIDevice returns the CDI device of the serial with the env.
+// wantCDIDevice returns the CDI device with the name and the env.
 func (e *poolTestEnv) wantCDIDevice(t *testing.T, name string, env []string) *cdiSpecs.Device {
 	t.Helper()
 	cd := cdiDeviceByName(e.cdiSpec(t), name)
@@ -410,15 +411,18 @@ func TestPoolPrepareExclusive(t *testing.T) {
 		Requests:     []string{"mem"},
 		PoolName:     "fake-cxl-pool",
 		DeviceName:   "pooled0",
-		CDIDeviceIDs: []string{"generic/cxl=pool-c1ee0001"},
+		CDIDeviceIDs: []string{"generic/cxl-pool=claim-u1-0"},
 	}}
 	if !reflect.DeepEqual(res.Devices, want) {
 		t.Fatalf("unexpected devices %+v", res.Devices)
 	}
 	e.f.wantCommand(t, "cxl create-region -t ram -d decoder0.0 -m mem0")
 	e.f.wantBlocks(t, "online_movable")
-	cd := e.wantCDIDevice(t, "pool-c1ee0001",
-		[]string{"CXL_POOL_NODE_C1EE0001=2", "CXL_POOL_SIZE_C1EE0001=268435456", "CXL_POOL_SERIAL_C1EE0001=0xc1ee0001"})
+	if spec := e.cdiSpec(t); spec.Kind != "generic/cxl-pool" {
+		t.Fatalf("CDI spec kind %q", spec.Kind)
+	}
+	cd := e.wantCDIDevice(t, "claim-u1-0", []string{"CXL_C1EE0001_MODE=numa", "CXL_C1EE0001_NODE=2", "CXL_C1EE0001_SERIAL=0xc1ee0001",
+		"CXL_C1EE0001_SHARED=0", "CXL_C1EE0001_SIZE=268435456", "CXL_CLAIM_u1=1"})
 	if len(cd.ContainerEdits.DeviceNodes) != 0 {
 		t.Fatalf("unexpected device nodes %+v", cd.ContainerEdits.DeviceNodes)
 	}
@@ -456,26 +460,31 @@ func TestPoolPrepareSharedTwoClaims(t *testing.T) {
 
 	res := prepare(t, p, poolClaim("u1", "c1", "shared0", sharedData))
 	noErr(t, res.Err)
-	if !slices.Equal(res.Devices[0].CDIDeviceIDs, []string{"generic/cxl=pool-c1ae0001"}) {
+	if !slices.Equal(res.Devices[0].CDIDeviceIDs, []string{"generic/cxl-pool=claim-u1-0"}) {
 		t.Fatalf("unexpected device %+v", res.Devices[0])
 	}
 	e.f.wantBlocks(t, "offline") // shared memory is never onlined
 	e.f.wantCommand(t, "daxctl reconfigure-device --mode=devdax --force dax0.0")
-	cd := e.wantCDIDevice(t, "pool-c1ae0001",
-		[]string{"CXL_SHARED_DAX_C1AE0001=/dev/dax0.0", "CXL_SHARED_SIZE_C1AE0001=268435456", "CXL_SHARED_SERIAL_C1AE0001=0xc1ae0001"})
+	sharedEnv := func(uid string) []string {
+		return []string{"CXL_C1AE0001_DAX=/dev/dax0.0", "CXL_C1AE0001_MODE=dax", "CXL_C1AE0001_READONLY=0",
+			"CXL_C1AE0001_SERIAL=0xc1ae0001", "CXL_C1AE0001_SHARED=1", "CXL_C1AE0001_SIZE=268435456", "CXL_CLAIM_" + uid + "=1"}
+	}
+	cd := e.wantCDIDevice(t, "claim-u1-0", sharedEnv("u1"))
 	wantNodes := []*cdiSpecs.DeviceNode{{Path: "/dev/dax0.0", Type: "c", Major: 251, Minor: 3}}
 	if !reflect.DeepEqual(cd.ContainerEdits.DeviceNodes, wantNodes) {
 		t.Fatalf("unexpected device nodes %+v", cd.ContainerEdits.DeviceNodes)
 	}
 
-	// a second claim on the same device reuses the region
+	// a second claim on the same device reuses the region and has a CDI
+	// device of its own
 	noErr(t, prepare(t, p, poolClaim("u2", "c2", "shared0", sharedData)).Err)
 	if n := strings.Count(e.f.commands(), "create-region"); n != 1 {
 		t.Fatalf("region created %d times", n)
 	}
-	if spec := e.cdiSpec(t); len(spec.Devices) != 1 {
-		t.Fatalf("expected one CDI device per serial, got %+v", spec.Devices)
+	if spec := e.cdiSpec(t); len(spec.Devices) != 2 {
+		t.Fatalf("expected one CDI device per claim, got %+v", spec.Devices)
 	}
+	e.wantCDIDevice(t, "claim-u2-0", sharedEnv("u2"))
 	// an exclusive claim on the shared serial is refused
 	res = prepare(t, p, poolClaim("u3", "c3", "shared0", `{"serial":"0xc1ae0001","shared":false,"size":268435456}`))
 	wantErr(t, res.Err, "another claim prepared it with shared=true")
@@ -485,7 +494,10 @@ func TestPoolPrepareSharedTwoClaims(t *testing.T) {
 	if strings.Contains(e.f.commands(), "disable-region") || !p.Serials()[0xc1ae0001] {
 		t.Fatalf("device released while still used:\n%s", e.f.commands())
 	}
-	e.wantCDIDevice(t, "pool-c1ae0001", cd.ContainerEdits.Env)
+	if cdiDeviceByName(e.cdiSpec(t), "claim-u1-0") != nil {
+		t.Fatal("CDI device of an unprepared claim left")
+	}
+	e.wantCDIDevice(t, "claim-u2-0", sharedEnv("u2"))
 	// unprepare of both releases
 	noErr(t, unprepare(t, p, "u2"))
 	e.f.wantReleased(t)
@@ -499,14 +511,15 @@ func TestPoolRestart(t *testing.T) {
 	res := prepare(t, p, poolClaim("u1", "c1", "pooled0", exclusiveData))
 	noErr(t, res.Err)
 	ncmds := len(e.f.cmds)
-	// a restart rewrites the CDI spec (newNodeState removes all generic/cxl specs)
+	// a restart rewrites the CDI spec (newNodeState removes the specs of
+	// both drivers)
 	_ = os.RemoveAll(e.cdiDir)
 
 	p2 := e.driver(t)
 	if !p2.Serials()[0xc1ee0001] {
 		t.Fatalf("restored serials %v", p2.Serials())
 	}
-	if cdiDeviceByName(e.cdiSpec(t), "pool-c1ee0001") == nil {
+	if cdiDeviceByName(e.cdiSpec(t), "claim-u1-0") == nil {
 		t.Fatal("CDI spec not rewritten after restart")
 	}
 	res2 := prepare(t, p2, poolClaim("u1", "c1", "pooled0", exclusiveData))
@@ -560,24 +573,24 @@ func TestBuildDevInfosSkipsPoolDevices(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := devInfos["region0"]; !ok {
+	if _, ok := devInfos["region0-node2"]; !ok {
 		t.Fatalf("local region missing: %v", devInfos)
 	}
-	if _, ok := devInfos["region1"]; ok {
+	if _, ok := devInfos["region1-node3"]; ok {
 		t.Fatal("pool region published")
 	}
-	dram, ok := devInfos["dram"].Dev.(*device.SystemDRAM)
+	dram, ok := devInfos["dram"].Dev.(*device.DRAM)
 	if !ok || !slices.Equal(dram.Nodes, []int{0}) {
 		t.Fatalf("pool node counted as DRAM: %+v", devInfos["dram"])
 	}
-	if devInfos, _ := buildDevInfos(&DriverConfig{}, devices, nil, nil); devInfos["region1"] == nil {
-		t.Fatal("region1 skipped without the pool helper")
+	if devInfos, _ := buildDevInfos(&DriverConfig{}, devices, nil, nil); devInfos["region1-node3"] == nil {
+		t.Fatal("region1 skipped without the pool driver")
 	}
 }
 
 const (
-	daxConfig = `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"PoolDeviceConfig","mode":"dax"}`
-	roConfig  = `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"PoolDeviceConfig","readOnly":true}`
+	daxConfig = `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"DeviceConfig","mode":"dax"}`
+	roConfig  = `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"DeviceConfig","readOnly":true}`
 )
 
 // withConfig adds an opaque config of the pool driver to the allocation
@@ -601,18 +614,18 @@ func TestPoolPrepareExclusiveDax(t *testing.T) {
 	claim := withConfig(poolClaim("u1", "c1", "pooled0", exclusiveData), resourceapi.AllocationConfigSourceClaim, nil, daxConfig)
 	res := prepare(t, p, claim)
 	noErr(t, res.Err)
-	if !slices.Equal(res.Devices[0].CDIDeviceIDs, []string{"generic/cxl=pool-c1ee0001"}) {
+	if !slices.Equal(res.Devices[0].CDIDeviceIDs, []string{"generic/cxl-pool=claim-u1-0"}) {
 		t.Fatalf("unexpected device %+v", res.Devices[0])
 	}
 	e.f.wantCommand(t, "daxctl reconfigure-device --mode=devdax --force dax0.0")
 	e.f.wantBlocks(t, "offline") // a dax device is never onlined
-	cd := e.wantCDIDevice(t, "pool-c1ee0001",
-		[]string{"CXL_POOL_DAX_C1EE0001=/dev/dax0.0", "CXL_POOL_SIZE_C1EE0001=268435456", "CXL_POOL_SERIAL_C1EE0001=0xc1ee0001"})
+	cd := e.wantCDIDevice(t, "claim-u1-0", []string{"CXL_C1EE0001_DAX=/dev/dax0.0", "CXL_C1EE0001_MODE=dax", "CXL_C1EE0001_READONLY=0",
+		"CXL_C1EE0001_SERIAL=0xc1ee0001", "CXL_C1EE0001_SHARED=0", "CXL_C1EE0001_SIZE=268435456", "CXL_CLAIM_u1=1"})
 	wantNodes := []*cdiSpecs.DeviceNode{{Path: "/dev/dax0.0", Type: "c", Major: 251, Minor: 3}}
 	if !reflect.DeepEqual(cd.ContainerEdits.DeviceNodes, wantNodes) {
 		t.Fatalf("unexpected device nodes %+v", cd.ContainerEdits.DeviceNodes)
 	}
-	if d := p.prepared["u1"].Devices[0]; d.Mode != device.ModeDax || d.Node != -1 || d.DaxDevice != "/dev/dax0.0" {
+	if d := p.prepared["u1"].Devices[0]; d.Mode != api.ModeDax || d.Node != -1 || d.DaxDevice != "/dev/dax0.0" {
 		t.Fatalf("prepared device %+v", d)
 	}
 
@@ -632,11 +645,11 @@ func TestPoolReadOnlyCDIDevices(t *testing.T) {
 
 	res := prepare(t, p, withConfig(poolClaim("u1", "c1", "shared0", sharedData), resourceapi.AllocationConfigSourceClaim, nil, roConfig))
 	noErr(t, res.Err)
-	if !slices.Equal(res.Devices[0].CDIDeviceIDs, []string{"generic/cxl=pool-c1ae0001-ro"}) {
+	if !slices.Equal(res.Devices[0].CDIDeviceIDs, []string{"generic/cxl-pool=claim-u1-0"}) {
 		t.Fatalf("unexpected device %+v", res.Devices[0])
 	}
-	ro := e.wantCDIDevice(t, "pool-c1ae0001-ro", []string{"CXL_SHARED_DAX_C1AE0001=/dev/dax0.0", "CXL_SHARED_SIZE_C1AE0001=268435456",
-		"CXL_SHARED_SERIAL_C1AE0001=0xc1ae0001", "CXL_SHARED_READONLY_C1AE0001=1"})
+	ro := e.wantCDIDevice(t, "claim-u1-0", []string{"CXL_C1AE0001_DAX=/dev/dax0.0", "CXL_C1AE0001_MODE=dax", "CXL_C1AE0001_READONLY=1",
+		"CXL_C1AE0001_SERIAL=0xc1ae0001", "CXL_C1AE0001_SHARED=1", "CXL_C1AE0001_SIZE=268435456", "CXL_CLAIM_u1=1"})
 	wantNodes := []*cdiSpecs.DeviceNode{{Path: "/dev/dax0.0", Type: "c", Major: 251, Minor: 3, Permissions: "r"}}
 	if !reflect.DeepEqual(ro.ContainerEdits.DeviceNodes, wantNodes) {
 		t.Fatalf("unexpected read-only device nodes %+v", ro.ContainerEdits.DeviceNodes)
@@ -646,20 +659,21 @@ func TestPoolReadOnlyCDIDevices(t *testing.T) {
 	// region is reused
 	res = prepare(t, p, poolClaim("u2", "c2", "shared0", sharedData))
 	noErr(t, res.Err)
-	if !slices.Equal(res.Devices[0].CDIDeviceIDs, []string{"generic/cxl=pool-c1ae0001"}) {
+	if !slices.Equal(res.Devices[0].CDIDeviceIDs, []string{"generic/cxl-pool=claim-u2-0"}) {
 		t.Fatalf("unexpected device %+v", res.Devices[0])
 	}
 	if n := strings.Count(e.f.commands(), "create-region"); n != 1 {
 		t.Fatalf("region created %d times", n)
 	}
-	rw := e.wantCDIDevice(t, "pool-c1ae0001", ro.ContainerEdits.Env[:3])
+	rw := e.wantCDIDevice(t, "claim-u2-0", []string{"CXL_C1AE0001_DAX=/dev/dax0.0", "CXL_C1AE0001_MODE=dax", "CXL_C1AE0001_READONLY=0",
+		"CXL_C1AE0001_SERIAL=0xc1ae0001", "CXL_C1AE0001_SHARED=1", "CXL_C1AE0001_SIZE=268435456", "CXL_CLAIM_u2=1"})
 	if rw.ContainerEdits.DeviceNodes[0].Permissions != "" {
 		t.Fatalf("read-write device node %+v", rw.ContainerEdits.DeviceNodes[0])
 	}
 
 	// unprepare the read-only claim: its CDI device goes, the device stays
 	noErr(t, unprepare(t, p, "u1"))
-	if cdiDeviceByName(e.cdiSpec(t), "pool-c1ae0001-ro") != nil || strings.Contains(e.f.commands(), "disable-region") {
+	if cdiDeviceByName(e.cdiSpec(t), "claim-u1-0") != nil || strings.Contains(e.f.commands(), "disable-region") {
 		t.Fatalf("after the read-only unprepare: %+v\n%s", e.cdiSpec(t), e.f.commands())
 	}
 	noErr(t, unprepare(t, p, "u2"))
@@ -674,11 +688,16 @@ func TestPoolConfigErrors(t *testing.T) {
 	for _, tc := range []struct {
 		data, params, err string
 	}{
-		{sharedData, `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"PoolDeviceConfig","mode":"numa"}`, "a shared device is used as dax only"},
-		{exclusiveData, roConfig, "readOnly needs mode dax"},
-		{exclusiveData, `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"PoolDeviceConfig","mode":"ram"}`, `invalid mode "ram"`},
-		{sharedData, `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"PoolDeviceConfig","access":"ro"}`, `unknown field "access"`},
-		{sharedData, `{"apiVersion":"v1","kind":"PoolDeviceConfig"}`, `apiVersion "v1"`},
+		{sharedData, `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"DeviceConfig","mode":"numa"}`, "DeviceConfig: mode numa: a shared device is used as dax only"},
+		{exclusiveData, roConfig, "DeviceConfig: readOnly needs mode dax"},
+		{exclusiveData, `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"DeviceConfig","mode":"ram"}`, `DeviceConfig: invalid mode "ram" (numa or dax)`},
+		{sharedData, `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"DeviceConfig","access":"ro"}`, `unknown field "access"`},
+		{sharedData, `{"apiVersion":"v1","kind":"DeviceConfig"}`, `DeviceConfig: apiVersion "v1", expected "cxl-pool.generic/v1alpha1"`},
+		// an old kind would give a read-write device of a reader
+		{sharedData, `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"PoolDeviceConfig","readOnly":true}`,
+			`cxl-pool.generic: preparing claim default/c1: unknown kind "PoolDeviceConfig" (DeviceConfig)`},
+		{sharedData, `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"MemoryPolicyConfig","memoryUseOrder":"first-dram"}`,
+			`unknown kind "MemoryPolicyConfig" (DeviceConfig)`},
 	} {
 		claim := withConfig(poolClaim("u1", "c1", "shared0", tc.data), resourceapi.AllocationConfigSourceClaim, nil, tc.params)
 		wantErr(t, prepare(t, p, claim).Err, tc.err)
@@ -689,13 +708,38 @@ func TestPoolConfigErrors(t *testing.T) {
 	}
 }
 
-// TestPoolDeviceMode checks the mode of devices of state files written
-// before modes existed.
-func TestPoolDeviceMode(t *testing.T) {
-	if m := (&preparedPoolDevice{DaxDevice: "/dev/dax0.0"}).mode(); m != device.ModeDax {
-		t.Errorf("old shared device: mode %q", m)
+// TestPoolCDISpecKeys builds the CDI devices of a claim with two devices
+// of one serial, the second one read-only, and a third device: one CDI
+// device per allocation result with its own env (the second device of the
+// serial has the key <HEX>_2) and device node; none of a companion claim.
+func TestPoolCDISpecKeys(t *testing.T) {
+	p := &poolDriver{prepared: map[string]*preparedPoolClaim{
+		"u1": {Devices: []preparedPoolDevice{
+			{Result: 0, Serial: 0xc1ae0001, Shared: true, Size: 1 << 28, Mode: api.ModeDax, DaxDevice: "/dev/dax0.0", DaxMajor: 251, DaxMinor: 3, Node: -1},
+			{Result: 1, Serial: 0xc1ae0001, Shared: true, Size: 1 << 28, Mode: api.ModeDax, ReadOnly: true, DaxDevice: "/dev/dax0.0", DaxMajor: 251, DaxMinor: 3, Node: -1},
+			{Result: 3, Serial: 0xc1ee0001, Size: 1 << 29, Mode: api.ModeNUMA, Node: 3},
+		}},
+		// a companion claim
+		"u2": {Devices: []preparedPoolDevice{{Serial: 0xc1ee0002, Size: 1 << 29, Mode: api.ModeNUMA, Node: 4}}, Lend: &lendRecord{Lease: "l1"}},
+	}}
+	spec := p.buildCDISpec()
+	want := []cdiSpecs.Device{
+		{Name: "claim-u1-0", ContainerEdits: cdiSpecs.ContainerEdits{
+			Env: []string{"CXL_C1AE0001_DAX=/dev/dax0.0", "CXL_C1AE0001_MODE=dax", "CXL_C1AE0001_READONLY=0", "CXL_C1AE0001_SERIAL=0xc1ae0001",
+				"CXL_C1AE0001_SHARED=1", "CXL_C1AE0001_SIZE=268435456", "CXL_CLAIM_u1=1"},
+			DeviceNodes: []*cdiSpecs.DeviceNode{{Path: "/dev/dax0.0", Type: "c", Major: 251, Minor: 3}},
+		}},
+		{Name: "claim-u1-1", ContainerEdits: cdiSpecs.ContainerEdits{
+			Env: []string{"CXL_C1AE0001_2_DAX=/dev/dax0.0", "CXL_C1AE0001_2_MODE=dax", "CXL_C1AE0001_2_READONLY=1", "CXL_C1AE0001_2_SERIAL=0xc1ae0001",
+				"CXL_C1AE0001_2_SHARED=1", "CXL_C1AE0001_2_SIZE=268435456", "CXL_CLAIM_u1=1"},
+			DeviceNodes: []*cdiSpecs.DeviceNode{{Path: "/dev/dax0.0", Type: "c", Major: 251, Minor: 3, Permissions: "r"}},
+		}},
+		{Name: "claim-u1-3", ContainerEdits: cdiSpecs.ContainerEdits{
+			Env: []string{"CXL_C1EE0001_MODE=numa", "CXL_C1EE0001_NODE=3", "CXL_C1EE0001_SERIAL=0xc1ee0001", "CXL_C1EE0001_SHARED=0",
+				"CXL_C1EE0001_SIZE=536870912", "CXL_CLAIM_u1=1"},
+		}},
 	}
-	if m := (&preparedPoolDevice{Node: 2}).mode(); m != device.ModeNUMA {
-		t.Errorf("old exclusive device: mode %q", m)
+	if spec.Kind != device.PoolCDIKind || !reflect.DeepEqual(spec.Devices, want) {
+		t.Fatalf("CDI spec %+v", spec)
 	}
 }

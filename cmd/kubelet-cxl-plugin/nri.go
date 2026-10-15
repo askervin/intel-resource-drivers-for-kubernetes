@@ -29,6 +29,7 @@ import (
 	"github.com/containerd/nri/pkg/stub"
 	"github.com/containers/nri-plugins/pkg/cgmpolmgr"
 
+	cxlapi "github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/api"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
 
 	"k8s.io/klog/v2"
@@ -328,18 +329,18 @@ func (p *nriPlugin) claimedMemory(ctrName string, claimUIDs []string) (cgmpolmgr
 			ctrName, claimUID, info.ClaimName, len(info.Devices))
 
 		for i, dev := range info.Devices {
-			klog.V(5).Infof("NRI CreateContainer: ctr=%s claim=%s device[%d]: name=%s type=%s sysfs=%s numa=%v affinities=%v total=%s consumed=%s request=%s",
+			klog.V(5).Infof("NRI CreateContainer: ctr=%s claim=%s device[%d]: name=%s type=%s mode=%s sysfs=%s numa=%v affinities=%v total=%s consumed=%s request=%s",
 				ctrName, claimUID, i,
-				dev.DeviceName, dev.DeviceType, dev.SysfsPath, dev.NUMANodes, dev.NodeAffinities,
+				dev.DeviceName, dev.DeviceType, dev.Mode, dev.SysfsPath, dev.NUMANodes, dev.NodeAffinities,
 				formatBytes(dev.TotalBytes), formatBytes(uint64(dev.ConsumedBytes)),
 				dev.RequestName)
-			switch dev.DeviceType {
-			case device.DeviceTypeDRAM:
+			switch {
+			case dev.DeviceType == device.DeviceTypeDRAM:
 				for _, n := range dev.NUMANodes {
 					dramNodeSet[n] = true
 				}
 				mem.DRAMQuota += dev.ConsumedBytes
-			case device.DeviceTypeCXLNode:
+			case dev.Mode == cxlapi.ModeNUMA && (dev.DeviceType == device.DeviceTypeMemdev || dev.DeviceType == device.DeviceTypeRegion):
 				for _, n := range dev.NUMANodes {
 					cxlNodeSet[n] = true
 				}

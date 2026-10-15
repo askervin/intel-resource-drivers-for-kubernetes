@@ -125,7 +125,7 @@ func TestPoolSlicesFirstListFails(t *testing.T) {
 		t.Fatalf("published %v after the first successful list (failing %v)", got, ps.Failing())
 	}
 	// without pool controllers (no client) everything is known
-	if got := scanNames(t, ctx, cfg, nil); !slices.Equal(got, []string{localDeviceName, "cxlmem-c1ee0001"}) {
+	if got := scanNames(t, ctx, cfg, nil); !slices.Equal(got, []string{localDeviceName, "memdev-c1ee0001"}) {
 		t.Fatalf("published %v without a client", got)
 	}
 }

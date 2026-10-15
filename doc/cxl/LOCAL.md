@@ -8,26 +8,27 @@ driver of kubelet-cxl-plugin publishes such free devices in the node's
 ResourceSlice and creates and destroys their regions on demand: every
 claim gets a slice of a device, as memory of a NUMA node or as a devdax
 device, slices of both kinds share a device, and a running container can
-borrow local memory and give it back (`cxl-request --local`).
+lease local memory and give it back
+(`cxl-request request --source local --size 64Mi`, see [LEASES.md](LEASES.md)).
 
 Regions that exist already (created by the BIOS or an admin, onlined as
-RAM) are published as `cxl-node` devices; this document is about the
-devices the plugin manages itself.
+RAM) are published as `region` devices ([USAGE.md](USAGE.md#devices-of-cxlgeneric));
+this document is about the devices the plugin manages itself.
 
 ## What the plugin publishes
 
-A memdev is published as a device of type `cxl-memdev` when it is enabled
+A memdev is published as a device of type `memdev` when it is enabled
 (bound to the `cxl_mem` driver; the kernel enables a hotplugged memdev,
 and the plugin never disables a local one), has RAM capacity, is not a
 pool device (prepared by the pool driver, see [POOL.md](POOL.md)), is not
 excluded by `ignoreDevices` (name, `cxl/memN`, `major:minor` or serial)
 and has no region that the plugin did not create itself. A memdev with a
-foreign region is left alone: its RAM region is a `cxl-node` device, a
+foreign region is left alone: its RAM region is a `region` device, a
 foreign devdax region is not published. Destroy the region to let the
 plugin manage the device.
 
 Local and pool devices are told apart by serial. A memdev is a pool
-device when the pool helper prepares it for a claim, or when its serial
+device when the pool driver prepares it for a claim, or when its serial
 is the `serial` attribute (or `<driver>/serial`) of a device in a
 ResourceSlice of any DRA driver other than `cxl.generic`: a pool
 controller publishes its devices before it attaches one to a node, so a
@@ -35,19 +36,18 @@ pool device is never offered as a local one, not even between its attach
 and its Prepare, or when its pod never starts. The plugin lists the
 ResourceSlices at every scan. When a list fails it keeps the serials of
 the last successful one; until a list has succeeded it publishes no
-`cxl-memdev` device at all (regions are published as usual), and it tries
+`memdev` device at all (regions are published as usual), and it tries
 again every 30 seconds while the list fails.
 
 ```yaml
-- name: cxlmem-c100e2e1               # "cxlmem-" + serial in lower-case hex
+- name: memdev-c100e2e1               # "memdev-" + serial in lower-case hex
   attributes:
-    type:            {string: cxl-memdev}
-    name:            {string: mem1}
-    serial:          {string: "0xc100e2e1"}
+    type:            {string: memdev}
     source:          {string: local}
+    serial:          {string: "0xc100e2e1"}
+    shared:          {bool: false}
     size:            {int: 1073741824}
     nodeAffinity:    {int: 0}
-    mode:            {string: none}
     memoryBlockSize: {int: 134217728}
   capacity:
     memory:
@@ -56,17 +56,17 @@ again every 30 seconds while the list fails.
         default: 1Gi                  # the whole device
         validRange: {min: 128Mi, step: 128Mi}   # the memory block size
   allowMultipleAllocations: true
+  nodeAllocatableResources: {memory: {mapping: {capacityKey: memory, capacityMultiplier: "1"}}}
 ```
 
 | Attribute | |
 |:--|:--|
-| `type` | `cxl-memdev` |
-| `name` | `memN` of the memdev, informational: it can change with the probe order |
-| `serial` | serial of the memdev, `0x` and lower-case hex, as the pool controller publishes serials |
+| `type` | `memdev` |
 | `source` | `local` (pool devices have `source: pool`) |
+| `serial` | serial of the memdev, `0x` and lower-case hex, as the pool controller publishes serials |
+| `shared` | `false`: a local memdev is used by this node only |
 | `size` | RAM capacity of the memdev in bytes |
 | `nodeAffinity` | CPU NUMA node of the memdev; absent if unknown |
-| `mode` | what the device holds, informational: `none` (no slices), `numa`, `dax` or `numa+dax` (slices of both kinds) |
 | `memoryBlockSize` | memory block size of the node in bytes: every slice is a multiple of it |
 
 Every slice, `numa` or `dax`, is a multiple of the memory block size of
@@ -87,33 +87,38 @@ requires a `default` with a `validRange`, and a range needs room for its
 size>]` instead. A memdev without the room for one whole block is not
 published, and no memdev is published while the block size cannot be
 read. `nodeAllocatableResources` maps the capacity to the node's memory as
-for `cxl-node` devices (with the `DRANodeAllocatableResources` feature
+for `region` devices (with the `DRANodeAllocatableResources` feature
 gate only).
 
 The driver configuration file (`/etc/kubelet-cxl-plugin.yaml`, `-f`)
 option `manageMemdevs: false` turns all of this off: free memdevs are not
 published and no regions are created.
 
-## Modes and DeviceClasses
+## Modes
 
-Every claim of a device gets a slice of its own, in one of two modes, and
-slices of both modes share a device at the same time:
+The DeviceClass `cxl-local` selects every local memdev. Every claim of a
+device gets a slice of its own, in one of two modes, and slices of both
+modes share a device at the same time:
 
-- `numa`: the slice is onlined as system RAM in movable memory blocks of
-  the NUMA node N of the device. All `numa` slices of a device (and of the
-  devices under one CXL host bridge) are on the same node N; the
-  containers are isolated by NUMA node (`cpuset.mems`), not per slice.
+- `numa` (default): the slice is onlined as system RAM in movable memory
+  blocks of the NUMA node N of the device. All `numa` slices of a device
+  (and of the devices under one CXL host bridge) are on the same node N;
+  the containers are isolated by NUMA node (`cpuset.mems`), not per slice.
 - `dax`: the slice is a character device `/dev/daxX.Y` of its own.
 
-[`deployments/cxl/local/device-classes.yaml`](../../deployments/cxl/local/device-classes.yaml):
+The mode, and `readOnly` for `dax` slices, is a `DeviceConfig` of the
+claim ([USAGE.md](USAGE.md#deviceconfig)):
 
-| DeviceClass | selects | config |
-|:--|:--|:--|
-| `cxl-local-memory` | `type == "cxl-memdev"` | none (mode `numa` is the default) |
-| `cxl-local-dax` | `type == "cxl-memdev"` | `LocalDeviceConfig` `mode: dax` |
-
-The classes select every local device: the `mode` attribute only tells
-what a device holds.
+```yaml
+config:
+- opaque:
+    driver: cxl.generic
+    parameters:
+      apiVersion: cxl.generic/v1alpha1
+      kind: DeviceConfig
+      mode: dax          # numa (default) or dax
+      readOnly: true     # dax only: the device node allows reads only
+```
 
 ### Slices and memory blocks
 
@@ -148,33 +153,19 @@ N. Capacity that no claim has stays offline. The containers whose claims
 or leases are on N share it; `memory.max` and cgmpolmgr's quota of each
 container (the slice size of its claims) bound what a container uses.
 
-### LocalDeviceConfig
-
-Opaque configuration for the driver `cxl.generic`, from the DeviceClass or
-the claim (the claim's wins), for the requests it lists (a request `r`
-also covers its subrequests `r/s`) or for all requests. Unknown fields are
-refused.
-
-```yaml
-config:
-- opaque:
-    driver: cxl.generic
-    parameters:
-      apiVersion: cxl.generic/v1alpha1
-      kind: LocalDeviceConfig
-      mode: dax          # numa (default) or dax
-      readOnly: true     # dax only: the device node allows reads only
-```
+All regions under one CXL host bridge share one NUMA node (the node of
+the host bridge's memory window): two memdevs under one host bridge are
+one node to the containers.
 
 ### Claims
 
-| | claim |
+| | claim on `cxl-local` |
 |:--|:--|
-| 128Mi as NUMA memory | `exactly: {deviceClassName: cxl-local-memory, capacity: {requests: {memory: 128Mi}}}` |
-| a 128Mi dax slice | `exactly: {deviceClassName: cxl-local-dax, capacity: {requests: {memory: 128Mi}}}` |
+| 128Mi as NUMA memory | `exactly: {deviceClassName: cxl-local, capacity: {requests: {memory: 128Mi}}}` |
+| a 128Mi dax slice | the same and a `DeviceConfig` with `mode: dax` |
+| a read-only slice | a `DeviceConfig` with `mode: dax, readOnly: true` |
 | a specific device | add `selectors: [{cel: {expression: 'device.attributes["cxl.generic"].serial == "0xc100e2e1"'}}]` |
 | the whole device | no capacity request |
-| a read-only slice | class `cxl-local-dax` and a claim `LocalDeviceConfig` with `mode: dax, readOnly: true` |
 | a slice shared by pods | one ResourceClaim (not a template) that several pods reference |
 
 Requests are rounded up to the memory block size (64Mi gets a 128Mi slice
@@ -182,15 +173,17 @@ with 128 MiB blocks). Pods that reference the same ResourceClaim land on
 the node of the claim's device; kubelet prepares the claim once, so all of
 them get the same slice.
 
-Examples: [`deployments/cxl/local/examples`](../../deployments/cxl/local/examples)
-(`local-memory-pod.yaml`, `local-dax-shared-slice.yaml`,
-`local-dax-readonly-pod.yaml`, `local-borrower-pod.yaml`).
+Examples in [`deployments/cxl/examples`](../../deployments/cxl/examples):
+[`local-numa.yaml`](../../deployments/cxl/examples/local-numa.yaml),
+[`local-dax-readonly.yaml`](../../deployments/cxl/examples/local-dax-readonly.yaml),
+[`local-dax-shared-claim.yaml`](../../deployments/cxl/examples/local-dax-shared-claim.yaml)
+(two pods, one claim).
 
 ## What Prepare does
 
-For every allocated `cxl-memdev` device of a claim:
+For every allocated `memdev` device of a claim:
 
-1. The mode and read-only setting come from the `LocalDeviceConfig`, the
+1. The mode and read-only setting come from the `DeviceConfig`, the
    size from the allocation's consumed capacity (the whole device if
    there is none), rounded up to a multiple of the memory block size
    (the block size is read again for every slice). A region the plugin
@@ -203,47 +196,51 @@ For every allocated `cxl-memdev` device of a claim:
    Prepare with "no room for the slice" (the scheduler accounts the
    capacity: this is not expected).
 4. `numa`: the slice is bound to kmem through sysfs, its memory blocks
-   are onlined movable, and N is
-   the slice's `target_node`. The claim is then a `cxl-node` claim of node
-   N with the slice size as its total and consumed bytes: containers that
-   reference it get N in their `cpuset.mems` exactly as for `cxl-node`
-   devices.
+   are onlined movable, and N is the slice's `target_node`. The claim has
+   node N with the slice size as its total and consumed bytes: containers
+   that reference it are steered to N exactly as for `region` devices
+   ([USAGE.md](USAGE.md#steering)).
 5. `dax`: the slice is bound to `device_dax`. The plugin writes zeros to
    the whole slice before the claim gets it, so a claim never reads what
    an earlier claim left there (this takes size / memory write bandwidth,
-   about 30 ms for 64 MiB and 120 ms for 256 MiB of DRAM). Every slice has
-   a CDI device of its own in the spec file `cxl-local`:
-   `generic/cxl=local-<claim uid>` for the first slice of a claim,
-   `generic/cxl=local-<claim uid>-<n>` (n = 1, 2, ...) for further slices
-   of the same claim. It has the device node and
+   about 30 ms for 64 MiB and 120 ms for 256 MiB of DRAM). A read-only
+   slice has device node permissions `r`: the device cgroup refuses opens
+   for writing, whatever the container's capabilities. Applications
+   `mmap` the device (`MAP_SHARED`, aligned to the device alignment,
+   2 MiB) and agree on the layout of the memory themselves.
+6. The slice's CDI device `generic/cxl=claim-<claim uid>-<n>` (spec file
+   `cxl-claims`, n the index of the allocation result in the claim) has
+   the claim marker `CXL_CLAIM_<uid>=1`, the device node of a `dax` slice
+   and the variables of [USAGE.md](USAGE.md#environment-variables):
 
    ```
-   CXL_LOCAL_DAX_<SERIAL>=/dev/daxX.Y
-   CXL_LOCAL_SIZE_<SERIAL>=<slice bytes>
-   CXL_LOCAL_SERIAL_<SERIAL>=0x<serial>
-   CXL_LOCAL_READONLY_<SERIAL>=1          (readOnly claims only)
+   CXL_<KEY>_SERIAL=0x<serial>
+   CXL_<KEY>_SHARED=0
+   CXL_<KEY>_MODE=numa                (or dax)
+   CXL_<KEY>_SIZE=<slice bytes>
+   CXL_<KEY>_NODE=<N>                 (numa)
+   CXL_<KEY>_DAX=/dev/daxX.Y          (dax)
+   CXL_<KEY>_READONLY=0|1             (dax)
    ```
 
-   `<SERIAL>` is the serial in upper-case hex without `0x`, `<serial>` in
-   lower-case hex. A read-only slice has device node permissions `r`: the
-   device cgroup refuses opens for writing, whatever the container's
-   capabilities. Applications `mmap` the device (`MAP_SHARED`, aligned to
-   the device alignment, 2 MiB) and agree on the layout of the memory
-   themselves.
-6. The `mode` attribute is published again.
+   `<KEY>` is the serial in upper-case hex without `0x`, `<serial>` in
+   lower-case hex; the second and later slices of the same memdev in the
+   claim have `<KEY>_2`, `<KEY>_3`, ... A container gets the devices of
+   the requests it references only: of a claim with a read-write and a
+   read-only request, a container that references the read-only one
+   gets only the read-only device node.
 
 A Prepare that fails releases what it took for the claim. Preparing a
 claim that is prepared already touches no device. The plugin's use of the
 devices is stored in `localDevices.json` in the `cxl.generic` plugin data
-directory: the mode of every slice, and the mode of every device as the
-`mode` attribute shows it.
+directory, with the mode of every slice.
 
 Unprepare: a `numa` slice's memory blocks are offlined (only the blocks
 of that slice), then the slice is unbound, set to size 0 and deleted
 (`daxX.0` is kept with size 0); a `dax` slice is deleted the same way.
 When the last slice of a device is gone, of either mode, its region is
 destroyed. The memdev stays enabled (unlike a pool device): the device is
-back in its initial state, and `mode` is `none` again. An offline that
+back in its initial state. An offline that
 fails because pages cannot move fails the Unprepare and keeps the slice;
 kubelet retries (the pages of other containers on the movable node
 migrate on a later try). kmem is never unbound from memory that is not
@@ -276,35 +273,13 @@ serial and slices by name; a slice that is gone is dropped, the slices of
 claims that are not in the prepared claims (`preparedClaimsInfo.json`)
 are released (`numa` slices offlined first), and so are the slices of the
 owner `-`, dax devices of the region that belong to no slice are deleted,
-and a region of the plugin without claims is destroyed. A state file with a mode per device and none per
-slice gives its slices the mode of their device; the `numa` claims of such
-a file have the whole region online, which more `numa` claims share until
-the region is released.
+and a region of the plugin without claims is destroyed.
 Regions do not survive a node reboot: the state file records the boot id
 of the kernel (`/proc/sys/kernel/random/boot_id`), and the state of
 another boot is dropped without touching any region, so that a region
 that firmware or an admin created under the same name is never taken for
-the plugin's. A slice that is gone gets no CDI device.
-
-## Steering and lending
-
-A container that references a `numa` claim when it is created is steered:
-cgmpolmgr adds the claim's node to its `cpuset.mems`. A running container
-borrows through a lease (see [POOL.md](POOL.md), "Lending to running
-containers"): `cxl-request memory 64Mi --local` (or `--source local`)
-creates a companion claim on `cxl-local-memory` (`cxl-local-dax` with
-`--dax`), and the node is lent to the container through NRI, or the fd of
-the dax slice is passed. The memory of a companion claim belongs to the
-borrower: the companion claim gets no claim marker, so the companion's
-pause container is not steered. `--source any` takes a local device if
-one fits, else pool memory. A container is either steered or borrowing,
-never both. A local lease needs no pool: it is Ready a few seconds after
-the request. A `numa` lease reports node N and the slice size (`"node"`,
-`"size"`); the slice grows N while the lease is Ready.
-
-All regions under one CXL host bridge share one NUMA node (the node of
-the host bridge's memory window): two `numa` devices under one host
-bridge are one node to the containers.
+the plugin's. A `dax` slice that is gone gets no device node and no
+`CXL_<KEY>_DAX` in its CDI device.
 
 ## Limitations
 
@@ -323,15 +298,17 @@ bridge are one node to the containers.
   region may start after a block boundary, and only whole blocks hold
   slices. An unaligned end needs no such room: it holds less than a block,
   which the rounding down excludes already.
-- Two dax claims of one device in one container get the same
-  `CXL_LOCAL_*` names (the device nodes differ).
+- Two claims of one device in one container set the same
+  `CXL_<KEY>_*` names (the device nodes of `dax` slices differ).
 - With `DRANodeAllocatableResources`, a dax claim raises the container's
   memory limit by the slice size although dax memory is not charged to
   the cgroup.
-- Memory limits of borrowers, the steered-or-borrowing rule and SIGBUS
-  after a forced release of a dax fd are as for pool leases.
+- Leases of local memory have the limitations of every lease
+  ([LEASES.md](LEASES.md#limitations)): memory limits of the requester,
+  no `numa` lease for a steered container, SIGBUS after a release of a
+  mapped dax fd.
 - A region that an admin creates on a memdev while the plugin uses it is
-  not published as a `cxl-node` device until the plugin has released the
+  not published as a `region` device until the plugin has released the
   memdev: the plugin hides every region of the memdevs it uses.
 - A memdev that is shared with other hosts but not managed by a pool
   controller looks like a local device. Onlining it as RAM corrupts the

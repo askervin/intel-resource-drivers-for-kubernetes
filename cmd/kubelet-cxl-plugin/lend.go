@@ -55,8 +55,8 @@ type containerRef struct {
 	BaseMems                                string // cpuset.mems.effective at start, e.g. "0-1"
 }
 
-// Lender lends NUMA nodes to running containers.
-type Lender interface {
+// nodeLender lends NUMA nodes to running containers through NRI.
+type nodeLender interface {
 	// ContainerByPid finds the container whose cgroup contains pid
 	// (/proc/<pid>/cgroup prefix match against CgroupPath).
 	ContainerByPid(pid int) (*containerRef, bool)
@@ -74,14 +74,13 @@ type Lender interface {
 	// LentNodes returns the nodes currently lent to the container.
 	LentNodes(podUID, name string) []int
 	// OnContainerGone registers a callback for StopContainer/RemoveContainer
-	// of a container that has lends or a lease socket (W1a releases leases).
+	// of a container that has lends or a lease socket.
 	OnContainerGone(func(ref containerRef))
-	// OnContainerStarted registers a callback for StartContainer (W1a
-	// re-applies exclusive lends of Ready leases to a restarted container).
+	// OnContainerStarted registers a callback for StartContainer.
 	OnContainerStarted(func(ref containerRef))
 }
 
-var _ Lender = (*nriPlugin)(nil)
+var _ nodeLender = (*nriPlugin)(nil)
 
 // errSteered is returned by LendNode for containers whose memory is
 // steered by cgmpolmgr because of a local CXL claim.
@@ -172,7 +171,7 @@ func (p *nriPlugin) initLendState() {
 }
 
 // WaitSynchronized waits until the first NRI Synchronize has filled
-// the container table, or ctx is done. Not part of Lender: lease code
+// the container table, or ctx is done. Not part of nodeLender: lease code
 // that runs at plugin start may call it before reconciling.
 func (p *nriPlugin) WaitSynchronized(ctx context.Context) error {
 	p.mu.Lock()
@@ -391,7 +390,7 @@ func (p *nriPlugin) hasSteeredClaims(ctrName string, ctr *api.Container) bool {
 	return len(mem.DRAMNodes) > 0 || len(mem.CXLNodes) > 0
 }
 
-// ContainerByPid implements Lender.
+// ContainerByPid implements nodeLender.
 func (p *nriPlugin) ContainerByPid(pid int) (*containerRef, bool) {
 	cgPath, err := pidCgroupDir(pid)
 	if err != nil {
@@ -448,7 +447,7 @@ func (p *nriPlugin) lookup(podUID, name string) *trackedContainer {
 	return best
 }
 
-// Container implements Lender.
+// Container implements nodeLender.
 func (p *nriPlugin) Container(podUID, name string) (*containerRef, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -460,7 +459,7 @@ func (p *nriPlugin) Container(podUID, name string) (*containerRef, bool) {
 	return &ref, true
 }
 
-// LentNodes implements Lender.
+// LentNodes implements nodeLender.
 func (p *nriPlugin) LentNodes(podUID, name string) []int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -471,21 +470,21 @@ func (p *nriPlugin) LentNodes(podUID, name string) []int {
 	return tc.lent.nodes().List()
 }
 
-// OnContainerGone implements Lender.
+// OnContainerGone implements nodeLender.
 func (p *nriPlugin) OnContainerGone(fn func(ref containerRef)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.goneFns = append(p.goneFns, fn)
 }
 
-// OnContainerStarted implements Lender.
+// OnContainerStarted implements nodeLender.
 func (p *nriPlugin) OnContainerStarted(fn func(ref containerRef)) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.startedFns = append(p.startedFns, fn)
 }
 
-// LendNode implements Lender.
+// LendNode implements nodeLender.
 func (p *nriPlugin) LendNode(ctx context.Context, podUID, name string, node int, holder string) error {
 	if node < 0 {
 		return fmt.Errorf("invalid NUMA node %d", node)
@@ -493,7 +492,7 @@ func (p *nriPlugin) LendNode(ctx context.Context, podUID, name string, node int,
 	return p.changeLend(ctx, podUID, name, node, holder, true)
 }
 
-// RevokeNode implements Lender.
+// RevokeNode implements nodeLender.
 func (p *nriPlugin) RevokeNode(ctx context.Context, podUID, name string, node int, holder string) error {
 	if node < 0 {
 		return fmt.Errorf("invalid NUMA node %d", node)

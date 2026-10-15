@@ -1,0 +1,69 @@
+# DeviceClasses of the CXL DRA driver. A class selects a kind of device;
+# how a device is given to containers (mode numa or dax, readOnly) is a
+# DeviceConfig of the claim. See doc/cxl/USAGE.md.
+#
+# cxl-local: a slice of a CXL memory device attached to the node, as RAM
+# of its NUMA node (default) or as a devdax device (DeviceConfig mode: dax).
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: cxl-local
+spec:
+  selectors:
+  - cel:
+      expression: 'device.driver == "cxl.generic" && device.attributes["cxl.generic"].type == "memdev"'
+---
+# cxl-pool: a whole exclusive device of a memory pool, as a new NUMA node
+# (default) or as a devdax device (DeviceConfig mode: dax).
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: cxl-pool
+spec:
+  selectors:
+  - cel:
+      expression: 'device.driver == "cxl-pool.generic" && device.attributes["cxl-pool.generic"].type == "memdev" && device.attributes["cxl-pool.generic"].shared == false'
+---
+# cxl-pool-shared: a shared device of a memory pool as a devdax device; one
+# of its hosts by default, all of them (exclusive) with capacity.requests.hosts.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: cxl-pool-shared
+spec:
+  selectors:
+  - cel:
+      expression: 'device.driver == "cxl-pool.generic" && device.attributes["cxl-pool.generic"].type == "memdev" && device.attributes["cxl-pool.generic"].shared == true'
+---
+# cxl-region: capacity of a CXL NUMA node of a region that existed before
+# the driver; the container is steered to it (with a MemoryPolicyConfig).
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: cxl-region
+spec:
+  selectors:
+  - cel:
+      expression: 'device.driver == "cxl.generic" && device.attributes["cxl.generic"].type == "region"'
+---
+# cxl-dram: capacity of the DRAM of the node for steering (with a
+# MemoryPolicyConfig).
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: cxl-dram
+spec:
+  selectors:
+  - cel:
+      expression: 'device.driver == "cxl.generic" && device.attributes["cxl.generic"].type == "dram"'
+---
+# cxl-lease: the lease socket and cxl-request, with which a running
+# container requests memory.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: cxl-lease
+spec:
+  selectors:
+  - cel:
+      expression: 'device.driver == "cxl.generic" && device.attributes["cxl.generic"].type == "lease"'

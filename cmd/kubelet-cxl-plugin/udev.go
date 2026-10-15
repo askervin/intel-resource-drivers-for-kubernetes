@@ -30,8 +30,8 @@ import (
 // UdevEventWatcher monitors udev events for CXL memory topology
 // changes and delivers debounced "stable" notifications. It watches
 // the node, memory, and cxl subsystems so that the debounce timer
-// accounts for the full hotplug sequence (CXL device bind → region
-// creation → memory onlining → NUMA node appearance) before
+// accounts for the full hotplug sequence (CXL device bind -> region
+// creation -> memory onlining -> NUMA node appearance) before
 // signaling that sysfs has stabilized and a rescan is warranted.
 type UdevEventWatcher struct {
 	monitor        *udev.Monitor
@@ -48,8 +48,8 @@ type UdevEventWatcher struct {
 //   - cxl: any action (CXL device/region changes)
 //
 // All these subsystems feed into the same debounce timer so the
-// driver waits for the full sequence (e.g. CXL region creation →
-// memory onlining → node appearance) to stabilize before rescanning.
+// driver waits for the full sequence (e.g. CXL region creation ->
+// memory onlining -> node appearance) to stabilize before rescanning.
 func NewUdevEventWatcher(stableDuration time.Duration) (*UdevEventWatcher, error) {
 	m, err := udev.NewMonitor(
 		udev.WithFilters(

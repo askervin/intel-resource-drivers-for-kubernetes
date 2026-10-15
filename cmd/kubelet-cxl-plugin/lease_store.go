@@ -17,41 +17,20 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"time"
 
-	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
+	"k8s.io/klog/v2"
+
+	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/api"
 )
 
 // leasesFileName is the lease store in the cxl.generic plugin data
 // directory.
 const leasesFileName = "leases.json"
-
-// Lease states. A lease is written in state Creating before any API
-// object exists, so that a restart can clean up after a crash.
-const (
-	leaseCreating  = "Creating"  // stored, companion objects not created yet
-	leasePending   = "Pending"   // companion claim and pod exist
-	leaseLending   = "Lending"   // companion claim being prepared, lend in progress
-	leaseReady     = "Ready"     // lent (exclusive) or fd available (shared)
-	leaseReleasing = "Releasing" // revoking, companion being deleted
-	leaseFailed    = "Failed"    // see Error; released by the client or by cleanup
-	// leaseReleased is never stored: the response state of a release
-	// that completed (the lease is gone).
-	leaseReleased = "Released"
-)
-
-// Lease kinds (request "kind").
-const (
-	leaseKindMemory = "memory" // exclusive memory, lent as a NUMA node or passed as a devdax fd
-	leaseKindShared = "shared" // shared pool device, passed as a devdax fd
-)
-
-// leaseSourceAny is the source of a memory lease that takes a local memdev
-// if one fits, else pool memory (device.SourceLocal, device.SourcePool).
-const leaseSourceAny = "any"
 
 // podRef identifies a pod.
 type podRef struct {
@@ -60,16 +39,17 @@ type podRef struct {
 	UID       string `json:"uid"`
 }
 
-// tokenClaim is a prepared claim on the token device: it owns the
-// socket <data dir>/leases/<uid>/cxl.sock.
-type tokenClaim struct {
+// leaseClaim is a prepared claim on the lease device: it owns the socket
+// <data dir>/leases/<uid>/cxl.sock.
+type leaseClaim struct {
 	UID       string   `json:"uid"`
 	Namespace string   `json:"namespace"`
 	Name      string   `json:"name"`
 	Pods      []podRef `json:"pods"` // reservedFor at Prepare (refreshed on demand)
 }
 
-func (c *tokenClaim) hasPod(uid string) bool {
+// hasPod tells whether the pod with the uid is one of the claim's pods.
+func (c *leaseClaim) hasPod(uid string) bool {
 	for _, p := range c.Pods {
 		if p.UID == uid {
 			return true
@@ -78,26 +58,27 @@ func (c *tokenClaim) hasPod(uid string) bool {
 	return false
 }
 
-// lease is one request of a container.
+// lease is one request of a container. A lease is stored in state
+// Creating before any API object exists, so that a restart can clean up
+// after a crash. The states are api.State*; Released is never stored.
 type lease struct {
-	ID         string `json:"id"`
-	TokenClaim string `json:"tokenClaim"` // uid of the token claim whose socket received it
-	RequestID  string `json:"requestId,omitempty"`
-	Kind       string `json:"kind"`
-	// Source is the requested source (local, pool or any), and the
-	// source of the device once Ready ("" in stores written before
-	// sources existed: pool).
+	ID string `json:"id"`
+	// Claim is the uid of the lease claim whose socket received it.
+	Claim     string `json:"claim"`
+	RequestID string `json:"requestId,omitempty"`
+	// Source is the requested source ("": local, then pool), and the
+	// source of the device once Ready.
 	Source string `json:"source,omitempty"`
-	Size   string `json:"size,omitempty"` // requested quantity (memory)
-	// Serial is 0x<lower-case hex>: the device of a shared lease, the
-	// requested device of a memory lease, or the device of a Ready lease.
-	Serial string `json:"serial,omitempty"`
-	// Mode is numa or dax ("" in stores written before modes existed:
-	// numa for memory, dax for shared leases).
-	Mode      string    `json:"mode,omitempty"`
-	Exclusive bool      `json:"exclusive,omitempty"` // shared: all of the device's hosts capacity
-	Hosts     string    `json:"hosts,omitempty"`     // exclusive: the hosts capacity requested
-	ReadOnly  bool      `json:"readOnly,omitempty"`  // dax: the fd is opened read-only
+	Mode   string `json:"mode"`   // effective: api.ModeNUMA or api.ModeDax
+	Shared bool   `json:"shared"` // one host of a shared device
+	// Hosts is the hosts capacity requested when a shared device is taken
+	// exclusively (all of it), "" otherwise.
+	Hosts    string `json:"hosts,omitempty"`
+	ReadOnly bool   `json:"readOnly,omitempty"` // dax: the fd is opened read-only
+	Size     string `json:"size,omitempty"`     // requested quantity
+	// Serial is 0x<lower-case hex>: the requested device, or the device
+	// of a Ready lease.
+	Serial    string    `json:"serial,omitempty"`
 	Pod       podRef    `json:"pod"`
 	Container string    `json:"container"`
 	State     string    `json:"state"`
@@ -108,13 +89,28 @@ type lease struct {
 	Created   time.Time `json:"created"`
 }
 
-// source returns the source of a lease, also for stores written before
-// sources existed.
-func (l *lease) source() string {
-	if l.Source == "" {
-		return device.SourcePool
+// deviceShared tells whether the device of a lease is a shared device:
+// one of its hosts, or all of them.
+func (l *lease) deviceShared() bool {
+	return l.Shared || l.Hosts != ""
+}
+
+// memory returns what a Ready lease gives its container, false before.
+func (l *lease) memory() (api.Memory, bool) {
+	serial, err := api.ParseSerial(l.Serial)
+	if l.State != api.StateReady || err != nil {
+		return api.Memory{}, false
 	}
-	return l.Source
+	return api.Memory{
+		Key:      api.Key(serial, 1),
+		Serial:   l.Serial,
+		Shared:   l.deviceShared(),
+		Mode:     l.Mode,
+		Size:     l.Bytes,
+		Node:     l.Node,
+		Dax:      l.Dax,
+		ReadOnly: l.ReadOnly,
+	}, true
 }
 
 // companionName is the name of the companion claim and pod of a lease.
@@ -126,12 +122,12 @@ func companionName(id string) string {
 // the broker serializes access with its mutex.
 type leaseStore struct {
 	path   string
-	Claims map[string]*tokenClaim `json:"claims"` // token claim uid -> ...
+	Claims map[string]*leaseClaim `json:"claims"` // lease claim uid -> ...
 	Leases map[string]*lease      `json:"leases"` // lease id -> ...
 }
 
-// loadLeaseStore reads the store at path, an empty store if it does
-// not exist.
+// loadLeaseStore reads the store at path: an empty store if it does not
+// exist or cannot be decoded (strictly).
 func loadLeaseStore(path string) (*leaseStore, error) {
 	s := &leaseStore{path: path}
 	data, err := os.ReadFile(path)
@@ -139,12 +135,15 @@ func loadLeaseStore(path string) (*leaseStore, error) {
 		return nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 	if err == nil {
-		if err := json.Unmarshal(data, s); err != nil {
-			return nil, fmt.Errorf("parsing %s: %w", path, err)
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(s); err != nil {
+			klog.Errorf("lease broker: parsing %s: %v; starting with an empty lease table", path, err)
+			s = &leaseStore{path: path}
 		}
 	}
 	if s.Claims == nil {
-		s.Claims = map[string]*tokenClaim{}
+		s.Claims = map[string]*leaseClaim{}
 	}
 	if s.Leases == nil {
 		s.Leases = map[string]*lease{}
@@ -154,25 +153,14 @@ func loadLeaseStore(path string) (*leaseStore, error) {
 
 // save writes the store atomically.
 func (s *leaseStore) save() error {
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encoding leases: %w", err)
-	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0600); err != nil {
-		return fmt.Errorf("writing %s: %w", tmp, err)
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		return fmt.Errorf("renaming %s: %w", tmp, err)
-	}
-	return nil
+	return writeJSONFile(s.path, s)
 }
 
-// leasesOf returns the leases received on the token claim's socket.
+// leasesOf returns the leases received on the lease claim's socket.
 func (s *leaseStore) leasesOf(claimUID string) []*lease {
 	var out []*lease
 	for _, l := range s.Leases {
-		if l.TokenClaim == claimUID {
+		if l.Claim == claimUID {
 			out = append(out, l)
 		}
 	}

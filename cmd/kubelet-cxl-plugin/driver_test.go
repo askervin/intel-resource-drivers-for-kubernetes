@@ -84,7 +84,7 @@ func TestNewDriverConfigFromString_WithTestability(t *testing.T) {
 }
 
 func TestNewDriverConfigFromString_WithoutTestability(t *testing.T) {
-	configJSON := `{"IgnoreDevices": ["mem0"]}`
+	configJSON := `{"ignoreDevices": ["mem0"]}`
 
 	cfg, err := newDriverConfigFromString(configJSON)
 	if err != nil {
@@ -344,12 +344,12 @@ func TestBuildDevInfos_WithFakeDevices(t *testing.T) {
 		t.Fatalf("expected 1 device info, got %d", len(devInfos))
 	}
 
-	info, ok := devInfos["fakeregion0"]
+	info, ok := devInfos["fakeregion0-node2"]
 	if !ok {
-		t.Fatal("expected device info keyed by fakeregion0")
+		t.Fatal("expected device info keyed by fakeregion0-node2")
 	}
-	if info.Name != "cxl-fakeregion0-node2" {
-		t.Errorf("expected name cxl-fakeregion0-node2, got %s", info.Name)
+	if info.Name != "fakeregion0-node2" {
+		t.Errorf("expected name fakeregion0-node2, got %s", info.Name)
 	}
 	if info.SysfsPath != "/fake/sys/bus/cxl/devices/fakeregion0" {
 		t.Errorf("expected fake sysfs path, got %s", info.SysfsPath)
@@ -415,15 +415,18 @@ func TestTestabilityConfig_JSONRoundTrip(t *testing.T) {
 
 func TestNewDriverConfigFromString_YAML(t *testing.T) {
 	configYAML := `
-IgnoreDevices:
+ignoreDevices:
   - mem0
   - mem1
-IgnoreRegions:
+ignoreRegions:
   - region0
-IgnoreNodes:
+ignoreNodes:
   - 1
   - 3
-IgnoreDRAMNodes: true
+ignoreNewMemoryDevices: true
+ignoreNewRegions: true
+ignoreNewNodes: true
+ignoreDRAMNodes: true
 `
 	cfg, err := newDriverConfigFromString(configYAML)
 	if err != nil {
@@ -438,8 +441,28 @@ IgnoreDRAMNodes: true
 	if len(cfg.IgnoreNodes) != 2 || cfg.IgnoreNodes[0] != 1 || cfg.IgnoreNodes[1] != 3 {
 		t.Errorf("expected IgnoreNodes [1 3], got %v", cfg.IgnoreNodes)
 	}
-	if !cfg.IgnoreDRAMNodes {
-		t.Error("expected IgnoreDRAMNodes=true")
+	if !cfg.IgnoreDRAMNodes || !cfg.IgnoreNewMemoryDevices || !cfg.IgnoreNewRegions || !cfg.IgnoreNewNodes {
+		t.Errorf("expected ignoreDRAMNodes and ignoreNew*: %+v", cfg)
+	}
+}
+
+// TestDriverConfigKeys checks that the keys of the configuration are the
+// lower-camel json tags.
+func TestDriverConfigKeys(t *testing.T) {
+	cfg := &DriverConfig{IgnoreDevices: []string{"mem0"}, IgnoreRegions: []string{"region0"}, IgnoreNodes: []int{1},
+		IgnoreNewMemoryDevices: true, IgnoreNewRegions: true, IgnoreNewNodes: true, IgnoreDRAMNodes: true,
+		UdevStableDuration: "1s", ManageMemdevs: ptr(true), PublishLeaseDevice: true}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"ignoreDevices":["mem0"],"ignoreRegions":["region0"],"ignoreNodes":[1],"ignoreNewMemoryDevices":true,"ignoreNewRegions":true,` +
+		`"ignoreNewNodes":true,"ignoreDRAMNodes":true,"udevStableDuration":"1s","manageMemdevs":true}`
+	if string(data) != want {
+		t.Errorf("configuration %s, expected %s", data, want)
+	}
+	if _, err := newDriverConfigFromString("ignoreDevice: [mem0]"); err == nil {
+		t.Error("an unknown key is accepted")
 	}
 }
 
@@ -482,7 +505,7 @@ testability:
 }
 
 func TestResolveConfigStr_StringOnly(t *testing.T) {
-	flags := &CXLFlags{ConfigStr: `{"IgnoreDevices": ["mem0"]}`}
+	flags := &CXLFlags{ConfigStr: `{"ignoreDevices": ["mem0"]}`}
 	result, err := resolveConfigStr(flags)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -493,7 +516,7 @@ func TestResolveConfigStr_StringOnly(t *testing.T) {
 }
 
 func TestResolveConfigStr_FileOnly(t *testing.T) {
-	content := `{"IgnoreDevices": ["mem1"]}`
+	content := `{"ignoreDevices": ["mem1"]}`
 	tmpFile := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
 		t.Fatalf("failed to write temp file: %v", err)
@@ -511,7 +534,7 @@ func TestResolveConfigStr_FileOnly(t *testing.T) {
 
 func TestResolveConfigStr_BothError(t *testing.T) {
 	flags := &CXLFlags{
-		ConfigStr:  `{"IgnoreDevices": ["mem0"]}`,
+		ConfigStr:  `{"ignoreDevices": ["mem0"]}`,
 		ConfigFile: "/some/file.json",
 	}
 	_, err := resolveConfigStr(flags)
@@ -543,7 +566,7 @@ func TestResolveConfigStr_FileNotFound(t *testing.T) {
 }
 
 func TestResolveConfigStr_YAMLFile(t *testing.T) {
-	content := "IgnoreDevices:\n  - mem0\nIgnoreDRAMNodes: true\n"
+	content := "ignoreDevices:\n  - mem0\nignoreDRAMNodes: true\n"
 	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
 		t.Fatalf("failed to write temp file: %v", err)
@@ -575,7 +598,7 @@ func TestDriverConfigManageMemdevs(t *testing.T) {
 		{"{}", true},
 		{"manageMemdevs: true", true},
 		{"manageMemdevs: false", false},
-		{`{"manageMemdevs": false, "IgnoreDevices": ["mem0"]}`, false},
+		{`{"manageMemdevs": false, "ignoreDevices": ["mem0"]}`, false},
 	} {
 		cfg, err := newDriverConfigFromString(tc.config)
 		if err != nil {
@@ -595,7 +618,7 @@ func TestNewLocalHelper(t *testing.T) {
 		t.Fatalf("unmanaged memdevs: %v %v", local, err)
 	}
 	// the state of a memdev that is gone is dropped at start
-	state := `[{"serial":3238060769,"serialHex":"c100e2e1","memdev":"mem0","region":"region0","mode":"numa","node":2,"claims":{"u1":[{"request":"mem","region":"region0","size":2097152}]}}]`
+	state := `[{"serial":3238060769,"serialHex":"c100e2e1","memdev":"mem0","region":"region0","node":2,"claims":{"u1":[{"request":"mem","region":"region0","mode":"numa","size":2097152,"dax":"dax0.1"}]}}]`
 	if err := os.WriteFile(filepath.Join(dir, localStateFileName), []byte(state), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -603,8 +626,8 @@ func TestNewLocalHelper(t *testing.T) {
 	if err != nil || local == nil {
 		t.Fatalf("local helper: %v %v", local, err)
 	}
-	if m := local.Modes(); len(m) != 0 {
-		t.Fatalf("modes %v of a gone memdev", m)
+	if m := local.Snapshot().Serials; len(m) != 0 {
+		t.Fatalf("serials %v of a gone memdev", m)
 	}
 	if local.mem.SysRoot != dir+"/sys" || local.stateFile != filepath.Join(dir, localStateFileName) {
 		t.Fatalf("local helper %+v", local)
@@ -625,11 +648,11 @@ func TestRescanBeforeStart(t *testing.T) {
 	}
 	d := &driver{
 		sysfsRoot: root,
-		config:    &DriverConfig{IgnoreDRAMNodes: true, PublishDynamicToken: true},
+		config:    &DriverConfig{IgnoreDRAMNodes: true, PublishLeaseDevice: true},
 		state:     nodeState{NodeState: &helpers.NodeState{NodeName: "n1"}},
 	}
 	d.rescanAndPublish(context.Background())
-	if devs, ok := d.state.Allocatable.(device.DevicesInfo); !ok || devs[device.DynamicDeviceName] == nil {
+	if devs, ok := d.state.Allocatable.(device.DevicesInfo); !ok || devs[device.LeaseDeviceName] == nil {
 		t.Fatalf("devices after the rescan: %+v", d.state.Allocatable)
 	}
 }

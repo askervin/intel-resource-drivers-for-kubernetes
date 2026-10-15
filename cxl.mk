@@ -23,9 +23,9 @@ bin/kubelet-cxl-plugin
 
 CXL_COMMON_SRC = \
 $(COMMON_SRC) \
-pkg/cxl/cdihelpers/*.go \
+pkg/cxl/api/*.go \
 pkg/cxl/device/*.go \
-pkg/cxl/discovery/*.go
+pkg/cxl/memorypolicy/*.go
 
 CXL_LDFLAGS = ${LDFLAGS} -extldflags ${EXT_LDFLAGS} -X ${PKG}/pkg/version.version=${CXL_VERSION}
 

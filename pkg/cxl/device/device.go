@@ -14,102 +14,99 @@
  * limitations under the License.
  */
 
+// Package device has the Kubernetes-facing names of the CXL DRA driver:
+// driver, device, attribute, capacity, DeviceClass, config, label and CDI
+// names, and the devices that cxl.generic publishes.
 package device
 
 import (
-	"fmt"
-	"regexp"
-
 	resourcev1 "k8s.io/api/resource/v1"
 )
 
-var (
-	PciRegexp = regexp.MustCompile(`[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$`)
-	CXLRegexp = regexp.MustCompile(`^cxl[0-9]+$`)
-)
-
 const (
-	CDIVendor        = "generic"
-	CDIClass         = "cxl"
-	CDIKind          = CDIVendor + "/" + CDIClass
-	DriverName       = CDIClass + "." + CDIVendor
-	PCIAddressLength = len("0000:00:00.0")
-
-	CXLDevicePattern = "cxl-[-a-z0-9]*"
-
-	// DeviceTypeCXLNode is the device type for CXL region devices.
-	DeviceTypeCXLNode = "cxl-node"
-	// DeviceTypeDRAM is the device type for system DRAM devices.
-	DeviceTypeDRAM = "dram"
-	// DeviceTypeCXLPool is the device type for CXL memory devices
-	// attached from a memory pool (driver PoolDriverName).
-	DeviceTypeCXLPool = "cxl-pool"
-
-	// PoolDriverName is the default DRA driver name of the pool
-	// helper, which prepares CXL memory devices hotplugged from a
-	// memory pool. See doc/cxl/POOL.md.
-	PoolDriverName = "cxl-pool.generic"
-	// PoolCDISpecName is the name of the CDI spec file of the
-	// prepared pool devices.
+	// CDIVendor is the CDI vendor of both drivers.
+	CDIVendor = "generic"
+	// CDIClass is the CDI class of cxl.generic.
+	CDIClass = "cxl"
+	// CDIKind is the CDI kind of cxl.generic.
+	CDIKind = CDIVendor + "/" + CDIClass
+	// PoolCDIClass is the CDI class of the pool driver.
+	PoolCDIClass = "cxl-pool"
+	// PoolCDIKind is the CDI kind of the pool driver.
+	PoolCDIKind = CDIVendor + "/" + PoolCDIClass
+	// ClaimsCDISpecName is the CDI spec file of the claims of cxl.generic.
+	ClaimsCDISpecName = "cxl-claims"
+	// LeasesCDISpecName is the CDI spec file of the lease claims (socket
+	// directory and CLI mounts).
+	LeasesCDISpecName = "cxl-leases"
+	// PoolCDISpecName is the CDI spec file of the claims of the pool
+	// driver.
 	PoolCDISpecName = "cxl-pool"
 
-	// DeviceTypeDynamic is the device type of the token device
-	// "dynamic" in the cxl.generic slice. A claim on it gives the
-	// containers that reference it a lease socket through which they
-	// can borrow local or pool memory while running. See
-	// doc/cxl/POOL.md.
-	DeviceTypeDynamic = "dynamic"
-	// DynamicDeviceName is the name of the token device.
-	DynamicDeviceName = "dynamic"
-	// LeaseCDISpecName is the name of the CDI spec file of the lease
-	// devices (socket directory and CLI mounts of token claims).
-	LeaseCDISpecName = "cxl-leases"
-	// LendConfigKind is the kind of the opaque claim configuration that
-	// names the lease and the borrowing container of a companion claim
-	// (apiVersion <driver name>/v1alpha1, for the pool driver or
-	// cxl.generic).
-	LendConfigKind = "LendConfig"
-	// PoolDeviceConfigKind is the kind of the opaque pool claim
-	// configuration that selects how a pool device is prepared: as a
-	// NUMA node or as a devdax device, and read-only (apiVersion <pool
-	// driver name>/v1alpha1).
-	PoolDeviceConfigKind = "PoolDeviceConfig"
+	// DriverName is the DRA driver of the devices attached to a node.
+	DriverName = CDIClass + "." + CDIVendor
+	// PoolDriverName is the default DRA driver name of the pool driver,
+	// which prepares CXL memory devices hotplugged from a memory pool.
+	// See doc/cxl/POOL.md.
+	PoolDriverName = "cxl-pool.generic"
 
-	// DeviceTypeCXLMemdev is the device type of a node-local CXL
-	// memory device (memdev) that the plugin creates regions on. See
-	// doc/cxl/LOCAL.md.
-	DeviceTypeCXLMemdev = "cxl-memdev"
-	// DeviceTypeCXLDax is the PreparedDeviceInfo type of a devdax
-	// slice of a local memdev. NRI steering ignores it.
-	DeviceTypeCXLDax = "cxl-dax"
-	// SourceLocal is the source attribute of local memdevs, and the
-	// lease source of memory from them.
-	SourceLocal = "local"
-	// SourcePool is the source attribute of pool devices, and the lease
-	// source of memory from the pool.
-	SourcePool = "pool"
-	// LocalDeviceConfigKind is the kind of the opaque cxl.generic claim
-	// configuration that selects how a local memdev is prepared: as a
-	// NUMA node or as a devdax slice, and read-only (apiVersion
-	// cxl.generic/v1alpha1).
-	LocalDeviceConfigKind = "LocalDeviceConfig"
-	// LocalCDISpecName is the name of the CDI spec file of the dax
-	// slices of local memdevs.
-	LocalCDISpecName = "cxl-local"
-	// ModeNUMA onlines device memory as a NUMA node.
-	ModeNUMA = "numa"
-	// ModeDax gives device memory to containers as a devdax device.
-	ModeDax = "dax"
+	// DeviceTypeMemdev is a CXL memory device: a slice of a local memdev
+	// or a whole pool device per claim.
+	DeviceTypeMemdev = "memdev"
+	// DeviceTypeRegion is a region that existed before the plugin, online
+	// as a NUMA node.
+	DeviceTypeRegion = "region"
+	// DeviceTypeDRAM is the system DRAM of the node.
+	DeviceTypeDRAM = "dram"
+	// DeviceTypeLease is the device whose claims give containers the
+	// lease socket.
+	DeviceTypeLease = "lease"
 
-	// CapacityMemory is the capacity key used in ResourceSlice device
-	// capacity and in ConsumedCapacity. Matches v1.ResourceMemory.
+	// Device attributes.
+	AttrType            resourcev1.QualifiedName = "type"
+	AttrSource          resourcev1.QualifiedName = "source"
+	AttrSerial          resourcev1.QualifiedName = "serial"
+	AttrShared          resourcev1.QualifiedName = "shared"
+	AttrSize            resourcev1.QualifiedName = "size"
+	AttrNode            resourcev1.QualifiedName = "node"
+	AttrNodes           resourcev1.QualifiedName = "nodes"
+	AttrNodeAffinity    resourcev1.QualifiedName = "nodeAffinity"
+	AttrMemoryBlockSize resourcev1.QualifiedName = "memoryBlockSize"
+
+	// CapacityMemory is the memory capacity of a device in bytes.
+	// Matches v1.ResourceMemory.
 	CapacityMemory resourcev1.QualifiedName = "memory"
+	// CapacityHosts is the capacity of a shared pool device: how many
+	// nodes may have it attached at a time.
+	CapacityHosts resourcev1.QualifiedName = "hosts"
+
+	// DeviceClasses (deployments/cxl/device-classes.yaml).
+	ClassLocal      = "cxl-local"
+	ClassPool       = "cxl-pool"
+	ClassPoolShared = "cxl-pool-shared"
+	ClassRegion     = "cxl-region"
+	ClassDRAM       = "cxl-dram"
+	ClassLease      = "cxl-lease"
+
+	// DeviceConfigKind is the kind of the opaque configuration of how a
+	// device is prepared (mode, readOnly), apiVersion <driver>/v1alpha1.
+	DeviceConfigKind = "DeviceConfig"
+
+	// LeaseDeviceName is the name of the lease device.
+	LeaseDeviceName = "lease"
+	// MemdevDevicePrefix is the prefix of the device names of local
+	// memdevs ("memdev-" + lower-case hex serial).
+	MemdevDevicePrefix = "memdev-"
+	// DRAMDeviceName is the name of the DRAM device.
+	DRAMDeviceName = "dram"
+
+	// Labels and annotation of the companion claim and pod of a lease.
+	LeaseLabel          = "cxl.generic/lease"
+	RequesterUIDLabel   = "cxl.generic/requester-uid"
+	NodeLabel           = "cxl.generic/node"
+	RequesterAnnotation = "cxl.generic/requester" // <namespace>/<pod>/<container>
 
 	PreparedClaimsFileName = "preparedClaims.json"
-
-	// "classic", for CDI names to be more user-friendly, and readable when discovery code is used by cdi-specs-generator,
-	// or "machine" for names to be used by DRA drivers. See determineDeviceName().
-	DefaultNamingStyle = "machine"
 
 	// From device-plugin.
 	DefaultSysfsRoot    = ""
@@ -121,39 +118,32 @@ const (
 // DeviceInfo is an internal structure type to store info about discovered device.
 type DeviceInfo struct {
 	// UID is a unique identifier on node, used in ResourceSlice K8s API object as RFC1123-compliant identifier.
-	// Consists of PCIAddress and Model with colons and dots replaced with hyphens, e.g. 0000-01-02-0-0x1234.
 	UID       string `json:"uid"`
 	Name      string `json:"name"`
 	Dev       any
 	SysfsPath string `json:"sysfs"`
 }
 
-type SystemDRAM struct {
-	Name  string
+// DRAM is the Dev of the DRAM device.
+type DRAM struct {
 	Nodes []int
 	Size  uint64
 }
 
-// CXLMemdev is the Dev of a local memdev device (DeviceTypeCXLMemdev).
-type CXLMemdev struct {
+// Memdev is the Dev of a local memdev device (DeviceTypeMemdev).
+type Memdev struct {
 	Name         string // memN
 	Serial       uint64
 	Size         uint64 // RAM capacity, bytes
 	NodeAffinity int    // CPU NUMA node of the memdev, -1 if unknown
 	BlockSize    uint64 // memory block size, bytes: slices are multiples of it
-	// Mode is what the plugin had on the memdev at scan time: "none",
-	// ModeNUMA, ModeDax or "numa+dax" (slices of both modes).
-	Mode string
 }
 
-// DynamicToken is the Dev of the token device: it has no hardware, no
+// LeaseToken is the Dev of the lease device: it has no hardware, no
 // capacity and can be allocated any number of times.
-type DynamicToken struct{}
+type LeaseToken struct{}
 
-func (g *DeviceInfo) CDIName() string {
-	return fmt.Sprintf("%s=%s", CDIKind, g.UID)
-}
-
+// DeepCopy returns a copy of the device info.
 func (g *DeviceInfo) DeepCopy() *DeviceInfo {
 	di := *g
 	return &di
@@ -162,6 +152,7 @@ func (g *DeviceInfo) DeepCopy() *DeviceInfo {
 // DevicesInfo is a dictionary with DeviceInfo.uid being the key.
 type DevicesInfo map[string]*DeviceInfo
 
+// DeepCopy returns a copy of the devices.
 func (g *DevicesInfo) DeepCopy() DevicesInfo {
 	devicesInfoCopy := DevicesInfo{}
 	for duid, device := range *g {

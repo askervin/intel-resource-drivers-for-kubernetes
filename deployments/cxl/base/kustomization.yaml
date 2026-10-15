@@ -1,5 +1,4 @@
 resources:
-  - device-class.yaml
   - namespace.yaml
   - resource-driver.yaml
 

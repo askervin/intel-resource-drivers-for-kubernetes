@@ -30,15 +30,16 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"k8s.io/klog/v2"
 
-	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
+	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/api"
 
 	"github.com/containers/nri-plugins/pkg/cxl/memctl"
 )
 
 // The local allocator gives the memory of node-local CXL memdevs (the
-// cxl-memdev devices of cxl.generic) to claims. It creates one devdax
+// memdev devices of cxl.generic) to claims. It creates one devdax
 // region per memdev on first use and destroys it after the last use. Every
 // allocation result gets a slice of the region: a dax device whose size is
 // a multiple of the memory block size. A numa slice is bound to kmem and
@@ -50,11 +51,6 @@ const (
 	// localStateFileName is the state file of the local allocator in the
 	// plugin data directory of cxl.generic.
 	localStateFileName = "localDevices.json"
-	// modeNone is the mode attribute of a memdev without slices.
-	modeNone = "none"
-	// modeNUMADax is the mode attribute of a memdev with slices of both
-	// modes.
-	modeNUMADax = device.ModeNUMA + "+" + device.ModeDax
 	// orphanOwner owns the slices whose release failed (no claim UID is
 	// "-"): they are never handed out, and released again before the
 	// next slice of their memdev.
@@ -80,14 +76,12 @@ var errNoRoom = errors.New("no room for the slice")
 type localSlice struct {
 	Request string `json:"request"`
 	Region  string `json:"region"`
-	// Mode is device.ModeNUMA (the memory of the slice is system RAM of
-	// the NUMA node of the region) or device.ModeDax (a devdax device).
+	// Mode is api.ModeNUMA (the memory of the slice is system RAM of the
+	// NUMA node of the region) or api.ModeDax (a devdax device).
 	Mode string `json:"mode"`
 	// Size is the slice size in bytes.
 	Size uint64 `json:"size"`
-	// Dax is the dax device of the slice (daxX.Y). A numa slice without
-	// one has the whole region online: the numa claims of a state file
-	// that has a mode per memdev and none per slice.
+	// Dax is the dax device of the slice (daxX.Y).
 	Dax       string `json:"dax,omitempty"`
 	DaxDevice string `json:"daxDevice,omitempty"` // dax: /dev/daxX.Y
 	Major     int    `json:"major,omitempty"`
@@ -104,12 +98,8 @@ type localDevice struct {
 	// while it is created: then every region on the memdev is the
 	// allocator's.
 	Region string `json:"region,omitempty"`
-	// Mode is what the memdev holds: modeNone, device.ModeNUMA,
-	// device.ModeDax or modeNUMADax. A slice without a mode has the mode
-	// of its memdev.
-	Mode string `json:"mode"`
-	Node int    `json:"node"`          // NUMA node of the memory of the region, -1 if unknown
-	Dax  string `json:"dax,omitempty"` // first dax device of the region
+	Node   int    `json:"node"`          // NUMA node of the memory of the region, -1 if unknown
+	Dax    string `json:"dax,omitempty"` // first dax device of the region
 	// Claims are the slices of the claims that use the memdev, by claim
 	// UID.
 	Claims map[string][]*localSlice `json:"claims"`
@@ -135,33 +125,28 @@ type localAllocator struct {
 	mu      sync.Mutex
 	devices map[uint64]*localDevice // by serial
 
-	// modes is a snapshot of the serials and modes of devices, and
+	// serialsSnap is a snapshot of the serials of the devices, and
 	// blockSize the memory block size in bytes (0 if unknown), for the
 	// publisher. They have their own lock so that a rescan never waits
 	// for a Prepare.
-	modesMu   sync.Mutex
-	modes     map[uint64]string
-	blockSize uint64
+	snapMu      sync.Mutex
+	serialsSnap map[uint64]bool
+	blockSize   uint64
 }
 
 // localSnapshot is what the publisher of local memdevs needs from the
 // local allocator.
 type localSnapshot struct {
-	// Modes are the mode attributes of the memdevs that the allocator
-	// uses or is preparing, by serial.
-	Modes map[uint64]string
+	// Serials are the serials of the memdevs that the allocator uses or
+	// is preparing.
+	Serials map[uint64]bool
 	// BlockSize is the memory block size in bytes, 0 if unknown.
 	BlockSize uint64
 }
 
-// mode returns the mode attribute of the memdev with the serial, and
-// whether the allocator uses it.
-func (l *localSnapshot) mode(serial uint64) (string, bool) {
-	if l == nil {
-		return "", false
-	}
-	m, ok := l.Modes[serial]
-	return m, ok
+// uses tells whether the allocator uses the memdev with the serial.
+func (l *localSnapshot) uses(serial uint64) bool {
+	return l != nil && l.Serials[serial]
 }
 
 // newLocalAllocator returns a local allocator with its state loaded from
@@ -185,7 +170,7 @@ func newLocalAllocator(mem *memctl.Manager, stateFile, bootID string) (*localAll
 	if _, err := a.readBlockSize(); err != nil {
 		klog.Warningf("local: %v: local memory devices are not published until the memory block size is known", err)
 	}
-	a.updateModes()
+	a.updateSnapshot()
 	return a, nil
 }
 
@@ -196,9 +181,9 @@ func (a *localAllocator) readBlockSize() (uint64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("memory block size: %w", err)
 	}
-	a.modesMu.Lock()
+	a.snapMu.Lock()
 	a.blockSize = bs
-	a.modesMu.Unlock()
+	a.snapMu.Unlock()
 	return bs, nil
 }
 
@@ -219,90 +204,32 @@ func rollbackContext(ctx context.Context) (context.Context, context.CancelFunc) 
 	return context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
 }
 
-// modeAttribute returns the mode attribute of a memdev whose mode is m (""
-// if the allocator does not use it).
-func modeAttribute(m string) string {
-	if m == "" {
-		return modeNone
-	}
-	return m
-}
-
-// Modes returns the modes of the memdevs that the allocator uses or is
-// preparing, by serial. Nil for a nil (disabled) allocator.
-func (a *localAllocator) Modes() map[uint64]string {
-	return a.Snapshot().modes()
-}
-
-// modes returns the modes of a snapshot, nil for a nil snapshot.
-func (l *localSnapshot) modes() map[uint64]string {
-	if l == nil {
-		return nil
-	}
-	return l.Modes
-}
-
-// Snapshot returns the modes of the memdevs that the allocator uses or is
-// preparing, and the memory block size. Nil for a nil (disabled)
+// Snapshot returns the serials of the memdevs that the allocator uses or
+// is preparing, and the memory block size. Nil for a nil (disabled)
 // allocator.
 func (a *localAllocator) Snapshot() *localSnapshot {
 	if a == nil {
 		return nil
 	}
-	a.modesMu.Lock()
-	snap := &localSnapshot{Modes: maps.Clone(a.modes), BlockSize: a.blockSize}
-	a.modesMu.Unlock()
+	a.snapMu.Lock()
+	snap := &localSnapshot{Serials: maps.Clone(a.serialsSnap), BlockSize: a.blockSize}
+	a.snapMu.Unlock()
 	if snap.BlockSize == 0 {
 		snap.BlockSize, _ = a.readBlockSize()
 	}
 	return snap
 }
 
-// updateModes sets the mode of every device from its slices and refreshes
-// the snapshot of the modes. Called with a.mu held.
-func (a *localAllocator) updateModes() {
-	m := make(map[uint64]string, len(a.devices))
-	for serial, d := range a.devices {
-		d.Mode = d.slicesMode()
-		m[serial] = d.Mode
+// updateSnapshot refreshes the snapshot of the serials of the devices.
+// Called with a.mu held.
+func (a *localAllocator) updateSnapshot() {
+	m := make(map[uint64]bool, len(a.devices))
+	for serial := range a.devices {
+		m[serial] = true
 	}
-	a.modesMu.Lock()
-	a.modes = m
-	a.modesMu.Unlock()
-}
-
-// slicesMode returns what the slices of a device are: modeNone,
-// device.ModeNUMA, device.ModeDax or modeNUMADax.
-func (d *localDevice) slicesMode() string {
-	numa, dax := false, false
-	for _, own := range d.Claims {
-		for _, s := range own {
-			numa = numa || s.Mode == device.ModeNUMA
-			dax = dax || s.Mode == device.ModeDax
-		}
-	}
-	switch {
-	case numa && dax:
-		return modeNUMADax
-	case numa:
-		return device.ModeNUMA
-	case dax:
-		return device.ModeDax
-	}
-	return modeNone
-}
-
-// wholeRegion tells whether the device has a numa slice that is the whole
-// region online.
-func (d *localDevice) wholeRegion() bool {
-	for _, own := range d.Claims {
-		for _, s := range own {
-			if s.Mode == device.ModeNUMA && s.Dax == "" {
-				return true
-			}
-		}
-	}
-	return false
+	a.snapMu.Lock()
+	a.serialsSnap = m
+	a.snapMu.Unlock()
 }
 
 // Acquire gives a slice of the local memdev with the serial to an
@@ -311,15 +238,15 @@ func (d *localDevice) wholeRegion() bool {
 // a multiple of the memory block size.
 //   - claimUID, request: the claim and the request of the allocation result
 //   - serial: the serial of the memdev
-//   - mode: device.ModeNUMA (system RAM of the NUMA node of the memdev) or
-//     device.ModeDax (a devdax device of its own)
+//   - mode: api.ModeNUMA (system RAM of the NUMA node of the memdev) or
+//     api.ModeDax (a devdax device of its own)
 //   - size: bytes that the allocation result consumes
 //   - readOnly: the dax slice is for reading only
 func (a *localAllocator) Acquire(ctx context.Context, claimUID, request string, serial uint64, mode string, size uint64, readOnly bool) (*localSlice, int, error) {
 	if a == nil {
 		return nil, -1, errors.New("local memdevs are not managed (manageMemdevs: false)")
 	}
-	if mode != device.ModeNUMA && mode != device.ModeDax {
+	if mode != api.ModeNUMA && mode != api.ModeDax {
 		return nil, -1, fmt.Errorf("invalid mode %q", mode)
 	}
 	if size == 0 {
@@ -336,24 +263,18 @@ func (a *localAllocator) Acquire(ctx context.Context, claimUID, request string, 
 		return nil, -1, err
 	}
 	s := &localSlice{Request: request, Region: d.Region, Mode: mode, Size: size, ReadOnly: readOnly}
-	if mode == device.ModeNUMA && d.wholeRegion() {
-		// blocks that a failed release left offline
-		_, err = a.mem.Online(d.Memdev, true)
-	} else {
-		err = a.addSlice(ctx, d, claimUID, s, bs)
-	}
-	if err != nil {
+	if err := a.addSlice(ctx, d, claimUID, s, bs); err != nil {
 		a.dropUnused(ctx, d)
 		return nil, -1, fmt.Errorf("memdev %s (serial 0x%x): %w", d.Memdev, serial, err)
 	}
 	d.Claims[claimUID] = append(d.Claims[claimUID], s)
 	node := -1
-	if mode == device.ModeNUMA {
+	if mode == api.ModeNUMA {
 		node = d.Node
 	}
 	klog.Infof("local: memdev %s (serial 0x%x) %s: claim %s request %s: slice %s mode %s size %d node %d%s",
 		d.Memdev, serial, d.Region, claimUID, request, s.Dax, mode, s.Size, node, strings.TrimRight(" "+s.DaxDevice, " "))
-	a.updateModes()
+	a.updateSnapshot()
 	if err := a.save(); err != nil {
 		return nil, -1, err
 	}
@@ -392,12 +313,11 @@ func (a *localAllocator) device(ctx context.Context, serial, bs uint64) (*localD
 		Serial:    serial,
 		SerialHex: fmt.Sprintf("%x", serial),
 		Memdev:    memdev,
-		Mode:      modeNone,
 		Node:      -1,
 		Claims:    map[string][]*localSlice{},
 	}
 	a.devices[serial] = d
-	a.updateModes()
+	a.updateSnapshot()
 	err = a.save()
 	if err == nil {
 		err = a.createRegion(ctx, d, bs)
@@ -460,7 +380,7 @@ func (a *localAllocator) createRegion(ctx context.Context, d *localDevice, bs ui
 
 // region creates the devdax region of a memdev.
 func (a *localAllocator) region(ctx context.Context, memdev string) (*memctl.RegionInfo, error) {
-	ri, err := a.mem.CreateRegion(ctx, memdev, memctl.ModeDevDax, "")
+	ri, err := a.mem.CreateRegion(ctx, memdev, memctl.ModeDax, "")
 	if err != nil {
 		return nil, err
 	}
@@ -526,7 +446,7 @@ func (a *localAllocator) addSlice(ctx context.Context, d *localDevice, claimUID 
 		s.Dax = dax
 		ranges, _ := a.mem.DaxDeviceRanges(dax)
 		logSlice(d, claimUID, "created", s, start, fmt.Sprintf(" at %v", ranges))
-		if s.Mode == device.ModeNUMA {
+		if s.Mode == api.ModeNUMA {
 			err = a.onlineSlice(ctx, d, claimUID, s, bs)
 		} else {
 			err = a.bindSlice(ctx, dax, s)
@@ -694,7 +614,7 @@ func zeroDax(devRoot string, major, minor int, size, align uint64) error {
 	}
 	defer os.RemoveAll(dir)
 	node := filepath.Join(dir, "dax")
-	if err := syscall.Mknod(node, syscall.S_IFCHR|0600, int(unixMkdev(uint32(major), uint32(minor)))); err != nil {
+	if err := syscall.Mknod(node, syscall.S_IFCHR|0600, int(unix.Mkdev(uint32(major), uint32(minor)))); err != nil {
 		return fmt.Errorf("mknod %d:%d: %w", major, minor, err)
 	}
 	f, err := os.OpenFile(node, os.O_RDWR, 0)
@@ -766,13 +686,8 @@ func (a *localAllocator) holds(claimUID, dax string) bool {
 	return false
 }
 
-// usesDax tells whether a slice of the device has the dax device. The
-// first dax device of a region that is online as a whole is the slice of
-// all its numa claims.
+// usesDax tells whether a slice of the device has the dax device.
 func (d *localDevice) usesDax(dax string) bool {
-	if dax == d.Dax && d.wholeRegion() {
-		return true
-	}
 	for _, own := range d.Claims {
 		for _, s := range own {
 			if s.Dax == dax {
@@ -805,7 +720,7 @@ func (a *localAllocator) Release(ctx context.Context, claimUID string) error {
 		}
 	}
 	if changed {
-		a.updateModes()
+		a.updateSnapshot()
 		errs = append(errs, a.save())
 	}
 	return errors.Join(errs...)
@@ -935,9 +850,9 @@ func (a *localAllocator) dropUnused(ctx context.Context, d *localDevice) {
 	a.persist()
 }
 
-// persist refreshes the modes and saves the state, logging an error.
+// persist refreshes the snapshot and saves the state, logging an error.
 func (a *localAllocator) persist() {
-	a.updateModes()
+	a.updateSnapshot()
 	if err := a.save(); err != nil {
 		klog.Errorf("local: %v", err)
 	}
@@ -958,7 +873,7 @@ func (a *localAllocator) Reconcile(ctx context.Context, prepared map[string]bool
 	for _, serial := range a.serials() {
 		a.reconcileDevice(ctx, a.devices[serial], prepared)
 	}
-	a.updateModes()
+	a.updateSnapshot()
 	if err := a.save(); err != nil {
 		klog.Errorf("local: %v", err)
 	}
@@ -1022,9 +937,9 @@ func (a *localAllocator) deleteOrphans(ctx context.Context, d *localDevice) {
 		if err != nil || size == 0 || d.usesDax(dax) {
 			continue
 		}
-		s := &localSlice{Mode: device.ModeDax, Size: size, Dax: dax}
+		s := &localSlice{Mode: api.ModeDax, Size: size, Dax: dax}
 		if a.mem.DaxDriver(dax) == memctl.DriverKmem {
-			s.Mode = device.ModeNUMA
+			s.Mode = api.ModeNUMA
 		}
 		klog.Warningf("local: memdev %s (serial 0x%x): %s (mode %s, %d bytes) belongs to no claim, deleting it", d.Memdev, d.Serial, dax, s.Mode, size)
 		if err := a.deleteSlice(ctx, d, orphanOwner, s); err != nil {
@@ -1070,8 +985,7 @@ func (a *localAllocator) save() error {
 }
 
 // load reads the state file, if there is one. A list of devices without a
-// boot id is read as the state of an unknown boot, a slice without a mode
-// has the mode of its device.
+// boot id is read as the state of an unknown boot.
 func (a *localAllocator) load() error {
 	data, err := os.ReadFile(a.stateFile)
 	if os.IsNotExist(err) {
@@ -1094,13 +1008,6 @@ func (a *localAllocator) load() error {
 	for _, d := range st.Devices {
 		if d.Claims == nil {
 			d.Claims = map[string][]*localSlice{}
-		}
-		for _, own := range d.Claims {
-			for _, s := range own {
-				if s.Mode == "" {
-					s.Mode = d.Mode
-				}
-			}
 		}
 		a.devices[d.Serial] = d
 	}

@@ -19,7 +19,6 @@ package main
 import (
 	"context"
 	"maps"
-	"strconv"
 	"sync"
 	"time"
 
@@ -32,7 +31,7 @@ import (
 )
 
 // A memdev whose serial a pool controller publishes in its ResourceSlices
-// is a pool device, also before the pool helper prepares it for a claim:
+// is a pool device, also before the pool driver prepares it for a claim:
 // cxl.generic never publishes it as a local memdev.
 
 // poolListRetry is how often the devices of pool controllers are listed
@@ -96,10 +95,8 @@ func (p *poolSlices) Serials(ctx context.Context) (map[uint64]bool, bool) {
 			continue
 		}
 		for j := range rs.Spec.Devices {
-			if s := deviceSerial(&rs.Spec.Devices[j], rs.Spec.Driver); s != "" {
-				if v, err := strconv.ParseUint(s, 0, 64); err == nil {
-					serials[v] = true
-				}
+			if s, ok := deviceSerial(&rs.Spec.Devices[j], rs.Spec.Driver); ok {
+				serials[s] = true
 			}
 		}
 	}
@@ -118,7 +115,7 @@ func (p *poolSlices) Failing() bool {
 }
 
 // scanInput returns the configuration and the pool serials of a scan: the
-// serials of the memdevs that the pool helper prepares and of the devices
+// serials of the memdevs that the pool driver prepares and of the devices
 // that pool controllers publish. While the devices of the pool controllers
 // are not known, the configuration publishes no local memdevs.
 func scanInput(ctx context.Context, driverConfig *DriverConfig, pool *poolDriver, slices *poolSlices) (*DriverConfig, map[uint64]bool) {

@@ -29,9 +29,12 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	cdiSpecs "tags.cncf.io/container-device-interface/specs-go"
 
+	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/api"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
+	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/memorypolicy"
 )
 
 // fakeHooks records the leaseHooks calls.
@@ -42,30 +45,33 @@ type fakeHooks struct {
 	devs       []lentDevice
 }
 
-func (h *fakeHooks) OnLending(cfg *lendConfig) error {
+func (h *fakeHooks) OnLending(id string, claim *resourceapi.ResourceClaim) (*lendRecord, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.calls = append(h.calls, "lending "+cfg.Lease)
-	return h.lendingErr
+	h.calls = append(h.calls, "lending "+id+" "+claim.Name)
+	if h.lendingErr != nil {
+		return nil, h.lendingErr
+	}
+	return &lendRecord{Lease: id, Pod: podRef{Namespace: testNS, Name: testPod, UID: testPodUID}, Container: testCtr}, nil
 }
 
-func (h *fakeHooks) OnPrepared(cfg *lendConfig, devs []lentDevice) {
+func (h *fakeHooks) OnPrepared(id string, devs []lentDevice) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.calls = append(h.calls, "prepared "+cfg.Lease)
+	h.calls = append(h.calls, "prepared "+id)
 	h.devs = devs
 }
 
-func (h *fakeHooks) OnLendFailed(cfg *lendConfig, err error) {
+func (h *fakeHooks) OnLendFailed(id string, err error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.calls = append(h.calls, "failed "+cfg.Lease+": "+err.Error())
+	h.calls = append(h.calls, "failed "+id+": "+err.Error())
 }
 
-func (h *fakeHooks) OnReleasing(lease string) {
+func (h *fakeHooks) OnReleasing(id string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.calls = append(h.calls, "releasing "+lease)
+	h.calls = append(h.calls, "releasing "+id)
 }
 
 func (h *fakeHooks) log() string {
@@ -76,7 +82,7 @@ func (h *fakeHooks) log() string {
 
 var _ leaseHooks = (*fakeHooks)(nil)
 
-// revokeFailer is a Lender whose RevokeNode fails.
+// revokeFailer is a nodeLender whose RevokeNode fails.
 type revokeFailer struct {
 	*fakeLender
 }
@@ -86,33 +92,47 @@ func (r revokeFailer) RevokeNode(ctx context.Context, podUID, name string, node 
 	return fmt.Errorf("node %d busy", node)
 }
 
-func testLendConfig() *lendConfig {
-	return &lendConfig{Kind: device.LendConfigKind, Lease: "l1", Pod: podRef{Namespace: testNS, Name: testPod, UID: testPodUID}, Container: testCtr}
+// companionClaim returns the companion claim of a lease as the broker
+// creates it: name, namespace, label and owner.
+func companionClaim(id string) *resourceapi.ResourceClaim {
+	return &resourceapi.ResourceClaim{ObjectMeta: metav1.ObjectMeta{
+		Name:            companionName(id),
+		Namespace:       testNS,
+		UID:             types.UID("uid-" + companionName(id)),
+		Labels:          map[string]string{device.LeaseLabel: id},
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "v1", Kind: "Pod", Name: testPod, UID: testPodUID, Controller: ptr(true)}},
+	}}
 }
 
-func TestClaimLenderDisabled(t *testing.T) {
-	cfg := testLendConfig()
-	c := newClaimLender(device.DriverName)
-	if c.enabled() {
-		t.Fatal("enabled without hooks")
+func testLendRecord() *lendRecord {
+	return &lendRecord{Lease: "l1", Pod: podRef{Namespace: testNS, Name: testPod, UID: testPodUID}, Container: testCtr}
+}
+
+func TestLeaseOf(t *testing.T) {
+	if id := leaseOf(companionClaim("1a2b3c4d")); id != "1a2b3c4d" {
+		t.Fatalf("lease of a companion claim %q", id)
 	}
-	wantErr(t, c.check(cfg), "lease l1: lending to running containers is disabled")
+	if id := leaseOf(&resourceapi.ResourceClaim{}); id != "" {
+		t.Fatalf("lease of another claim %q", id)
+	}
+}
+
+func TestCompanionLenderDisabled(t *testing.T) {
+	claim := companionClaim("l1")
+	c := newCompanionLender(device.DriverName)
+	_, err := c.check("l1", claim)
+	wantErr(t, err, "lease l1: lending to running containers is disabled (--leases=false)")
 	hooks := &fakeHooks{}
 	c.set(nil, hooks)
-	if !c.enabled() {
-		t.Fatal("not enabled with hooks")
-	}
-	err := c.check(cfg)
-	if !errors.Is(err, errLendingUnavailable) {
+	if _, err := c.check("l1", claim); !errors.Is(err, errLendingUnavailable) {
 		t.Fatalf("check without NRI: %v", err)
 	}
 	// numa devices cannot be lent without NRI, dax devices need no lend
-	rec, err := c.lend(context.Background(), cfg, []lentDevice{{Mode: device.ModeNUMA, Node: 3}})
-	if !errors.Is(err, errLendingUnavailable) || len(rec.Nodes) != 0 {
+	rec := testLendRecord()
+	if err := c.lend(context.Background(), rec, []lentDevice{{Mode: api.ModeNUMA, Node: 3}}); !errors.Is(err, errLendingUnavailable) || len(rec.Nodes) != 0 {
 		t.Fatalf("lend without NRI: %+v %v", rec, err)
 	}
-	rec, err = c.lend(context.Background(), cfg, []lentDevice{{Mode: device.ModeDax, Node: -1, DaxDevice: "/dev/dax0.1"}})
-	noErr(t, err)
+	noErr(t, c.lend(context.Background(), rec, []lentDevice{{Mode: api.ModeDax, Node: -1, DaxDevice: "/dev/dax0.1"}}))
 	if rec.Lease != "l1" || rec.Container != testCtr || len(rec.Nodes) != 0 {
 		t.Fatalf("dax lend record %+v", rec)
 	}
@@ -122,44 +142,46 @@ func TestClaimLenderDisabled(t *testing.T) {
 		t.Fatalf("hooks called: %s", log)
 	}
 
-	// a nil claimLender is disabled and safe to use
-	var n *claimLender
+	// a nil companionLender is disabled and safe to use
+	var n *companionLender
 	n.set(newFakeLender(), hooks)
-	n.prepared(cfg, nil)
-	n.failed(cfg, errors.New("x"))
+	n.prepared("l1", nil)
+	n.failed("l1", errors.New("x"))
 	n.releasing("l1")
-	n.reprepared(&lendRecord{Lease: "l1"}, nil)
-	if n.enabled() || hooks.log() != "" {
-		t.Fatalf("nil claimLender: enabled %v, hooks %s", n.enabled(), hooks.log())
+	n.reprepared(&lendRecord{Lease: "l1"}, claim, nil)
+	if hooks.log() != "" {
+		t.Fatalf("nil companionLender: hooks %s", hooks.log())
 	}
-	wantErr(t, n.check(cfg), "disabled")
-	if _, err := n.parse(&resourceapi.ResourceClaim{}); err == nil {
-		t.Fatal("nil claimLender parsed a claim")
-	}
+	_, err = n.check("l1", claim)
+	wantErr(t, err, "disabled")
 }
 
-func TestClaimLenderLendRevoke(t *testing.T) {
+func TestCompanionLenderLendRevoke(t *testing.T) {
 	ctx := context.Background()
-	cfg := testLendConfig()
+	claim := companionClaim("l1")
 	nodes := newFakeLender(testRef)
 	hooks := &fakeHooks{}
-	c := newClaimLender(device.PoolDriverName)
+	c := newCompanionLender(device.PoolDriverName)
 	c.set(nodes, hooks)
 
-	noErr(t, c.check(cfg))
+	rec, err := c.check("l1", claim)
+	noErr(t, err)
+	if !reflect.DeepEqual(rec, testLendRecord()) {
+		t.Fatalf("lend of the lease %+v", rec)
+	}
 	hooks.lendingErr = errors.New("lease l1 is Failed")
-	wantErr(t, c.check(cfg), "lease l1 is Failed")
+	_, err = c.check("l1", claim)
+	wantErr(t, err, "lease l1 is Failed")
 	hooks.lendingErr = nil
 
 	devs := []lentDevice{
-		{Mode: device.ModeNUMA, Node: 2},
-		{Mode: device.ModeDax, Node: -1, DaxDevice: "/dev/dax0.0"},
-		{Mode: device.ModeNUMA, Node: -1},
-		{Mode: device.ModeNUMA, Node: 3},
+		{Mode: api.ModeNUMA, Node: 2},
+		{Mode: api.ModeDax, Node: -1, DaxDevice: "/dev/dax0.0"},
+		{Mode: api.ModeNUMA, Node: -1},
+		{Mode: api.ModeNUMA, Node: 3},
 	}
-	rec, err := c.lend(ctx, cfg, devs)
-	noErr(t, err)
-	want := &lendRecord{Lease: "l1", Pod: cfg.Pod, Container: testCtr, Nodes: []int{2, 3}}
+	noErr(t, c.lend(ctx, rec, devs))
+	want := &lendRecord{Lease: "l1", Pod: rec.Pod, Container: testCtr, Nodes: []int{2, 3}}
 	if !reflect.DeepEqual(rec, want) {
 		t.Fatalf("lend record %+v", rec)
 	}
@@ -172,31 +194,31 @@ func TestClaimLenderLendRevoke(t *testing.T) {
 	}
 	noErr(t, c.revoke(ctx, nil, "ns/c"))
 
-	// a failing LendNode returns the nodes lent so far, including the
-	// failed one, so that a revoke cleans up
+	// a failing LendNode leaves the nodes lent so far, including the
+	// failed one, in the record, so that a revoke cleans up
 	nodes.mu.Lock()
 	nodes.lendErr = errSteered
 	nodes.mu.Unlock()
-	rec, err = c.lend(ctx, cfg, devs)
-	if !errors.Is(err, errSteered) || !reflect.DeepEqual(rec.Nodes, []int{2}) {
+	rec = testLendRecord()
+	if err := c.lend(ctx, rec, devs); !errors.Is(err, errSteered) || !reflect.DeepEqual(rec.Nodes, []int{2}) {
 		t.Fatalf("failed lend: %+v %v", rec, err)
 	}
 
 	// revoke errors are joined
 	c.set(revokeFailer{nodes}, hooks)
-	err = c.revoke(ctx, &lendRecord{Lease: "l1", Pod: cfg.Pod, Container: testCtr, Nodes: []int{2, 3}}, "ns/c")
+	err = c.revoke(ctx, &lendRecord{Lease: "l1", Pod: rec.Pod, Container: testCtr, Nodes: []int{2, 3}}, "ns/c")
 	wantErr(t, err, "revoking node 2")
 	wantErr(t, err, "node 3 busy")
 
 	// hook forwarding
 	hooks.calls = nil
-	c.prepared(cfg, devs[:1])
-	c.failed(cfg, errors.New("boom"))
+	c.prepared("l1", devs[:1])
+	c.failed("l1", errors.New("boom"))
 	c.releasing("l1")
-	c.reprepared(&lendRecord{Lease: "l2", Pod: cfg.Pod, Container: testCtr}, devs[1:2])
+	c.reprepared(&lendRecord{Lease: "l2", Pod: rec.Pod, Container: testCtr}, companionClaim("l2"), devs[1:2])
 	hooks.lendingErr = errors.New("unknown lease")
-	c.reprepared(&lendRecord{Lease: "l3"}, devs)
-	if got, want := hooks.log(), "prepared l1\nfailed l1: boom\nreleasing l1\nlending l2\nprepared l2\nlending l3"; got != want {
+	c.reprepared(&lendRecord{Lease: "l3"}, companionClaim("l3"), devs)
+	if got, want := hooks.log(), "prepared l1\nfailed l1: boom\nreleasing l1\nlending l2 cxl-lease-l2\nprepared l2\nlending l3 cxl-lease-l3"; got != want {
 		t.Fatalf("hook calls:\n%s\nexpected:\n%s", got, want)
 	}
 	if !reflect.DeepEqual(hooks.devs, devs[1:2]) {
@@ -204,74 +226,35 @@ func TestClaimLenderLendRevoke(t *testing.T) {
 	}
 }
 
-// TestLendRecordJSON checks that lend records of state files written by
-// earlier versions of the pool helper load.
 func TestLendRecordJSON(t *testing.T) {
-	old := `{"lease":"000000a1","pod":{"namespace":"demo","name":"borrower","uid":"pod-uid-1"},"container":"app","nodes":[2]}`
+	enc := `{"lease":"000000a1","pod":{"namespace":"demo","name":"borrower","uid":"pod-uid-1"},"container":"app","nodes":[2]}`
 	var rec lendRecord
-	noErr(t, json.Unmarshal([]byte(old), &rec))
+	noErr(t, json.Unmarshal([]byte(enc), &rec))
 	want := lendRecord{Lease: "000000a1", Pod: podRef{Namespace: testNS, Name: testPod, UID: testPodUID}, Container: testCtr, Nodes: []int{2}}
 	if !reflect.DeepEqual(rec, want) {
 		t.Fatalf("loaded %+v", rec)
 	}
 	data, err := json.Marshal(&rec)
 	noErr(t, err)
-	if string(data) != old {
+	if string(data) != enc {
 		t.Fatalf("encoded %s", data)
-	}
-	if cfg := rec.config(); cfg.Kind != device.LendConfigKind || cfg.Lease != rec.Lease || cfg.Pod != rec.Pod || cfg.Container != rec.Container {
-		t.Fatalf("config %+v", cfg)
 	}
 }
 
-func TestParseLendConfig(t *testing.T) {
-	mk := func(src resourceapi.AllocationConfigSource, params string) *resourceapi.ResourceClaim {
-		c := &resourceapi.ResourceClaim{ObjectMeta: metav1.ObjectMeta{Namespace: testNS, Name: "c"}}
-		c.Status.Allocation = &resourceapi.AllocationResult{Devices: resourceapi.DeviceAllocationResult{
-			Config: []resourceapi.DeviceAllocationConfiguration{
-				{Source: src, DeviceConfiguration: resourceapi.DeviceConfiguration{Opaque: &resourceapi.OpaqueDeviceConfiguration{
-					Driver: device.PoolDriverName, Parameters: runtime.RawExtension{Raw: []byte(params)}}}},
-				{Source: src, DeviceConfiguration: resourceapi.DeviceConfiguration{Opaque: &resourceapi.OpaqueDeviceConfiguration{
-					Driver: device.DriverName, Parameters: runtime.RawExtension{Raw: []byte(`{"kind":"LendConfig"}`)}}}},
-			},
-		}}
-		return c
-	}
-	good := `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"LendConfig","lease":"abc","pod":{"namespace":"demo","name":"p","uid":"u"},"container":"app"}`
-	cfg, err := parseLendConfig(mk(resourceapi.AllocationConfigSourceClaim, good), device.PoolDriverName)
-	noErr(t, err)
-	if cfg == nil || cfg.Lease != "abc" || cfg.Container != "app" || cfg.Pod != (podRef{Namespace: testNS, Name: "p", UID: "u"}) {
-		t.Fatalf("parsed %+v", cfg)
-	}
-	cfg, err = parseLendConfig(mk(resourceapi.AllocationConfigSourceClaim, `{"kind":"Other"}`), device.PoolDriverName)
-	if cfg != nil || err != nil {
-		t.Fatalf("other kind: %+v %v", cfg, err)
-	}
-	for _, c := range []struct {
-		src    resourceapi.AllocationConfigSource
-		params string
-		err    string
-	}{
-		{resourceapi.AllocationConfigSourceClass, good, "only from the claim"},
-		{resourceapi.AllocationConfigSourceClaim, strings.Replace(good, `"namespace":"demo"`, `"namespace":"other"`, 1), "not the claim's namespace"},
-		{resourceapi.AllocationConfigSourceClaim, strings.Replace(good, `"container":"app"`, `"container":""`, 1), "required"},
-		{resourceapi.AllocationConfigSourceClaim, strings.Replace(good, "v1alpha1", "v9", 1), "apiVersion"},
-		{resourceapi.AllocationConfigSourceClaim, `{"kind":`, "invalid opaque config"},
-	} {
-		_, err := parseLendConfig(mk(c.src, c.params), device.PoolDriverName)
-		wantErr(t, err, c.err)
-	}
-
-	// the pool helper refuses a LendConfig without a broker or a lender
+// TestPoolCompanionRefused prepares a companion claim through the pool
+// driver without a broker or a lender: nothing is touched.
+func TestPoolCompanionRefused(t *testing.T) {
 	pe := newPoolTestEnv(t)
 	pe.f.plug("0xc1ee0001")
 	p := pe.driver(t)
 	claim := poolClaim("u9", "c9", "pooled0", exclusiveData)
 	claim.Namespace = testNS
-	claim.Status.Allocation.Devices.Config = mk(resourceapi.AllocationConfigSourceClaim, good).Status.Allocation.Devices.Config
-	wantErr(t, prepare(t, p, claim).Err, "lending to running containers is disabled")
+	claim.Labels = map[string]string{device.LeaseLabel: "abc"}
+	wantErr(t, prepare(t, p, claim).Err, "lending to running containers is disabled (--leases=false)")
 	p.lender.set(nil, &broker{store: &leaseStore{Leases: map[string]*lease{}}, changed: make(chan struct{})})
 	wantErr(t, prepare(t, p, claim).Err, "lending unavailable: NRI not connected")
+	p.lender.set(newFakeLender(testRef), &broker{store: &leaseStore{Leases: map[string]*lease{}}, changed: make(chan struct{})})
+	wantErr(t, prepare(t, p, claim).Err, "claim demo/c9: not the companion of lease abc")
 	if strings.Contains(pe.f.commands(), "create-region") {
 		t.Fatalf("device touched for a refused lend:\n%s", pe.f.commands())
 	}
@@ -290,76 +273,101 @@ func withDriverConfig(c *resourceapi.ResourceClaim, driver string, source resour
 	return c
 }
 
-func TestParseDeviceConfig(t *testing.T) {
+func TestParseConfigDeviceConfig(t *testing.T) {
 	const (
 		class = resourceapi.AllocationConfigSourceClass
 		claim = resourceapi.AllocationConfigSourceClaim
 		pool  = device.PoolDriverName
 		local = device.DriverName
 	)
-	lend := `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"LendConfig","lease":"l1"}`
-	localDax := `{"apiVersion":"cxl.generic/v1alpha1","kind":"LocalDeviceConfig","mode":"dax"}`
-	localRO := `{"apiVersion":"cxl.generic/v1alpha1","kind":"LocalDeviceConfig","mode":"dax","readOnly":true}`
-	poolDax := deviceConfig{APIVersion: "cxl-pool.generic/v1alpha1", Kind: "PoolDeviceConfig", Mode: "dax"}
+	policy := `{"apiVersion":"cxl.generic/v1alpha1","kind":"MemoryPolicyConfig","memoryUseOrder":"first-dram"}`
+	localDax := `{"apiVersion":"cxl.generic/v1alpha1","kind":"DeviceConfig","mode":"dax"}`
+	localRO := `{"apiVersion":"cxl.generic/v1alpha1","kind":"DeviceConfig","mode":"dax","readOnly":true}`
+	poolDax := deviceConfig{APIVersion: "cxl-pool.generic/v1alpha1", Kind: "DeviceConfig", Mode: "dax"}
 	for _, tc := range []struct {
-		name, driver, kind, request string
-		configs                     func(c *resourceapi.ResourceClaim)
-		want                        deviceConfig
-		err                         string
+		name, driver, request string
+		configs               func(c *resourceapi.ResourceClaim)
+		want                  deviceConfig
+		err                   string
 	}{
-		{name: "none", driver: pool, kind: device.PoolDeviceConfigKind, request: "mem", configs: func(c *resourceapi.ResourceClaim) {}},
-		{name: "claim wins over class", driver: pool, kind: device.PoolDeviceConfigKind, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
+		{name: "none", driver: pool, request: "mem", configs: func(c *resourceapi.ResourceClaim) {}},
+		{name: "claim replaces class", driver: pool, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
 			withConfig(c, claim, nil, daxConfig)
 			withConfig(c, class, nil, roConfig)
 		}, want: poolDax},
-		{name: "class only", driver: pool, kind: device.PoolDeviceConfigKind, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
+		{name: "class only", driver: pool, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
 			withConfig(c, class, nil, roConfig)
-		}, want: deviceConfig{APIVersion: "cxl-pool.generic/v1alpha1", Kind: "PoolDeviceConfig", ReadOnly: true}},
-		{name: "another request", driver: pool, kind: device.PoolDeviceConfigKind, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
+		}, want: deviceConfig{APIVersion: "cxl-pool.generic/v1alpha1", Kind: "DeviceConfig", ReadOnly: true}},
+		{name: "another request", driver: pool, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
 			withConfig(c, claim, []string{"other"}, daxConfig)
 		}},
-		{name: "subrequest", driver: pool, kind: device.PoolDeviceConfigKind, request: "mem/a", configs: func(c *resourceapi.ResourceClaim) {
+		{name: "subrequest", driver: pool, request: "mem/a", configs: func(c *resourceapi.ResourceClaim) {
 			withConfig(c, claim, []string{"mem"}, daxConfig)
 		}, want: poolDax},
-		{name: "other kinds and drivers", driver: pool, kind: device.PoolDeviceConfigKind, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
-			withConfig(c, claim, nil, lend)
-			withDriverConfig(c, local, claim, nil, daxConfig)
+		{name: "another kind and another driver", driver: local, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
+			withDriverConfig(c, local, claim, nil, policy)
+			withConfig(c, claim, nil, daxConfig)
 		}},
-		{name: "local class and claim", driver: local, kind: device.LocalDeviceConfigKind, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
+		{name: "local class and claim", driver: local, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
 			withDriverConfig(c, local, claim, nil, localRO)
 			withDriverConfig(c, local, class, nil, localDax)
-		}, want: deviceConfig{APIVersion: "cxl.generic/v1alpha1", Kind: "LocalDeviceConfig", Mode: "dax", ReadOnly: true}},
-		{name: "local ignores pool kind", driver: local, kind: device.LocalDeviceConfigKind, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
-			withDriverConfig(c, local, claim, nil, `{"apiVersion":"cxl.generic/v1alpha1","kind":"PoolDeviceConfig","mode":"dax"}`)
-		}},
+			withDriverConfig(c, local, claim, nil, policy)
+		}, want: deviceConfig{APIVersion: "cxl.generic/v1alpha1", Kind: "DeviceConfig", Mode: "dax", ReadOnly: true}},
 		// firstAvailable of a companion claim: each config lists the
 		// subrequest of its driver
-		{name: "subrequest of this driver", driver: local, kind: device.LocalDeviceConfigKind, request: "lease/local", configs: func(c *resourceapi.ResourceClaim) {
+		{name: "subrequest of this driver", driver: local, request: "lease/local", configs: func(c *resourceapi.ResourceClaim) {
 			withDriverConfig(c, local, claim, []string{"lease/local"}, localDax)
 			withDriverConfig(c, local, claim, []string{"lease/pool"}, localRO)
-		}, want: deviceConfig{APIVersion: "cxl.generic/v1alpha1", Kind: "LocalDeviceConfig", Mode: "dax"}},
-		{name: "subrequest of another", driver: pool, kind: device.PoolDeviceConfigKind, request: "lease/pool", configs: func(c *resourceapi.ResourceClaim) {
+		}, want: deviceConfig{APIVersion: "cxl.generic/v1alpha1", Kind: "DeviceConfig", Mode: "dax"}},
+		{name: "subrequest of another", driver: pool, request: "lease/pool", configs: func(c *resourceapi.ResourceClaim) {
 			withConfig(c, claim, []string{"lease/local"}, daxConfig)
 		}},
-		{name: "unknown field", driver: local, kind: device.LocalDeviceConfigKind, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
-			withDriverConfig(c, local, claim, nil, `{"apiVersion":"cxl.generic/v1alpha1","kind":"LocalDeviceConfig","slice":"1"}`)
-		}, err: `invalid LocalDeviceConfig from FromClaim config: json: unknown field "slice"`},
-		{name: "wrong apiVersion", driver: local, kind: device.LocalDeviceConfigKind, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
-			withDriverConfig(c, local, class, nil, `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"LocalDeviceConfig"}`)
-		}, err: `LocalDeviceConfig: apiVersion "cxl-pool.generic/v1alpha1", expected "cxl.generic/v1alpha1"`},
-		{name: "not json", driver: local, kind: device.LocalDeviceConfigKind, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
+		{name: "unknown field", driver: local, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
+			withDriverConfig(c, local, claim, nil, `{"apiVersion":"cxl.generic/v1alpha1","kind":"DeviceConfig","slice":"1"}`)
+		}, err: `DeviceConfig: invalid FromClaim config: json: unknown field "slice"`},
+		{name: "wrong apiVersion", driver: local, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
+			withDriverConfig(c, local, class, nil, `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"DeviceConfig"}`)
+		}, err: `DeviceConfig: apiVersion "cxl-pool.generic/v1alpha1", expected "cxl.generic/v1alpha1"`},
+		{name: "not json", driver: local, request: "mem", configs: func(c *resourceapi.ResourceClaim) {
 			withDriverConfig(c, local, class, nil, `{"kind":`)
-		}, err: "invalid opaque config for cxl.generic"},
+		}, err: "invalid opaque FromClass config for cxl.generic"},
 	} {
 		c := poolClaim("u1", "c1", "shared0", sharedData)
 		tc.configs(c)
-		got, err := parseDeviceConfig(c, tc.driver, tc.kind, tc.request)
+		got := &deviceConfig{}
+		_, err := parseConfig(c, tc.driver, device.DeviceConfigKind, tc.request, got)
 		switch {
 		case tc.err != "" && (err == nil || !strings.Contains(err.Error(), tc.err)):
 			t.Errorf("%s: expected error %q, got %v", tc.name, tc.err, err)
 		case tc.err == "" && (err != nil || *got != tc.want):
 			t.Errorf("%s: got %+v %v, expected %+v", tc.name, got, err, tc.want)
 		}
+	}
+}
+
+// TestParseConfigWithoutRequest decodes a MemoryPolicyConfig, which is per
+// claim: every config of the kind applies, whatever requests it lists.
+func TestParseConfigWithoutRequest(t *testing.T) {
+	c := poolClaim("u1", "c1", "shared0", sharedData)
+	withDriverConfig(c, device.DriverName, resourceapi.AllocationConfigSourceClaim, []string{"cxl"},
+		`{"apiVersion":"cxl.generic/v1alpha1","kind":"MemoryPolicyConfig","memoryUseOrder":"first-dram"}`)
+	var cfg memorypolicy.MemoryPolicyConfig
+	found, err := parseConfig(c, device.DriverName, memorypolicy.Kind, "", &cfg)
+	if err != nil || !found || cfg.MemoryUseOrder != "first-dram" {
+		t.Fatalf("policy %+v found %v %v", cfg, found, err)
+	}
+	found, err = parseConfig(c, device.DriverName, memorypolicy.Kind, "dram", &cfg)
+	if err != nil || found {
+		t.Fatalf("policy of another request found %v %v", found, err)
+	}
+	// a later config replaces an earlier one as a whole
+	withDriverConfig(c, device.DriverName, resourceapi.AllocationConfigSourceClaim, nil,
+		`{"apiVersion":"cxl.generic/v1alpha1","kind":"MemoryPolicyConfig","memoryUseOrder":"first-cxl","maxStep":"8Mi"}`)
+	withDriverConfig(c, device.DriverName, resourceapi.AllocationConfigSourceClaim, nil,
+		`{"apiVersion":"cxl.generic/v1alpha1","kind":"MemoryPolicyConfig","memoryUseOrder":"interleave"}`)
+	found, err = parseConfig(c, device.DriverName, memorypolicy.Kind, "", &cfg)
+	if err != nil || !found || cfg.MemoryUseOrder != "interleave" || cfg.MaxStep != "" {
+		t.Fatalf("replaced policy %+v found %v %v", cfg, found, err)
 	}
 }
 
@@ -370,37 +378,94 @@ func TestDeviceConfigModeFor(t *testing.T) {
 		want   string
 		err    string
 	}{
-		{shared: true, want: device.ModeDax},
-		{want: device.ModeNUMA},
-		{cfg: deviceConfig{Mode: "dax", ReadOnly: true}, want: device.ModeDax},
-		{cfg: deviceConfig{Mode: "dax", ReadOnly: true}, shared: true, want: device.ModeDax},
-		{cfg: deviceConfig{Kind: "PoolDeviceConfig", Mode: "numa"}, shared: true, err: "PoolDeviceConfig: mode numa: a shared device is used as dax only"},
-		{cfg: deviceConfig{Kind: "LocalDeviceConfig", ReadOnly: true}, err: "LocalDeviceConfig: readOnly needs mode dax"},
-		{cfg: deviceConfig{Kind: "LocalDeviceConfig", Mode: "kmem"}, err: `LocalDeviceConfig: invalid mode "kmem" (numa or dax)`},
+		{shared: true, want: api.ModeDax},
+		{want: api.ModeNUMA},
+		{cfg: deviceConfig{Mode: "dax", ReadOnly: true}, want: api.ModeDax},
+		{cfg: deviceConfig{Mode: "dax", ReadOnly: true}, shared: true, want: api.ModeDax},
+		{cfg: deviceConfig{Mode: "numa"}, shared: true, err: "DeviceConfig: mode numa: a shared device is used as dax only"},
+		{cfg: deviceConfig{ReadOnly: true}, err: "DeviceConfig: readOnly needs mode dax"},
+		{cfg: deviceConfig{Mode: "kmem"}, err: `DeviceConfig: invalid mode "kmem" (numa or dax)`},
 	} {
 		got, err := tc.cfg.modeFor(tc.shared)
-		if (tc.err == "" && (err != nil || got != tc.want)) || (tc.err != "" && (err == nil || !strings.Contains(err.Error(), tc.err))) {
+		if (tc.err == "" && (err != nil || got != tc.want)) || (tc.err != "" && (err == nil || err.Error() != tc.err)) {
 			t.Errorf("%+v shared %v: got %q %v, expected %q %q", tc.cfg, tc.shared, got, err, tc.want, tc.err)
 		}
 	}
 }
 
-func TestDaxCDIDevice(t *testing.T) {
-	got := daxCDIDevice("local-u1", "CXL_LOCAL_", "c100e2e1", "/dev/dax1.2", 252, 2, 64<<20, false)
-	want := cdiSpecs.Device{Name: "local-u1", ContainerEdits: cdiSpecs.ContainerEdits{
-		Env:         []string{"CXL_LOCAL_DAX_C100E2E1=/dev/dax1.2", "CXL_LOCAL_SIZE_C100E2E1=67108864", "CXL_LOCAL_SERIAL_C100E2E1=0xc100e2e1"},
-		DeviceNodes: []*cdiSpecs.DeviceNode{{Path: "/dev/dax1.2", Type: "c", Major: 252, Minor: 2}},
-	}}
-	if !reflect.DeepEqual(got, want) {
+func TestDaxDeviceNode(t *testing.T) {
+	if got, want := daxDeviceNode("/dev/dax1.2", 252, 2, false), (&cdiSpecs.DeviceNode{Path: "/dev/dax1.2", Type: "c", Major: 252, Minor: 2}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %+v", got)
 	}
-	got = daxCDIDevice("pool-c1ae0001-ro", "CXL_SHARED_", "c1ae0001", "/dev/dax0.0", 251, 3, 1<<28, true)
-	want = cdiSpecs.Device{Name: "pool-c1ae0001-ro", ContainerEdits: cdiSpecs.ContainerEdits{
-		Env: []string{"CXL_SHARED_DAX_C1AE0001=/dev/dax0.0", "CXL_SHARED_SIZE_C1AE0001=268435456", "CXL_SHARED_SERIAL_C1AE0001=0xc1ae0001",
-			"CXL_SHARED_READONLY_C1AE0001=1"},
-		DeviceNodes: []*cdiSpecs.DeviceNode{{Path: "/dev/dax0.0", Type: "c", Major: 251, Minor: 3, Permissions: "r"}},
-	}}
-	if !reflect.DeepEqual(got, want) {
+	if got, want := daxDeviceNode("/dev/dax0.0", 251, 3, true), (&cdiSpecs.DeviceNode{Path: "/dev/dax0.0", Type: "c", Major: 251, Minor: 3, Permissions: "r"}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("read-only: got %+v", got)
+	}
+}
+
+func TestEnvKeys(t *testing.T) {
+	keys := envKeys{}
+	var got []string
+	for _, base := range []string{"C100E2E1", "REGION0", "C100E2E1", "DRAM", "C100E2E1"} {
+		got = append(got, keys.next(base))
+	}
+	if want := []string{"C100E2E1", "REGION0", "C100E2E1_2", "DRAM", "C100E2E1_3"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("keys %v", got)
+	}
+}
+
+func TestCheckConfigKinds(t *testing.T) {
+	const (
+		local = device.DriverName
+		pool  = device.PoolDriverName
+	)
+	kinds := map[string][]string{local: {device.DeviceConfigKind, memorypolicy.Kind}, pool: {device.DeviceConfigKind}}
+	for _, tc := range []struct {
+		name, driver, params, err string
+	}{
+		{"DeviceConfig", local, `{"apiVersion":"cxl.generic/v1alpha1","kind":"DeviceConfig","mode":"dax"}`, ""},
+		{"MemoryPolicyConfig", local, `{"apiVersion":"cxl.generic/v1alpha1","kind":"MemoryPolicyConfig"}`, ""},
+		{"pool DeviceConfig", pool, daxConfig, ""},
+		{"LocalDeviceConfig", local, `{"apiVersion":"cxl.generic/v1alpha1","kind":"LocalDeviceConfig","mode":"dax"}`,
+			`unknown kind "LocalDeviceConfig" (DeviceConfig or MemoryPolicyConfig)`},
+		{"PoolDeviceConfig", pool, `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"PoolDeviceConfig","readOnly":true}`,
+			`unknown kind "PoolDeviceConfig" (DeviceConfig)`},
+		{"pool MemoryPolicyConfig", pool, `{"apiVersion":"cxl-pool.generic/v1alpha1","kind":"MemoryPolicyConfig"}`,
+			`unknown kind "MemoryPolicyConfig" (DeviceConfig)`},
+		{"no kind", local, `{"apiVersion":"cxl.generic/v1alpha1","mode":"dax"}`, `unknown kind "" (DeviceConfig or MemoryPolicyConfig)`},
+		{"not json", pool, `{"kind":`, "invalid opaque FromClass config for cxl-pool.generic"},
+	} {
+		for _, driver := range []string{local, pool} {
+			c := poolClaim("u1", "c1", "shared0", sharedData)
+			withDriverConfig(c, tc.driver, resourceapi.AllocationConfigSourceClass, nil, tc.params)
+			err := checkConfigKinds(c, driver, kinds[driver]...)
+			switch {
+			case driver != tc.driver && err != nil:
+				t.Errorf("%s: the config of %s fails %s: %v", tc.name, tc.driver, driver, err)
+			case driver == tc.driver && tc.err == "" && err != nil:
+				t.Errorf("%s: %v", tc.name, err)
+			case driver == tc.driver && tc.err != "" && (err == nil || !strings.HasPrefix(err.Error(), tc.err)):
+				t.Errorf("%s: expected error %q, got %v", tc.name, tc.err, err)
+			}
+		}
+	}
+}
+
+func TestDeviceConfigNUMAOnly(t *testing.T) {
+	for _, tc := range []struct {
+		cfg  deviceConfig
+		what string
+		err  string
+	}{
+		{deviceConfig{}, "region", ""},
+		{deviceConfig{Mode: "numa"}, "dram", ""},
+		{deviceConfig{Mode: "dax"}, "region", "DeviceConfig: mode dax: a region is used as numa only"},
+		{deviceConfig{Mode: "dax", ReadOnly: true}, "dram", "DeviceConfig: mode dax: a dram is used as numa only"},
+		{deviceConfig{ReadOnly: true}, "region", "DeviceConfig: readOnly needs mode dax"},
+		{deviceConfig{Mode: "kmem"}, "dram", `DeviceConfig: invalid mode "kmem" (numa or dax)`},
+	} {
+		err := tc.cfg.numaOnly(tc.what)
+		if (tc.err == "" && err != nil) || (tc.err != "" && (err == nil || err.Error() != tc.err)) {
+			t.Errorf("%+v %s: %v, expected %q", tc.cfg, tc.what, err, tc.err)
+		}
 	}
 }

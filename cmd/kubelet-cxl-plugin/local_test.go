@@ -18,7 +18,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -31,7 +30,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
+	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/api"
 
 	"github.com/containers/nri-plugins/pkg/cxl/memctl"
 )
@@ -529,11 +528,11 @@ func (f *fakeLocalSys) zero(major, minor int, size, align uint64) error {
 	return nil
 }
 
-func wantMode(t *testing.T, a *localAllocator, mode string) {
+// wantUsed checks whether the allocator uses the local memdev.
+func wantUsed(t *testing.T, a *localAllocator, used bool) {
 	t.Helper()
-	m := a.Modes()
-	if got, ok := m[localSerial]; (mode == "" && ok) || (mode != "" && got != mode) {
-		t.Fatalf("modes %v, expected %q", m, mode)
+	if got := a.Snapshot().uses(localSerial); got != used {
+		t.Fatalf("memdev used %v, expected %v", got, used)
 	}
 }
 
@@ -542,7 +541,7 @@ func acquire(t *testing.T, a *localAllocator, uid, mode string, size uint64) *lo
 	t.Helper()
 	s, node, err := a.Acquire(context.Background(), uid, "mem", localSerial, mode, size, false)
 	noErr(t, err)
-	if want := map[string]int{device.ModeNUMA: 2, device.ModeDax: -1}[mode]; node != want {
+	if want := map[string]int{api.ModeNUMA: 2, api.ModeDax: -1}[mode]; node != want {
 		t.Fatalf("%s: node %d, expected %d", uid, node, want)
 	}
 	return s
@@ -558,7 +557,7 @@ func TestLocalBlockSize(t *testing.T) {
 	}
 	// 2 GiB blocks: a 128 MiB claim needs a 2 GiB slice
 	f.write("devices/system/memory/block_size_bytes", "80000000")
-	_, _, err := a.Acquire(context.Background(), "u1", "mem", localSerial, device.ModeNUMA, 128*mib, false)
+	_, _, err := a.Acquire(context.Background(), "u1", "mem", localSerial, api.ModeNUMA, 128*mib, false)
 	if !errors.Is(err, errNoRoom) || !strings.Contains(err.Error(), "the slice needs 2147483648") {
 		t.Fatalf("expected no room for 2 GiB, got %v", err)
 	}
@@ -567,7 +566,7 @@ func TestLocalBlockSize(t *testing.T) {
 		t.Fatalf("block size %d after the change", bs)
 	}
 	f.write("devices/system/memory/block_size_bytes", "bogus")
-	_, _, err = a.Acquire(context.Background(), "u1", "mem", localSerial, device.ModeDax, 128*mib, false)
+	_, _, err = a.Acquire(context.Background(), "u1", "mem", localSerial, api.ModeDax, 128*mib, false)
 	wantErr(t, err, "memory block size")
 	// unknown at start: the snapshot reads it again
 	_ = os.Remove(f.p("devices/system/memory/block_size_bytes"))
@@ -580,7 +579,7 @@ func TestLocalBlockSize(t *testing.T) {
 		t.Fatalf("block size %d", bs)
 	}
 	var none *localAllocator
-	if none.Snapshot() != nil || none.Modes() != nil {
+	if none.Snapshot() != nil {
 		t.Fatal("snapshot of a nil allocator")
 	}
 }
@@ -594,26 +593,26 @@ func TestLocalMixedSlices(t *testing.T) {
 	ctx := context.Background()
 
 	// a dax slice of 64 MiB is rounded up to a block: dax0.0 is reused
-	wantSlice(t, acquire(t, a, "u1", device.ModeDax, 64*mib),
-		localSlice{Request: "mem", Region: "region0", Mode: device.ModeDax, Size: localBlockSize, Dax: "dax0.0", DaxDevice: "/dev/dax0.0", Major: 252})
+	wantSlice(t, acquire(t, a, "u1", api.ModeDax, 64*mib),
+		localSlice{Request: "mem", Region: "region0", Mode: api.ModeDax, Size: localBlockSize, Dax: "dax0.0", DaxDevice: "/dev/dax0.0", Major: 252})
 	f.wantCommand(t, "cxl create-region -t ram -d decoder0.0 -m mem0")
 	f.wantDax(t, "dax0.0", localBlockSize, "device_dax")
 	f.wantRanges(t, "dax0.0", blockRange(74, 1))
 	f.wantMemoryBlocks(t, "")
-	wantMode(t, a, device.ModeDax)
+	wantUsed(t, a, true)
 
 	// a numa slice: the next block, onlined movable
-	wantSlice(t, acquire(t, a, "u2", device.ModeNUMA, localBlockSize),
-		localSlice{Request: "mem", Region: "region0", Mode: device.ModeNUMA, Size: localBlockSize, Dax: "dax0.1"})
+	wantSlice(t, acquire(t, a, "u2", api.ModeNUMA, localBlockSize),
+		localSlice{Request: "mem", Region: "region0", Mode: api.ModeNUMA, Size: localBlockSize, Dax: "dax0.1"})
 	f.wantDax(t, "dax0.1", localBlockSize, "kmem")
 	f.wantRanges(t, "dax0.1", blockRange(75, 1))
 	f.wantMemoryBlocks(t, "online_movable", 75)
-	wantMode(t, a, modeNUMADax)
+	wantUsed(t, a, true)
 
 	// a dax slice of two blocks, and a numa slice of two blocks
-	acquire(t, a, "u3", device.ModeDax, 2*localBlockSize)
+	acquire(t, a, "u3", api.ModeDax, 2*localBlockSize)
 	f.wantRanges(t, "dax0.2", blockRange(76, 2))
-	acquire(t, a, "u4", device.ModeNUMA, 2*localBlockSize-mib)
+	acquire(t, a, "u4", api.ModeNUMA, 2*localBlockSize-mib)
 	f.wantDax(t, "dax0.3", 2*localBlockSize, "kmem")
 	f.wantRanges(t, "dax0.3", blockRange(78, 2))
 	f.wantMemoryBlocks(t, "online_movable", 75, 78, 79)
@@ -630,8 +629,8 @@ func TestLocalMixedSlices(t *testing.T) {
 		t.Fatal("dax0.1 not deleted")
 	}
 	f.wantMemoryBlocks(t, "online_movable", 78, 79)
-	wantMode(t, a, modeNUMADax)
-	acquire(t, a, "u5", device.ModeNUMA, localBlockSize)
+	wantUsed(t, a, true)
+	acquire(t, a, "u5", api.ModeNUMA, localBlockSize)
 	f.wantRanges(t, "dax0.4", blockRange(75, 1))
 	f.wantMemoryBlocks(t, "online_movable", 75, 78, 79)
 
@@ -641,7 +640,7 @@ func TestLocalMixedSlices(t *testing.T) {
 	noErr(t, a.Release(ctx, "u4"))
 	noErr(t, a.Release(ctx, "u5"))
 	f.wantMemoryBlocks(t, "")
-	wantMode(t, a, device.ModeDax)
+	wantUsed(t, a, true)
 	if strings.Contains(f.commands(), "destroy-region") {
 		t.Fatalf("region released while a slice exists:\n%s", f.commands())
 	}
@@ -651,7 +650,7 @@ func TestLocalMixedSlices(t *testing.T) {
 	if _, err := os.Lstat(f.p(fakeMemPath + "/driver")); err != nil {
 		t.Fatal("memdev disabled")
 	}
-	wantMode(t, a, "")
+	wantUsed(t, a, false)
 	noErr(t, a.Release(ctx, "u3"))
 
 	// only dax slices are zeroed, after they are bound
@@ -670,23 +669,23 @@ func TestLocalDaxSlices(t *testing.T) {
 	a := f.allocator(t, t.TempDir())
 	ctx := context.Background()
 
-	wantSlice(t, acquire(t, a, "u1", device.ModeDax, localBlockSize),
-		localSlice{Request: "mem", Region: "region0", Mode: device.ModeDax, Size: localBlockSize, Dax: "dax0.0", DaxDevice: "/dev/dax0.0", Major: 252})
-	s, _, err := a.Acquire(ctx, "u2", "mem", localSerial, device.ModeDax, 3*mib, true)
+	wantSlice(t, acquire(t, a, "u1", api.ModeDax, localBlockSize),
+		localSlice{Request: "mem", Region: "region0", Mode: api.ModeDax, Size: localBlockSize, Dax: "dax0.0", DaxDevice: "/dev/dax0.0", Major: 252})
+	s, _, err := a.Acquire(ctx, "u2", "mem", localSerial, api.ModeDax, 3*mib, true)
 	noErr(t, err)
-	wantSlice(t, s, localSlice{Request: "mem", Region: "region0", Mode: device.ModeDax, Size: localBlockSize, Dax: "dax0.1", DaxDevice: "/dev/dax0.1", Major: 252, Minor: 1, ReadOnly: true})
+	wantSlice(t, s, localSlice{Request: "mem", Region: "region0", Mode: api.ModeDax, Size: localBlockSize, Dax: "dax0.1", DaxDevice: "/dev/dax0.1", Major: 252, Minor: 1, ReadOnly: true})
 	// a slice larger than the free space
-	_, _, err = a.Acquire(ctx, "u3", "mem", localSerial, device.ModeDax, localRegionSize, false)
+	_, _, err = a.Acquire(ctx, "u3", "mem", localSerial, api.ModeDax, localRegionSize, false)
 	if !errors.Is(err, errNoRoom) || f.daxExists("dax0.2") {
 		t.Fatalf("expected no room and no new dax device, got %v", err)
 	}
 	// releasing the first slice keeps dax0.0 with size 0 for the next
 	noErr(t, a.Release(ctx, "u1"))
 	f.wantDax(t, "dax0.0", 0, "")
-	wantSlice(t, acquire(t, a, "u3", device.ModeDax, 16*mib),
-		localSlice{Request: "mem", Region: "region0", Mode: device.ModeDax, Size: localBlockSize, Dax: "dax0.0", DaxDevice: "/dev/dax0.0", Major: 252})
+	wantSlice(t, acquire(t, a, "u3", api.ModeDax, 16*mib),
+		localSlice{Request: "mem", Region: "region0", Mode: api.ModeDax, Size: localBlockSize, Dax: "dax0.0", DaxDevice: "/dev/dax0.0", Major: 252})
 	// a second slice of the same claim
-	s, _, err = a.Acquire(ctx, "u3", "mem2", localSerial, device.ModeDax, 2*mib, false)
+	s, _, err = a.Acquire(ctx, "u3", "mem2", localSerial, api.ModeDax, 2*mib, false)
 	noErr(t, err)
 	if s.Dax != "dax0.2" || len(a.devices[localSerial].Claims["u3"]) != 2 {
 		t.Fatalf("second slice %+v", s)
@@ -697,7 +696,7 @@ func TestLocalDaxSlices(t *testing.T) {
 		t.Fatal("slices not deleted")
 	}
 	f.wantRegionReleased(t, "region0")
-	wantMode(t, a, "")
+	wantUsed(t, a, false)
 }
 
 // Without daxctl, slices of both modes are bound through sysfs.
@@ -708,9 +707,9 @@ func TestLocalSlicesSysfs(t *testing.T) {
 	a, err := newLocalAllocator(m, filepath.Join(t.TempDir(), localStateFileName), "boot-1")
 	noErr(t, err)
 	a.zero = f.zero
-	acquire(t, a, "u1", device.ModeDax, 8*mib)
+	acquire(t, a, "u1", api.ModeDax, 8*mib)
 	f.wantDax(t, "dax0.0", localBlockSize, "device_dax")
-	acquire(t, a, "u2", device.ModeNUMA, 8*mib)
+	acquire(t, a, "u2", api.ModeNUMA, 8*mib)
 	f.wantDax(t, "dax0.1", localBlockSize, "kmem")
 	f.wantMemoryBlocks(t, "online_movable", 75)
 	noErr(t, a.Release(context.Background(), "u2"))
@@ -733,19 +732,19 @@ func TestLocalPlacement(t *testing.T) {
 	ctx := context.Background()
 
 	// first-fit would give dax0.0 the head of the region
-	acquire(t, a, "u1", device.ModeNUMA, localBlockSize)
+	acquire(t, a, "u1", api.ModeNUMA, localBlockSize)
 	f.wantDax(t, "dax0.0", 0, "")
 	f.wantDax(t, "dax0.1", localBlockSize, "kmem")
 	f.wantRanges(t, "dax0.1", blockRange(74, 1))
 	f.wantMemoryBlocks(t, "online_movable", 74)
 	// dax slices too: never the head, never half a block
-	acquire(t, a, "u2", device.ModeDax, localBlockSize)
+	acquire(t, a, "u2", api.ModeDax, localBlockSize)
 	f.wantRanges(t, "dax0.2", blockRange(75, 1))
-	acquire(t, a, "u3", device.ModeNUMA, localBlockSize)
+	acquire(t, a, "u3", api.ModeNUMA, localBlockSize)
 	f.wantRanges(t, "dax0.3", blockRange(76, 1))
 	f.wantMemoryBlocks(t, "online_movable", 74, 76)
 	// 128 MiB is free, in the head and the tail: no whole block
-	_, _, err := a.Acquire(ctx, "u4", "mem", localSerial, device.ModeDax, localBlockSize, false)
+	_, _, err := a.Acquire(ctx, "u4", "mem", localSerial, api.ModeDax, localBlockSize, false)
 	if !errors.Is(err, errNoRoom) || !strings.Contains(err.Error(), "no 134217728 bytes of whole free memory blocks in region0") {
 		t.Fatalf("expected no whole blocks, got %v", err)
 	}
@@ -759,7 +758,7 @@ func TestLocalPlacement(t *testing.T) {
 	noErr(t, a.Release(ctx, "u1"))
 	noErr(t, a.Release(ctx, "u3"))
 	f.wantMemoryBlocks(t, "")
-	acquire(t, a, "u5", device.ModeNUMA, 2*localBlockSize)
+	acquire(t, a, "u5", api.ModeNUMA, 2*localBlockSize)
 	f.wantRanges(t, "dax0.4", blockRange(74, 1), blockRange(76, 1))
 	f.wantDax(t, "dax0.4", 2*localBlockSize, "kmem")
 	f.wantMemoryBlocks(t, "online_movable", 74, 76)
@@ -788,23 +787,23 @@ func TestLocalLargeBlocks(t *testing.T) {
 	}
 	a := f.allocator(t, t.TempDir())
 	ctx := context.Background()
-	acquire(t, a, "u1", device.ModeDax, bs)
-	acquire(t, a, "u2", device.ModeNUMA, bs)
-	acquire(t, a, "u3", device.ModeDax, bs)
+	acquire(t, a, "u1", api.ModeDax, bs)
+	acquire(t, a, "u2", api.ModeNUMA, bs)
+	acquire(t, a, "u3", api.ModeDax, bs)
 	f.wantRanges(t, "dax0.1", block(19))
 	f.wantRanges(t, "dax0.2", block(20))
 	f.wantRanges(t, "dax0.3", block(21))
 	f.wantMemoryBlocks(t, "online_movable", 20)
 	// the scheduler admits no fourth block
-	_, _, err := a.Acquire(ctx, "u4", "mem", localSerial, device.ModeNUMA, bs, false)
+	_, _, err := a.Acquire(ctx, "u4", "mem", localSerial, api.ModeNUMA, bs, false)
 	if !errors.Is(err, errNoRoom) {
 		t.Fatalf("expected no room, got %v", err)
 	}
 	// the released blocks serve the other mode
 	noErr(t, a.Release(ctx, "u2"))
 	noErr(t, a.Release(ctx, "u1"))
-	acquire(t, a, "u5", device.ModeDax, bs)
-	acquire(t, a, "u6", device.ModeNUMA, bs)
+	acquire(t, a, "u5", api.ModeDax, bs)
+	acquire(t, a, "u6", api.ModeNUMA, bs)
 	f.wantRanges(t, "dax0.4", block(19))
 	f.wantRanges(t, "dax0.5", block(20))
 	f.wantMemoryBlocks(t, "online_movable", 20)
@@ -825,23 +824,23 @@ func TestLocalPlacementFailures(t *testing.T) {
 
 	// the misplaced first-fit device cannot be deleted
 	f.failSeq = map[string][]error{"bus/dax/devices/dax0.0/size": {nil, syscall.EIO}}
-	_, _, err := a.Acquire(ctx, "u1", "mem", localSerial, device.ModeNUMA, localBlockSize, false)
+	_, _, err := a.Acquire(ctx, "u1", "mem", localSerial, api.ModeNUMA, localBlockSize, false)
 	wantErr(t, err, "dax0.0: set size 0: input/output error")
 	f.wantRegionReleased(t, "region0")
-	wantMode(t, a, "")
+	wantUsed(t, a, false)
 
-	acquire(t, a, "u1", device.ModeDax, localBlockSize)
+	acquire(t, a, "u1", api.ModeDax, localBlockSize)
 	f.wantRanges(t, "dax0.1", blockRange(74, 1))
 	// the placed device cannot be mapped
 	f.fail = map[string]error{"bus/dax/devices/dax0.2/mapping": syscall.EIO}
-	_, _, err = a.Acquire(ctx, "u2", "mem", localSerial, device.ModeNUMA, localBlockSize, false)
+	_, _, err = a.Acquire(ctx, "u2", "mem", localSerial, api.ModeNUMA, localBlockSize, false)
 	wantErr(t, err, "dax0.2: map 0x258000000-0x25fffffff: input/output error")
 	if f.daxExists("dax0.2") {
 		t.Fatal("a device that could not be mapped is left")
 	}
 	// the placed device cannot be bound to kmem: it goes, dax0.0 stays
 	f.fail = map[string]error{"bus/dax/drivers/kmem/bind": syscall.EIO}
-	_, _, err = a.Acquire(ctx, "u2", "mem", localSerial, device.ModeNUMA, localBlockSize, false)
+	_, _, err = a.Acquire(ctx, "u2", "mem", localSerial, api.ModeNUMA, localBlockSize, false)
 	wantErr(t, err, "bind dax0.3 to kmem: input/output error")
 	if f.daxExists("dax0.3") {
 		t.Fatal("a placed device that could not be bound is left")
@@ -850,7 +849,7 @@ func TestLocalPlacementFailures(t *testing.T) {
 	f.wantDax(t, "dax0.1", localBlockSize, "device_dax")
 	// the free memory of the region cannot be read
 	f.write("bus/cxl/devices/region0/size", "bogus")
-	_, _, err = a.Acquire(ctx, "u2", "mem", localSerial, device.ModeDax, localBlockSize, false)
+	_, _, err = a.Acquire(ctx, "u2", "mem", localSerial, api.ModeDax, localBlockSize, false)
 	wantErr(t, err, "cannot parse region region0")
 	f.write("bus/cxl/devices/region0/size", fmt.Sprintf("0x%x", f.regionSize))
 	f.wantDax(t, "dax0.0", 0, "")
@@ -866,7 +865,7 @@ func TestLocalPlacementFailures(t *testing.T) {
 	f.noKmemBlocks = true
 	tctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
-	_, _, err = a.Acquire(tctx, "u2", "mem", localSerial, device.ModeNUMA, localBlockSize, false)
+	_, _, err = a.Acquire(tctx, "u2", "mem", localSerial, api.ModeNUMA, localBlockSize, false)
 	wantErr(t, err, "0 of 1 memory blocks appeared: context deadline exceeded")
 	f.noKmemBlocks = false
 	if devs := f.manager().DaxDevices("region0"); len(devs) != 2 {
@@ -884,8 +883,8 @@ func TestLocalFailedReleases(t *testing.T) {
 	dir := t.TempDir()
 	a := f.allocator(t, dir)
 	ctx := context.Background()
-	acquire(t, a, "u1", device.ModeNUMA, localBlockSize)
-	acquire(t, a, "u2", device.ModeDax, localBlockSize)
+	acquire(t, a, "u1", api.ModeNUMA, localBlockSize)
+	acquire(t, a, "u2", api.ModeDax, localBlockSize)
 	f.wantDax(t, "dax0.0", localBlockSize, "kmem")
 	f.wantMemoryBlocks(t, "online_movable", 74)
 
@@ -898,31 +897,31 @@ func TestLocalFailedReleases(t *testing.T) {
 	if len(d.Claims[orphanOwner]) != 1 || d.Claims[orphanOwner][0].Dax != "dax0.0" || d.Claims["u1"] != nil {
 		t.Fatalf("claims after reconcile %+v", d.Claims)
 	}
-	wantMode(t, a, modeNUMADax)
+	wantUsed(t, a, true)
 	data, _ := os.ReadFile(filepath.Join(dir, localStateFileName))
 	if !strings.Contains(string(data), `"-": [`) {
 		t.Fatalf("state file lacks the orphan:\n%s", data)
 	}
 	// the next slice fails while the orphan cannot be released
 	f.failSeq = map[string][]error{blockPath(74) + "/state": {syscall.EBUSY}}
-	_, _, err := a.Acquire(ctx, "u3", "mem", localSerial, device.ModeDax, localBlockSize, false)
+	_, _, err := a.Acquire(ctx, "u3", "mem", localSerial, api.ModeDax, localBlockSize, false)
 	wantErr(t, err, "releasing slice dax0.0: cannot offline its memory (in use?)")
 	f.wantDax(t, "dax0.0", localBlockSize, "kmem")
 	f.wantMemoryBlocks(t, "online_movable", 74)
 	// then it is released, and dax0.0 is reused
-	s := acquire(t, a, "u3", device.ModeDax, localBlockSize)
+	s := acquire(t, a, "u3", api.ModeDax, localBlockSize)
 	if s.Dax != "dax0.0" || len(a.devices[localSerial].Claims[orphanOwner]) != 0 {
 		t.Fatalf("slice %+v, claims %+v", s, a.devices[localSerial].Claims)
 	}
 	f.wantMemoryBlocks(t, "")
-	wantMode(t, a, device.ModeDax)
+	wantUsed(t, a, true)
 
 	// a numa slice whose rollback cannot offline it
 	f.failSeq = map[string][]error{
 		blockPath(77) + "/state": {syscall.EIO},
 		blockPath(76) + "/state": {nil, syscall.EBUSY},
 	}
-	_, _, err = a.Acquire(ctx, "u4", "mem", localSerial, device.ModeNUMA, 2*localBlockSize, false)
+	_, _, err = a.Acquire(ctx, "u4", "mem", localSerial, api.ModeNUMA, 2*localBlockSize, false)
 	wantErr(t, err, "memory77: online_movable: input/output error")
 	if own := a.devices[localSerial].Claims[orphanOwner]; len(own) != 1 || own[0].Dax != "dax0.2" {
 		t.Fatalf("orphans %+v", a.devices[localSerial].Claims)
@@ -936,7 +935,7 @@ func TestLocalFailedReleases(t *testing.T) {
 	if strings.Contains(f.commands(), "destroy-region") || len(a.devices[localSerial].Claims) != 1 {
 		t.Fatalf("region released with an orphan, claims %+v:\n%s", a.devices[localSerial].Claims, f.commands())
 	}
-	acquire(t, a, "u5", device.ModeNUMA, localBlockSize)
+	acquire(t, a, "u5", api.ModeNUMA, localBlockSize)
 	if f.daxExists("dax0.2") || len(a.devices[localSerial].Claims) != 1 {
 		t.Fatalf("orphan dax0.2 not released, claims %+v", a.devices[localSerial].Claims)
 	}
@@ -953,10 +952,10 @@ func TestLocalUntrackedKmem(t *testing.T) {
 	dir := t.TempDir()
 	a := f.allocator(t, dir)
 	ctx := context.Background()
-	acquire(t, a, "u1", device.ModeNUMA, localBlockSize)
-	acquire(t, a, "u2", device.ModeDax, localBlockSize)
+	acquire(t, a, "u1", api.ModeNUMA, localBlockSize)
+	acquire(t, a, "u2", api.ModeDax, localBlockSize)
 	delete(a.devices[localSerial].Claims, "u1")
-	s := acquire(t, a, "u3", device.ModeDax, localBlockSize)
+	s := acquire(t, a, "u3", api.ModeDax, localBlockSize)
 	if s.Dax == "dax0.0" {
 		t.Fatalf("dax0.0 with online memory reused: %+v", s)
 	}
@@ -975,7 +974,7 @@ func TestLocalNUMAReleaseFailure(t *testing.T) {
 	f := newFakeLocalSys(t)
 	a := f.allocator(t, t.TempDir())
 	ctx := context.Background()
-	acquire(t, a, "u1", device.ModeNUMA, 2*localBlockSize)
+	acquire(t, a, "u1", api.ModeNUMA, 2*localBlockSize)
 	f.fail = map[string]error{"devices/system/memory/memory75/state": syscall.EBUSY}
 	err := a.Release(ctx, "u1")
 	wantErr(t, err, "releasing slice dax0.0: cannot offline its memory (in use?)")
@@ -988,7 +987,7 @@ func TestLocalNUMAReleaseFailure(t *testing.T) {
 		t.Fatalf("claims %+v", a.devices[localSerial].Claims)
 	}
 	// another numa claim gets a slice of its own meanwhile
-	acquire(t, a, "u2", device.ModeNUMA, localBlockSize)
+	acquire(t, a, "u2", api.ModeNUMA, localBlockSize)
 	f.wantRanges(t, "dax0.1", blockRange(76, 1))
 	noErr(t, a.Release(ctx, "u1"))
 	f.wantMemoryBlocks(t, "online_movable", 76)
@@ -1012,7 +1011,7 @@ func TestLocalRegionErrors(t *testing.T) {
 
 	// a transient region creation failure is retried once
 	f.failCreate = 1
-	acquire(t, a, "u1", device.ModeNUMA, localBlockSize)
+	acquire(t, a, "u1", api.ModeNUMA, localBlockSize)
 	if n := strings.Count(f.commands(), "create-region"); n != 2 {
 		t.Fatalf("region created %d times:\n%s", n, f.commands())
 	}
@@ -1020,28 +1019,28 @@ func TestLocalRegionErrors(t *testing.T) {
 
 	// two failures make the claim fail and leave nothing
 	f.failCreate = 2
-	_, _, err := a.Acquire(ctx, "u1", "mem", localSerial, device.ModeNUMA, localBlockSize, false)
+	_, _, err := a.Acquire(ctx, "u1", "mem", localSerial, api.ModeNUMA, localBlockSize, false)
 	wantErr(t, err, "add_dev")
-	wantMode(t, a, "")
+	wantUsed(t, a, false)
 
 	// a region that the plugin did not create
 	_, err = f.exec(ctx, "cxl", "create-region", "-t", "ram", "-d", "decoder0.0", "-m", "mem0")
 	noErr(t, err)
-	_, _, err = a.Acquire(ctx, "u1", "mem", localSerial, device.ModeDax, localBlockSize, false)
+	_, _, err = a.Acquire(ctx, "u1", "mem", localSerial, api.ModeDax, localBlockSize, false)
 	wantErr(t, err, "memdev mem0 has region region0 that the plugin did not create")
-	wantMode(t, a, "")
+	wantUsed(t, a, false)
 
 	// unknown memdev, bad arguments, disabled allocator
-	_, _, err = a.Acquire(ctx, "u1", "mem", 0x1234, device.ModeDax, localBlockSize, false)
+	_, _, err = a.Acquire(ctx, "u1", "mem", 0x1234, api.ModeDax, localBlockSize, false)
 	if !errors.Is(err, memctl.ErrNotFound) {
 		t.Fatalf("expected not found, got %v", err)
 	}
 	_, _, err = a.Acquire(ctx, "u1", "mem", localSerial, "ram", localBlockSize, false)
 	wantErr(t, err, `invalid mode "ram"`)
-	_, _, err = a.Acquire(ctx, "u1", "mem", localSerial, device.ModeDax, 0, false)
+	_, _, err = a.Acquire(ctx, "u1", "mem", localSerial, api.ModeDax, 0, false)
 	wantErr(t, err, "size 0")
 	var none *localAllocator
-	_, _, err = none.Acquire(ctx, "u1", "mem", localSerial, device.ModeDax, localBlockSize, false)
+	_, _, err = none.Acquire(ctx, "u1", "mem", localSerial, api.ModeDax, localBlockSize, false)
 	wantErr(t, err, "manageMemdevs: false")
 	noErr(t, none.Release(ctx, "u1"))
 	none.Reconcile(ctx, nil)
@@ -1052,15 +1051,15 @@ func TestLocalStateAndReconcile(t *testing.T) {
 	dir := t.TempDir()
 	a := f.allocator(t, dir)
 	ctx := context.Background()
-	acquire(t, a, "u1", device.ModeDax, localBlockSize)
-	acquire(t, a, "u2", device.ModeNUMA, localBlockSize)
-	acquire(t, a, "u3", device.ModeDax, localBlockSize)
+	acquire(t, a, "u1", api.ModeDax, localBlockSize)
+	acquire(t, a, "u2", api.ModeNUMA, localBlockSize)
+	acquire(t, a, "u3", api.ModeDax, localBlockSize)
 	st, err := os.Stat(filepath.Join(dir, localStateFileName))
 	if err != nil || st.Mode().Perm() != 0o600 {
 		t.Fatalf("state file: %v %v", st, err)
 	}
 	data, _ := os.ReadFile(filepath.Join(dir, localStateFileName))
-	for _, want := range []string{`"serialHex": "c100e2e1"`, `"region": "region0"`, `"mode": "numa+dax"`, `"mode": "numa"`, `"dax": "dax0.1"`, `"daxDevice": "/dev/dax0.2"`} {
+	for _, want := range []string{`"serialHex": "c100e2e1"`, `"region": "region0"`, `"mode": "dax"`, `"mode": "numa"`, `"dax": "dax0.1"`, `"daxDevice": "/dev/dax0.2"`} {
 		if !strings.Contains(string(data), want) {
 			t.Fatalf("state file lacks %s:\n%s", want, data)
 		}
@@ -1069,13 +1068,13 @@ func TestLocalStateAndReconcile(t *testing.T) {
 	// restart: the numa claim u2 is not prepared any more: its memory is
 	// offlined and its slice deleted
 	a = f.allocator(t, dir)
-	wantMode(t, a, modeNUMADax)
+	wantUsed(t, a, true)
 	a.Reconcile(ctx, map[string]bool{"u1": true, "u3": true})
 	if f.daxExists("dax0.1") || len(a.devices[localSerial].Claims) != 2 {
 		t.Fatalf("after reconcile: %+v", a.devices[localSerial])
 	}
 	f.wantMemoryBlocks(t, "")
-	wantMode(t, a, device.ModeDax)
+	wantUsed(t, a, true)
 
 	// restart: a dax device that belongs to no claim (a crash before the
 	// state was saved) is deleted, a kmem one offlined first
@@ -1097,98 +1096,38 @@ func TestLocalStateAndReconcile(t *testing.T) {
 	noErr(t, m.ResizeDaxDevice(ctx, "dax0.0", 2*localBlockSize))
 	a = f.allocator(t, dir)
 	a.Reconcile(ctx, map[string]bool{"u1": true})
-	wantMode(t, a, "")
+	wantUsed(t, a, false)
 	f.wantRegionReleased(t, "region0")
 
 	// restart: a region of the state with no claims is destroyed
-	acquire(t, a, "u1", device.ModeNUMA, localBlockSize)
+	acquire(t, a, "u1", api.ModeNUMA, localBlockSize)
 	a.devices[localSerial].Claims = map[string][]*localSlice{}
 	noErr(t, a.save())
 	a = f.allocator(t, dir)
-	wantMode(t, a, modeNone)
+	wantUsed(t, a, true)
 	a.Reconcile(ctx, map[string]bool{"u1": true})
-	wantMode(t, a, "")
+	wantUsed(t, a, false)
 	f.wantRegionReleased(t, "region0")
 	f.wantMemoryBlocks(t, "")
 
 	// restart: the region is gone (reboot) or the memdev is gone
-	acquire(t, a, "u1", device.ModeNUMA, localBlockSize)
+	acquire(t, a, "u1", api.ModeNUMA, localBlockSize)
 	noErr(t, a.mem.SetBlocksState(f.blocks("dax0.0"), "offline"))
 	_, err = f.exec(ctx, "cxl", "destroy-region", "region0")
 	noErr(t, err)
 	a = f.allocator(t, dir)
 	a.Reconcile(ctx, map[string]bool{"u1": true})
-	wantMode(t, a, "")
-	acquire(t, a, "u1", device.ModeDax, localBlockSize)
+	wantUsed(t, a, false)
+	acquire(t, a, "u1", api.ModeDax, localBlockSize)
 	f.unplug()
 	a = f.allocator(t, dir)
 	a.Reconcile(ctx, map[string]bool{"u1": true})
-	wantMode(t, a, "")
+	wantUsed(t, a, false)
 
 	// a broken state file
 	f.write("broken/"+localStateFileName, "{")
 	_, err = newLocalAllocator(f.manager(), f.p("broken/"+localStateFileName), "boot-1")
 	wantErr(t, err, "parsing")
-}
-
-// A state file with a mode per memdev and none per slice: the slices get
-// the mode of their memdev. A numa memdev of it has its whole region
-// online: more numa claims share it, a dax claim finds no room.
-func TestLocalStateMigration(t *testing.T) {
-	f := newFakeLocalSys(t)
-	dir := t.TempDir()
-	ctx := context.Background()
-	// the region of a numa memdev: dax0.0 is kmem with all memory online
-	_, err := f.exec(ctx, "cxl", "create-region", "-t", "ram", "-d", "decoder0.0", "-m", "mem0")
-	noErr(t, err)
-	noErr(t, f.manager().SetBlocksState(f.blocks("dax0.0"), "online_movable"))
-	noErr(t, os.WriteFile(filepath.Join(dir, localStateFileName), []byte(`{"bootID":"boot-1","devices":[
-		{"serial":3238060769,"serialHex":"c100e2e1","memdev":"mem0","region":"region0","mode":"numa","node":2,"dax":"dax0.0",
-		 "claims":{"u1":[{"request":"mem","region":"region0","size":67108864}]}}]}`), 0o600))
-	a := f.allocator(t, dir)
-	wantMode(t, a, device.ModeNUMA)
-	if s := a.devices[localSerial].Claims["u1"][0]; s.Mode != device.ModeNUMA || s.Dax != "" {
-		t.Fatalf("migrated slice %+v", s)
-	}
-	a.Reconcile(ctx, map[string]bool{"u1": true, "u2": true})
-	wantMode(t, a, device.ModeNUMA)
-	ncreate := strings.Count(f.commands(), "create-region")
-	wantSlice(t, acquire(t, a, "u2", device.ModeNUMA, localBlockSize),
-		localSlice{Request: "mem", Region: "region0", Mode: device.ModeNUMA, Size: localBlockSize})
-	_, _, err = a.Acquire(ctx, "u3", "mem", localSerial, device.ModeDax, localBlockSize, false)
-	if !errors.Is(err, errNoRoom) {
-		t.Fatalf("expected no room for a dax slice, got %v", err)
-	}
-	f.wantDax(t, "dax0.0", localRegionSize, "kmem")
-	if strings.Count(f.commands(), "create-region") != ncreate {
-		t.Fatalf("region created again:\n%s", f.commands())
-	}
-	noErr(t, a.Release(ctx, "u1"))
-	noErr(t, a.Release(ctx, "u2"))
-	f.wantRegionReleased(t, "region0")
-	f.wantMemoryBlocks(t, "")
-
-	// a dax memdev: its slices are dax slices
-	acquire(t, a, "u1", device.ModeDax, localBlockSize)
-	acquire(t, a, "u2", device.ModeDax, localBlockSize)
-	var st localState
-	data, err := os.ReadFile(filepath.Join(dir, localStateFileName))
-	noErr(t, err)
-	noErr(t, json.Unmarshal(data, &st))
-	for _, own := range st.Devices[0].Claims {
-		own[0].Mode = ""
-	}
-	noErr(t, writeJSONFile(filepath.Join(dir, localStateFileName), st))
-	a = f.allocator(t, dir)
-	wantMode(t, a, device.ModeDax)
-	for _, uid := range []string{"u1", "u2"} {
-		if s := a.devices[localSerial].Claims[uid][0]; s.Mode != device.ModeDax || s.Dax == "" {
-			t.Fatalf("migrated slice %+v", s)
-		}
-	}
-	noErr(t, a.Release(ctx, "u2"))
-	noErr(t, a.Release(ctx, "u1"))
-	f.wantRegionReleased(t, "region0")
 }
 
 // wantRegionReleased checks that the region was released last, and the
@@ -1208,52 +1147,52 @@ func TestLocalSliceFailures(t *testing.T) {
 	// the region does not come up in devdax mode: the region that the
 	// failed creation left goes again
 	f.failDaxctl = errors.New("daxctl: enable failed")
-	_, _, err := a.Acquire(ctx, "u1", "mem", localSerial, device.ModeDax, 8*mib, false)
+	_, _, err := a.Acquire(ctx, "u1", "mem", localSerial, api.ModeDax, 8*mib, false)
 	wantErr(t, err, "enable failed")
 	f.wantRegionReleased(t, "region0")
-	wantMode(t, a, "")
+	wantUsed(t, a, false)
 	f.failDaxctl = nil
 
 	// zeroing fails: the same
 	f.zeroErr = errors.New("mmap: no such device")
-	_, _, err = a.Acquire(ctx, "u1", "mem", localSerial, device.ModeDax, 8*mib, false)
+	_, _, err = a.Acquire(ctx, "u1", "mem", localSerial, api.ModeDax, 8*mib, false)
 	wantErr(t, err, "zeroing dax0.0: mmap: no such device")
 	f.wantRegionReleased(t, "region0")
-	wantMode(t, a, "")
+	wantUsed(t, a, false)
 	f.zeroErr = nil
 
 	// kmem cannot be bound, or the memory not onlined: the same, no
 	// memory is left online
 	f.fail = map[string]error{"bus/dax/drivers/kmem/bind": syscall.EIO}
-	_, _, err = a.Acquire(ctx, "u1", "mem", localSerial, device.ModeNUMA, 8*mib, false)
+	_, _, err = a.Acquire(ctx, "u1", "mem", localSerial, api.ModeNUMA, 8*mib, false)
 	wantErr(t, err, "bind dax0.0 to kmem: input/output error")
 	f.wantRegionReleased(t, "region0")
 	f.fail = map[string]error{"devices/system/memory/memory75/state": syscall.EIO}
-	_, _, err = a.Acquire(ctx, "u1", "mem", localSerial, device.ModeNUMA, 2*localBlockSize, false)
+	_, _, err = a.Acquire(ctx, "u1", "mem", localSerial, api.ModeNUMA, 2*localBlockSize, false)
 	wantErr(t, err, "memory75: online_movable: input/output error")
 	f.wantRegionReleased(t, "region0")
 	f.wantMemoryBlocks(t, "")
-	wantMode(t, a, "")
+	wantUsed(t, a, false)
 
 	// a later slice fails to resize, to bind or to online: only that
 	// slice goes
-	acquire(t, a, "u1", device.ModeDax, 8*mib)
+	acquire(t, a, "u1", api.ModeDax, 8*mib)
 	f.fail = map[string]error{"bus/dax/devices/dax0.1/size": syscall.EIO}
-	_, _, err = a.Acquire(ctx, "u2", "mem", localSerial, device.ModeDax, 8*mib, false)
+	_, _, err = a.Acquire(ctx, "u2", "mem", localSerial, api.ModeDax, 8*mib, false)
 	wantErr(t, err, "input/output error")
 	if f.daxExists("dax0.1") {
 		t.Fatal("a slice that failed to resize was left")
 	}
 	f.fail = nil
 	f.failDaxctl = errors.New("daxctl: enable failed")
-	_, _, err = a.Acquire(ctx, "u2", "mem", localSerial, device.ModeDax, 8*mib, false)
+	_, _, err = a.Acquire(ctx, "u2", "mem", localSerial, api.ModeDax, 8*mib, false)
 	wantErr(t, err, "enable failed")
 	if f.daxExists("dax0.2") {
 		t.Fatal("a slice that failed to bind was left")
 	}
 	f.failDaxctl = nil
 	f.fail = map[string]error{"devices/system/memory/memory76/state": syscall.EIO}
-	_, _, err = a.Acquire(ctx, "u2", "mem", localSerial, device.ModeNUMA, 2*localBlockSize, false)
+	_, _, err = a.Acquire(ctx, "u2", "mem", localSerial, api.ModeNUMA, 2*localBlockSize, false)
 	wantErr(t, err, "memory76: online_movable")
 	if f.daxExists("dax0.3") {
 		t.Fatal("a slice that failed to online was left")
@@ -1263,11 +1202,11 @@ func TestLocalSliceFailures(t *testing.T) {
 	if len(a.devices[localSerial].Claims) != 1 {
 		t.Fatalf("claims %+v", a.devices[localSerial].Claims)
 	}
-	wantMode(t, a, device.ModeDax)
+	wantUsed(t, a, true)
 
 	// a slice that fails to delete stays with its claim until a retry
 	f.fail = map[string]error{localDaxAttrs + "/delete": syscall.EBUSY}
-	acquire(t, a, "u3", device.ModeDax, 8*mib)
+	acquire(t, a, "u3", api.ModeDax, 8*mib)
 	wantErr(t, a.Release(ctx, "u3"), "releasing slice")
 	if !f.daxExists("dax0.4") || len(a.devices[localSerial].Claims["u3"]) != 1 {
 		t.Fatalf("after a failed release: %+v", a.devices[localSerial].Claims)
@@ -1286,7 +1225,7 @@ func TestLocalStateOfAnotherBoot(t *testing.T) {
 	dir := t.TempDir()
 	a := f.allocator(t, dir)
 	ctx := context.Background()
-	acquire(t, a, "u1", device.ModeNUMA, localBlockSize)
+	acquire(t, a, "u1", api.ModeNUMA, localBlockSize)
 	data, _ := os.ReadFile(filepath.Join(dir, localStateFileName))
 	if !strings.Contains(string(data), `"bootID": "boot-1"`) {
 		t.Fatalf("state file lacks the boot id:\n%s", data)
@@ -1295,9 +1234,9 @@ func TestLocalStateOfAnotherBoot(t *testing.T) {
 
 	// an unknown boot keeps the state, another boot forgets it
 	c := f.allocatorOfBoot(t, dir, "")
-	wantMode(t, c, device.ModeNUMA)
+	wantUsed(t, c, true)
 	b := f.allocatorOfBoot(t, dir, "boot-2")
-	wantMode(t, b, "")
+	wantUsed(t, b, false)
 	b.Reconcile(ctx, map[string]bool{"u1": true})
 	if len(f.commands()) != ncmds {
 		t.Fatalf("the state of another boot touched the memdev:\n%s", f.commands()[ncmds:])
@@ -1305,21 +1244,21 @@ func TestLocalStateOfAnotherBoot(t *testing.T) {
 
 	// an entry without a region
 	noErr(t, os.WriteFile(filepath.Join(dir, localStateFileName),
-		[]byte(`{"bootID":"boot-1","devices":[{"serial":3238060769,"serialHex":"c100e2e1","memdev":"mem0","mode":"numa","node":-1,"claims":{}}]}`), 0o600))
+		[]byte(`{"bootID":"boot-1","devices":[{"serial":3238060769,"serialHex":"c100e2e1","memdev":"mem0","node":-1,"claims":{}}]}`), 0o600))
 	a = f.allocator(t, dir)
-	wantMode(t, a, modeNone)
+	wantUsed(t, a, true)
 	a.Reconcile(ctx, nil)
-	wantMode(t, a, "")
+	wantUsed(t, a, false)
 	if len(f.commands()) != ncmds {
 		t.Fatalf("an entry without a region touched the memdev:\n%s", f.commands()[ncmds:])
 	}
 
 	// a list of devices without a boot id is the state of an unknown boot
-	f.write("list/"+localStateFileName, `[{"serial":3238060769,"serialHex":"c100e2e1","memdev":"mem0","region":"region0","mode":"numa","node":2,"claims":{"u1":[{"request":"mem","region":"region0","size":2097152}]}}]`)
+	f.write("list/"+localStateFileName, `[{"serial":3238060769,"serialHex":"c100e2e1","memdev":"mem0","region":"region0","node":2,"claims":{"u1":[{"request":"mem","region":"region0","mode":"numa","size":2097152,"dax":"dax0.1"}]}}]`)
 	l := f.allocatorOfBoot(t, f.p("list"), "boot-1")
-	wantMode(t, l, "")
+	wantUsed(t, l, false)
 	l = f.allocatorOfBoot(t, f.p("list"), "")
-	wantMode(t, l, device.ModeNUMA)
+	wantUsed(t, l, true)
 }
 
 func TestZeroFile(t *testing.T) {

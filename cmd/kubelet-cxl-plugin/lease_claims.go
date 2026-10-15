@@ -33,15 +33,16 @@ import (
 	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
 	cdiSpecs "tags.cncf.io/container-device-interface/specs-go"
 
+	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/api"
 	"github.com/intel/intel-resource-drivers-for-kubernetes/pkg/cxl/device"
 )
 
-// The token device "dynamic" of the cxl.generic slice: a claim on it
-// gives the containers that reference the claim a lease socket. Prepare
-// creates <data dir>/leases/<claim uid>/cxl.sock and returns the CDI
-// device generic/cxl=lease-<claim uid>, which bind-mounts that
-// directory at /run/cxl and the cxl-request CLI at /usr/local/bin.
-// Requests on the socket are served by the broker (broker.go).
+// The lease device "lease" of the cxl.generic slice: a claim on it gives
+// the containers that reference the claim a lease socket. Prepare creates
+// <data dir>/leases/<claim uid>/cxl.sock and returns the CDI device
+// generic/cxl=lease-<claim uid>, which bind-mounts that directory at
+// /run/cxl and the cxl-request CLI at /usr/local/bin. Requests on the
+// socket are served by the broker (broker.go).
 
 const (
 	// leaseDirName is the directory of the per-claim socket directories
@@ -49,27 +50,24 @@ const (
 	leaseDirName = "leases"
 	// leaseSocketName is the socket in a claim's directory.
 	leaseSocketName = "cxl.sock"
-	// leaseContainerDir is where the claim's directory is mounted.
+	// leaseContainerDir is where the claim's directory is mounted: the
+	// directory of api.DefaultSocket.
 	leaseContainerDir = "/run/cxl"
-	// leaseSocketEnv names the socket inside the container.
-	leaseSocketEnv = "CXL_LEASE_SOCKET"
-	// cxlRequestContainerPath and cxlReleaseContainerPath are where the
-	// CLI is mounted (the same binary; it acts on its argv[0]).
-	cxlRequestContainerPath = "/usr/local/bin/cxl-request"
-	cxlReleaseContainerPath = "/usr/local/bin/cxl-release"
+	// leaseCLIContainerPath is where the CLI is mounted.
+	leaseCLIContainerPath = "/usr/local/bin/cxl-request"
 
-	defaultCXLRequestBin  = "/usr/local/bin/cxl-request"
-	defaultLeaseWait      = 120 * time.Second
-	defaultCompanionImage = "registry.k8s.io/pause:3.10"
+	defaultLeaseCLI            = "/usr/local/bin/cxl-request"
+	defaultLeaseWait           = 120 * time.Second
+	defaultLeaseCompanionImage = "registry.k8s.io/pause:3.10"
 
 	// selinuxContainerFileLabel lets container processes use the socket
 	// directory on SELinux hosts (best effort, ignored elsewhere).
 	selinuxContainerFileLabel = "system_u:object_r:container_file_t:s0"
 )
 
-// tokenClaims is what nodeState needs from the broker for claims on the
-// token device.
-type tokenClaims interface {
+// leaseClaims is what nodeState needs from the broker for claims on the
+// lease device.
+type leaseClaims interface {
 	// OpenClaim records the claim and starts its socket. Idempotent.
 	OpenClaim(claim *resourceapi.ResourceClaim) error
 	// CloseClaim starts releasing all leases of the claim, waits until
@@ -81,9 +79,9 @@ type tokenClaims interface {
 	CloseClaim(ctx context.Context, uid string) error
 }
 
-var _ tokenClaims = (*broker)(nil)
+var _ leaseClaims = (*broker)(nil)
 
-// leaseCDIDeviceName is the CDI device name of a token claim.
+// leaseCDIDeviceName is the CDI device name of a lease claim.
 func leaseCDIDeviceName(claimUID string) string {
 	return "lease-" + claimUID
 }
@@ -92,15 +90,15 @@ func leaseCDIDeviceID(claimUID string) string {
 	return cdiparser.QualifiedName(device.CDIVendor, device.CDIClass, leaseCDIDeviceName(claimUID))
 }
 
-// leaseDir is the host directory of a token claim.
+// leaseDir is the host directory of a lease claim.
 func (b *broker) leaseDir(claimUID string) string {
 	return filepath.Join(b.cfg.DataDir, leaseDirName, claimUID)
 }
 
-// leaseCDIDevice returns the CDI device of a token claim.
+// leaseCDIDevice returns the CDI device of a lease claim.
 func (b *broker) leaseCDIDevice(claimUID string) cdiSpecs.Device {
 	edits := cdiSpecs.ContainerEdits{
-		Env: []string{leaseSocketEnv + "=" + leaseContainerDir + "/" + leaseSocketName},
+		Env: []string{api.SocketEnv + "=" + api.DefaultSocket},
 		Mounts: []*cdiSpecs.Mount{{
 			HostPath:      b.leaseDir(claimUID),
 			ContainerPath: leaseContainerDir,
@@ -110,24 +108,22 @@ func (b *broker) leaseCDIDevice(claimUID string) cdiSpecs.Device {
 	}
 	// A missing bind mount source fails the container creation, so the
 	// CLI is mounted only if it exists. The socket works without it.
-	if b.cfg.RequestBin != "" {
-		if _, err := os.Stat(b.cfg.RequestBin); err == nil {
-			for _, p := range []string{cxlRequestContainerPath, cxlReleaseContainerPath} {
-				edits.Mounts = append(edits.Mounts, &cdiSpecs.Mount{
-					HostPath:      b.cfg.RequestBin,
-					ContainerPath: p,
-					Type:          "bind",
-					Options:       []string{"bind", "ro"},
-				})
-			}
+	if b.cfg.CLI != "" {
+		if _, err := os.Stat(b.cfg.CLI); err == nil {
+			edits.Mounts = append(edits.Mounts, &cdiSpecs.Mount{
+				HostPath:      b.cfg.CLI,
+				ContainerPath: leaseCLIContainerPath,
+				Type:          "bind",
+				Options:       []string{"bind", "ro"},
+			})
 		} else {
-			klog.Warningf("lease broker: cxl-request CLI %s not mounted into containers: %v", b.cfg.RequestBin, err)
+			klog.Warningf("lease broker: cxl-request CLI %s not mounted into containers: %v", b.cfg.CLI, err)
 		}
 	}
 	return cdiSpecs.Device{Name: leaseCDIDeviceName(claimUID), ContainerEdits: edits}
 }
 
-// writeCDISpec writes the CDI spec of all token claims, or removes it
+// writeCDISpec writes the CDI spec of all lease claims, or removes it
 // when there are none. Called with b.mu held.
 func (b *broker) writeCDISpec() error {
 	if b.cfg.CDI == nil {
@@ -143,8 +139,8 @@ func (b *broker) writeCDISpec() error {
 		spec.Devices = append(spec.Devices, b.leaseCDIDevice(uid))
 	}
 	if len(spec.Devices) == 0 {
-		if err := b.cfg.CDI.RemoveSpec(device.LeaseCDISpecName); err != nil {
-			klog.V(5).Infof("lease broker: could not remove CDI spec %s (may not exist): %v", device.LeaseCDISpecName, err)
+		if err := b.cfg.CDI.RemoveSpec(device.LeasesCDISpecName); err != nil {
+			klog.V(5).Infof("lease broker: could not remove CDI spec %s (may not exist): %v", device.LeasesCDISpecName, err)
 		}
 		return nil
 	}
@@ -153,16 +149,16 @@ func (b *broker) writeCDISpec() error {
 		return fmt.Errorf("CDI spec version: %w", err)
 	}
 	spec.Version = v
-	if err := b.cfg.CDI.WriteSpec(spec, device.LeaseCDISpecName); err != nil {
-		return fmt.Errorf("failed to write CDI spec %s: %w", device.LeaseCDISpecName, err)
+	if err := b.cfg.CDI.WriteSpec(spec, device.LeasesCDISpecName); err != nil {
+		return fmt.Errorf("failed to write CDI spec %s: %w", device.LeasesCDISpecName, err)
 	}
 	return nil
 }
 
-// OpenClaim implements tokenClaims.
+// OpenClaim implements leaseClaims.
 func (b *broker) OpenClaim(claim *resourceapi.ResourceClaim) error {
 	uid := string(claim.UID)
-	tc := &tokenClaim{UID: uid, Namespace: claim.Namespace, Name: claim.Name, Pods: reservedPods(claim)}
+	tc := &leaseClaim{UID: uid, Namespace: claim.Namespace, Name: claim.Name, Pods: reservedPods(claim)}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.store.Claims[uid] = tc
@@ -191,7 +187,7 @@ func reservedPods(claim *resourceapi.ResourceClaim) []podRef {
 	return pods
 }
 
-// CloseClaim implements tokenClaims.
+// CloseClaim implements leaseClaims.
 func (b *broker) CloseClaim(ctx context.Context, uid string) error {
 	b.mu.Lock()
 	tc := b.store.Claims[uid]
@@ -206,7 +202,7 @@ func (b *broker) CloseClaim(ctx context.Context, uid string) error {
 		return nil
 	}
 	for _, id := range ids {
-		b.startRelease(id, "token claim unprepared (pod done)")
+		b.startRelease(id, "lease claim unprepared (pod done)")
 	}
 	ctx, cancel := context.WithTimeout(ctx, b.closeTimeout)
 	defer cancel()
@@ -240,7 +236,7 @@ func (b *broker) CloseClaim(ctx context.Context, uid string) error {
 	return errors.Join(errs...)
 }
 
-// listen starts the socket of a token claim if it is not running.
+// listen starts the socket of a lease claim if it is not running.
 // Called with b.mu held.
 func (b *broker) listen(uid string) error {
 	if b.listeners[uid] != nil {

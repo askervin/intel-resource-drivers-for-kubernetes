@@ -35,25 +35,24 @@ type CXLFlags struct {
 	NRIIdx     string
 	NRISocket  string
 
-	// PoolDriverName is the DRA driver name of the pool helper,
+	// PoolDriverName is the DRA driver name of the pool driver,
 	// empty disables it.
 	PoolDriverName string
-	// PoolPrepareTimeout is how long the pool helper waits for a
+	// PoolPrepareTimeout is how long the pool driver waits for a
 	// memdev to appear.
 	PoolPrepareTimeout time.Duration
 
-	// Lend enables lending local and pool memory to running
-	// containers: the token device "dynamic", lease sockets and
-	// companion pods.
-	Lend bool
-	// CXLRequestBin is the host path of the static cxl-request CLI
-	// that is bind-mounted into containers with a token claim.
-	CXLRequestBin string
-	// LeaseWaitDefault is how long a lease request waits for Ready
-	// when the request does not say.
-	LeaseWaitDefault time.Duration
-	// CompanionImage is the image of the companion pods.
-	CompanionImage string
+	// Leases enables lending local and pool memory to running
+	// containers: the lease device, lease sockets and companion pods.
+	Leases bool
+	// LeaseCLI is the host path of the static cxl-request CLI that is
+	// bind-mounted into containers of lease claims.
+	LeaseCLI string
+	// LeaseWait is how long a lease request waits for Ready when the
+	// request does not say.
+	LeaseWait time.Duration
+	// LeaseCompanionImage is the image of the companion pods.
+	LeaseCompanionImage string
 }
 
 func main() {
@@ -66,10 +65,10 @@ func main() {
 		PoolDriverName:     cxl.PoolDriverName,
 		PoolPrepareTimeout: defaultPoolPrepareTimeout,
 
-		Lend:             true,
-		CXLRequestBin:    defaultCXLRequestBin,
-		LeaseWaitDefault: defaultLeaseWait,
-		CompanionImage:   defaultCompanionImage,
+		Leases:              true,
+		LeaseCLI:            defaultLeaseCLI,
+		LeaseWait:           defaultLeaseWait,
+		LeaseCompanionImage: defaultLeaseCompanionImage,
 	}
 	cliFlags := []cli.Flag{
 		&cli.StringFlag{
@@ -117,46 +116,45 @@ func main() {
 		},
 		&cli.StringFlag{
 			Name:        "pool-driver-name",
-			Usage:       "DRA driver name of the CXL memory pool helper (empty disables it)",
+			Usage:       "DRA driver name of the CXL memory pool driver (empty disables it)",
 			Value:       cxlFlags.PoolDriverName,
 			Destination: &cxlFlags.PoolDriverName,
 			EnvVars:     []string{"POOL_DRIVER_NAME"},
 		},
 		&cli.DurationFlag{
 			Name:        "pool-prepare-timeout",
-			Usage:       "how long the pool helper waits for a hotplugged CXL memory device to appear",
+			Usage:       "how long the pool driver waits for a hotplugged CXL memory device to appear",
 			Value:       cxlFlags.PoolPrepareTimeout,
 			Destination: &cxlFlags.PoolPrepareTimeout,
 			EnvVars:     []string{"POOL_PREPARE_TIMEOUT"},
 		},
 		&cli.BoolFlag{
-			Name:        "lend",
-			Aliases:     []string{"pool-lend"},
-			Usage:       "lend local and pool memory to running containers that claim the token device \"dynamic\" (needs NRI; pool memory needs the pool helper)",
-			Value:       cxlFlags.Lend,
-			Destination: &cxlFlags.Lend,
-			EnvVars:     []string{"LEND", "POOL_LEND"},
+			Name:        "leases",
+			Usage:       "lend memory to running containers: publish the lease device, serve lease sockets, create companions (needs NRI; pool memory needs the pool driver)",
+			Value:       cxlFlags.Leases,
+			Destination: &cxlFlags.Leases,
+			EnvVars:     []string{"LEASES"},
 		},
 		&cli.StringFlag{
-			Name:        "cxl-request-bin",
-			Usage:       "host path of the static cxl-request CLI, bind-mounted into containers with a token claim",
-			Value:       cxlFlags.CXLRequestBin,
-			Destination: &cxlFlags.CXLRequestBin,
-			EnvVars:     []string{"CXL_REQUEST_BIN"},
+			Name:        "lease-cli",
+			Usage:       "host path of the static cxl-request CLI, mounted into containers of lease claims",
+			Value:       cxlFlags.LeaseCLI,
+			Destination: &cxlFlags.LeaseCLI,
+			EnvVars:     []string{"LEASE_CLI"},
 		},
 		&cli.DurationFlag{
-			Name:        "lease-wait-default",
-			Usage:       "how long a lease request waits for the lease to become Ready when the request does not say",
-			Value:       cxlFlags.LeaseWaitDefault,
-			Destination: &cxlFlags.LeaseWaitDefault,
-			EnvVars:     []string{"LEASE_WAIT_DEFAULT"},
+			Name:        "lease-wait",
+			Usage:       "default wait of a lease request for the lease to become Ready",
+			Value:       cxlFlags.LeaseWait,
+			Destination: &cxlFlags.LeaseWait,
+			EnvVars:     []string{"LEASE_WAIT"},
 		},
 		&cli.StringFlag{
-			Name:        "companion-image",
-			Usage:       "container image of the companion pods that hold leased pool devices",
-			Value:       cxlFlags.CompanionImage,
-			Destination: &cxlFlags.CompanionImage,
-			EnvVars:     []string{"COMPANION_IMAGE"},
+			Name:        "lease-companion-image",
+			Usage:       "container image of the companion pods that hold the devices of leases",
+			Value:       cxlFlags.LeaseCompanionImage,
+			Destination: &cxlFlags.LeaseCompanionImage,
+			EnvVars:     []string{"LEASE_COMPANION_IMAGE"},
 		},
 	}
 
